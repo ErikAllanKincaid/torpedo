@@ -12,17 +12,12 @@ pub struct Member {
     pub is_coordinator: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupMode {
     Open,
+    #[default]
     Restricted,
-}
-
-impl Default for GroupMode {
-    fn default() -> Self {
-        GroupMode::Restricted
-    }
 }
 
 impl fmt::Display for GroupMode {
@@ -78,14 +73,14 @@ impl MemberList {
     }
 
     pub fn add(&mut self, member: Member) -> Result<(), IpCollision> {
-        if let Some(existing) = self.get_by_ip(member.ip) {
-            if existing.identity != member.identity {
-                return Err(IpCollision {
-                    ip: member.ip,
-                    existing_identity: existing.identity.clone(),
-                    new_identity: member.identity.clone(),
-                });
-            }
+        if let Some(existing) = self.get_by_ip(member.ip)
+            && existing.identity != member.identity
+        {
+            return Err(IpCollision {
+                ip: member.ip,
+                existing_identity: existing.identity.clone(),
+                new_identity: member.identity.clone(),
+            });
         }
         self.members.insert(member.identity.clone(), member);
         Ok(())

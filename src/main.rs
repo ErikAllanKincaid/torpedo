@@ -12,8 +12,9 @@ mod stats;
 mod transport;
 mod tun;
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::{net::Ipv4Addr, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -22,13 +23,13 @@ use iroh::endpoint::Endpoint;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use control::{ControlMsg, PeerInfo};
-use peers::{IpAllocator, PeerTable};
+use control::ControlMsg;
+use membership::{
+    GroupMode, IdentityProvider, IrohIdentityProvider, Member, MemberList, MembershipPolicy,
+    policy_for_mode,
+};
+use peers::PeerTable;
 use stats::Stats;
-
-fn coordinator_ip(subnet_index: u8) -> Ipv4Addr {
-    tun::TunDevice::coordinator_ip(subnet_index)
-}
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -47,6 +48,9 @@ enum Command {
         /// Network name (defaults to "default")
         #[arg(long, default_value = "default")]
         name: String,
+        /// Membership mode: open or restricted
+        #[arg(long, default_value = "restricted")]
+        mode: GroupMode,
     },
     /// Join an existing network using a node ID or room code
     Join {
@@ -97,17 +101,17 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list(),
         Command::Leave { name } => cmd_leave(&name),
-        Command::Create { name } => {
+        Command::Create { name, mode } => {
             check_root();
             let token = shutdown::token();
             let stats = stats::Stats::new();
             stats.spawn_logger(token.clone());
-            cmd_create(&name, token, stats).await
+            cmd_create(&name, mode, token, stats).await
         }
         Command::Join { node_id, name } => {
             check_root();
-            let node_id = room_code::parse_node_id(&node_id)
-                .context("invalid node ID or room code")?;
+            let node_id =
+                room_code::parse_node_id(&node_id).context("invalid node ID or room code")?;
             let token = shutdown::token();
             let stats = stats::Stats::new();
             stats.spawn_logger(token.clone());
@@ -131,59 +135,44 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_create(name: &str, token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
+async fn cmd_create(
+    name: &str,
+    mode: GroupMode,
+    token: CancellationToken,
+    stats: Arc<Stats>,
+) -> Result<()> {
     let key = identity::load_or_create()?;
+    let public_key = key.public();
     let alpn = transport::network_alpn(name);
     let ep = transport::create_endpoint_with_alpns(key, vec![alpn.clone()]).await?;
 
-    // Assign subnet index
-    let mut app_config = config::load()?;
-    let subnet_index = config::next_subnet_index(&app_config);
-
-    cmd_create_on_endpoint(name, &ep, subnet_index, token, stats, &mut app_config).await
-}
-
-/// Run a coordinator for a single network on a shared endpoint.
-async fn cmd_create_on_endpoint(
-    name: &str,
-    ep: &Endpoint,
-    subnet_index: u8,
-    token: CancellationToken,
-    stats: Arc<Stats>,
-    app_config: &mut config::AppConfig,
-) -> Result<()> {
-    let coord_ip = coordinator_ip(subnet_index);
+    let identity = IrohIdentityProvider::new(public_key);
+    let my_ip = identity.local_ip();
     let room_code = room_code::encode(&ep.id());
-    let alpn = transport::network_alpn(name);
+    let policy = policy_for_mode(mode);
 
-    tracing::info!(name = %name, subnet_index, "network created");
-    tracing::info!(ip = %coord_ip, "your virtual IP");
-    tracing::info!(node_id = %ep.id(), "share this node ID with peers");
-    tracing::info!(room_code = %room_code, "or share this room code");
+    tracing::info!(name = %name, mode = ?mode, "network created");
+    tracing::info!(ip = %my_ip, "your virtual IP");
+    tracing::info!(room_code = %room_code, "share this room code");
 
-    // Save network to config
-    config::upsert_network(
-        app_config,
-        config::NetworkConfig {
-            name: name.to_string(),
-            coordinator_id: ep.id().to_string(),
-            assigned_ip: None,
-            subnet_index,
-            peers: vec![],
-        },
-    );
-    config::save(app_config)?;
-    tracing::info!("saved network to config");
+    let mut member_list = MemberList::new();
+    member_list
+        .add(Member {
+            identity: identity.local_identity(),
+            ip: my_ip,
+            is_coordinator: true,
+        })
+        .expect("self-add cannot collide");
 
-    let tun_dev = tun::TunDevice::create_mesh_subnet(coord_ip, subnet_index)
-        .context("failed to create TUN device")?;
+    let mut app_config = config::load()?;
+    save_network_config(&mut app_config, name, &ep, mode, Some(my_ip), &member_list)?;
+
+    let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
 
     let peers = PeerTable::new();
-    let mut ip_alloc = IpAllocator::for_subnet(subnet_index);
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
 
     forward::spawn_tun_writer(tun_dev.share(), tun_rx);
-
     tokio::spawn(forward::run_mesh(
         tun_dev,
         peers.clone(),
@@ -192,8 +181,33 @@ async fn cmd_create_on_endpoint(
         stats.clone(),
     ));
 
+    let member_list = Arc::new(std::sync::RwLock::new(member_list));
+
+    run_accept_loop(
+        &ep, &alpn, &identity, &*policy, member_list, peers, tun_tx, token, stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_accept_loop(
+    ep: &Endpoint,
+    alpn: &[u8],
+    identity: &IrohIdentityProvider,
+    policy: &dyn MembershipPolicy,
+    member_list: Arc<std::sync::RwLock<MemberList>>,
+    peers: PeerTable,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    token: CancellationToken,
+    stats: Arc<Stats>,
+) -> Result<()> {
+    let self_member = {
+        let list = member_list.read().unwrap();
+        list.get(&identity.local_identity()).cloned().unwrap()
+    };
+
     loop {
-        tracing::info!(network = %name, "waiting for peers to join...");
+        tracing::info!("waiting for peers...");
 
         let conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
@@ -213,100 +227,145 @@ async fn cmd_create_on_endpoint(
             }
         };
 
-        let assigned_ip = ip_alloc.next();
-        let existing_peers = peers.peer_infos();
-        let peer_endpoint_id = conn.remote_id().to_string();
+        let remote_id = conn.remote_id().to_string();
+        let peer_ip = identity.derive_ip(&remote_id);
 
-        peers.add(assigned_ip, conn.clone(), peer_endpoint_id);
+        // Check if this is a known member reconnecting
+        let is_known = member_list.read().unwrap().is_member(&remote_id);
 
-        tracing::info!(ip = %assigned_ip, network = %name, "peer joined network");
+        if is_known {
+            tracing::info!(ip = %peer_ip, "known member reconnecting");
+            let members = member_list
+                .read()
+                .unwrap()
+                .all()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            peers.add(peer_ip, conn.clone(), remote_id);
 
-        let peers_clone = peers.clone();
+            let token_clone = token.clone();
+            let stats_clone = stats.clone();
+            let tun_tx_clone = tun_tx.clone();
+            tokio::spawn(async move {
+                send_member_sync(&conn, &members).await;
+                forward::spawn_peer_reader(conn, tun_tx_clone, token_clone, stats_clone);
+            });
+            continue;
+        }
+
+        // New join — check policy
+        if !policy.can_authorize(&self_member) {
+            tracing::warn!(peer = %remote_id, "not authorized to accept new members");
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(
+                    &mut send,
+                    &ControlMsg::JoinDenied {
+                        reason: "not authorized".to_string(),
+                    },
+                )
+                .await;
+            }
+            continue;
+        }
+
+        // Check IP collision
+        let has_collision = {
+            let list = member_list.read().unwrap();
+            if let Some(existing) = list.get_by_ip(peer_ip) {
+                existing.identity != remote_id
+            } else {
+                false
+            }
+        };
+        if has_collision {
+            tracing::warn!(ip = %peer_ip, "IP collision, rejecting");
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(
+                    &mut send,
+                    &ControlMsg::JoinDenied {
+                        reason: "IP collision".to_string(),
+                    },
+                )
+                .await;
+            }
+            continue;
+        }
+
+        // Accept the new member
+        let new_member = Member {
+            identity: remote_id.clone(),
+            ip: peer_ip,
+            is_coordinator: false,
+        };
+        member_list
+            .write()
+            .unwrap()
+            .add(new_member)
+            .expect("checked above");
+
+        let members: Vec<Member> = member_list
+            .read()
+            .unwrap()
+            .all()
+            .into_iter()
+            .cloned()
+            .collect();
+        peers.add(peer_ip, conn.clone(), remote_id);
+        tracing::info!(ip = %peer_ip, "new member joined");
+
+        // Send JoinApproved to new peer
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(
+                &mut send,
+                &ControlMsg::JoinApproved {
+                    your_ip: peer_ip,
+                    members: members.clone(),
+                },
+            )
+            .await;
+        }
+
+        // Broadcast MemberSync to existing peers
+        broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
+
+        let tun_tx_clone = tun_tx.clone();
         let token_clone = token.clone();
         let stats_clone = stats.clone();
-        let tun_tx_clone = tun_tx.clone();
-
         tokio::spawn(async move {
-            if let Err(e) = handle_new_peer(
-                conn,
-                assigned_ip,
-                existing_peers,
-                peers_clone,
-                token_clone,
-                stats_clone,
-                tun_tx_clone,
-            )
-            .await
-            {
-                tracing::warn!(ip = %assigned_ip, error = %e, "peer session ended");
-            }
+            forward::spawn_peer_reader(conn, tun_tx_clone, token_clone, stats_clone);
         });
     }
 }
 
-async fn handle_new_peer(
-    conn: iroh::endpoint::Connection,
-    assigned_ip: Ipv4Addr,
-    existing_peers: Vec<PeerInfo>,
-    peers: PeerTable,
-    token: CancellationToken,
-    stats: Arc<Stats>,
-    tun_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
-    let (mut send, _recv) = conn.open_bi().await.context("open control stream")?;
-
-    let welcome = ControlMsg::Welcome {
-        your_ip: assigned_ip,
-        peers: existing_peers.clone(),
-    };
-    control::send_msg(&mut send, &welcome).await?;
-
-    tracing::info!(ip = %assigned_ip, peer_count = existing_peers.len(), "sent welcome");
-
-    let new_peer_info = PeerInfo {
-        ip: assigned_ip,
-        endpoint_id: conn.remote_id().to_string(),
-    };
-    broadcast_to_peers(
-        &peers,
-        &ControlMsg::PeerJoined(new_peer_info),
-        Some(assigned_ip),
-    )
-    .await;
-
-    let reader_handle = forward::spawn_peer_reader(conn.clone(), tun_tx, token.clone(), stats);
-
-    tokio::select! {
-        _ = token.cancelled() => {}
-        _ = reader_handle => {
-            tracing::info!(ip = %assigned_ip, "peer disconnected");
-            peers.remove(&assigned_ip);
-            broadcast_to_peers(
-                &peers,
-                &ControlMsg::PeerLeft { ip: assigned_ip },
-                None,
-            )
-            .await;
-        }
+async fn send_member_sync(conn: &iroh::endpoint::Connection, members: &[Member]) {
+    if let Ok((mut send, _)) = conn.open_bi().await {
+        let _ = control::send_msg(
+            &mut send,
+            &ControlMsg::MemberSync {
+                members: members.to_vec(),
+            },
+        )
+        .await;
     }
-
-    Ok(())
 }
 
-async fn broadcast_to_peers(peers: &PeerTable, msg: &ControlMsg, exclude: Option<Ipv4Addr>) {
+async fn broadcast_member_sync(
+    peers: &PeerTable,
+    members: &[Member],
+    exclude_ip: Option<Ipv4Addr>,
+) {
+    let msg = ControlMsg::MemberSync {
+        members: members.to_vec(),
+    };
     for (ip, conn) in peers.all_connections() {
-        if Some(ip) == exclude {
+        if Some(ip) == exclude_ip {
             continue;
         }
-        match conn.open_bi().await {
-            Ok((mut send, _recv)) => {
-                if let Err(e) = control::send_msg(&mut send, msg).await {
-                    tracing::warn!(peer_ip = %ip, error = %e, "failed to broadcast");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(peer_ip = %ip, error = %e, "failed to open control stream");
-            }
+        if let Ok((mut send, _)) = conn.open_bi().await
+            && let Err(e) = control::send_msg(&mut send, &msg).await
+        {
+            tracing::warn!(peer_ip = %ip, error = %e, "failed to sync members");
         }
     }
 }
@@ -318,59 +377,43 @@ async fn cmd_join(
     stats: Arc<Stats>,
 ) -> Result<()> {
     let key = identity::load_or_create()?;
+    let public_key = key.public();
     let alpn = transport::network_alpn(name);
     let ep = transport::create_endpoint_with_alpns(key, vec![alpn.clone()]).await?;
 
-    // Assign subnet index
-    let app_config = config::load()?;
-    let subnet_index = config::next_subnet_index(&app_config);
-
-    cmd_join_on_endpoint(node_id, name, &ep, subnet_index, token, stats).await
-}
-
-/// Join a network on a shared endpoint with a specific subnet and ALPN.
-async fn cmd_join_on_endpoint(
-    node_id: EndpointId,
-    name: &str,
-    ep: &Endpoint,
-    subnet_index: u8,
-    token: CancellationToken,
-    stats: Arc<Stats>,
-) -> Result<()> {
-    let alpn = transport::network_alpn(name);
+    let identity = IrohIdentityProvider::new(public_key);
     let mut backoff = BACKOFF_INITIAL;
 
     loop {
         tracing::info!(network = %name, "connecting to network...");
 
+        // Try coordinator first
         let conn = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            result = transport::connect_to_peer_with_alpn(ep, node_id, &alpn) => {
+            result = transport::connect_to_peer_with_alpn(&ep, node_id, &alpn) => {
                 match result {
                     Ok(conn) => {
                         backoff = BACKOFF_INITIAL;
                         conn
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to connect");
-                        backoff_sleep(&token, &mut backoff).await;
-                        continue;
+                        tracing::warn!(error = %e, "coordinator unavailable, trying known peers...");
+
+                        // Try known peers from config
+                        if let Some(conn) = try_reconnect_to_known_peers(
+                            &ep, name, &alpn, &identity, &token,
+                        ).await {
+                            conn
+                        } else {
+                            backoff_sleep(&token, &mut backoff).await;
+                            continue;
+                        }
                     }
                 }
             }
         };
 
-        match join_mesh(
-            conn,
-            ep,
-            name,
-            node_id,
-            subnet_index,
-            token.clone(),
-            stats.clone(),
-        )
-        .await
-        {
+        match enter_mesh(conn, &ep, name, &identity, &alpn, token.clone(), stats.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if token.is_cancelled() {
@@ -383,37 +426,93 @@ async fn cmd_join_on_endpoint(
     }
 }
 
-async fn join_mesh(
-    coordinator_conn: iroh::endpoint::Connection,
+async fn try_reconnect_to_known_peers(
     ep: &Endpoint,
     network_name: &str,
-    coordinator_node_id: EndpointId,
-    subnet_index: u8,
+    alpn: &[u8],
+    identity: &IrohIdentityProvider,
+    token: &CancellationToken,
+) -> Option<iroh::endpoint::Connection> {
+    let app_config = config::load().ok()?;
+    let net = app_config
+        .networks
+        .iter()
+        .find(|n| n.name == network_name)?;
+
+    for member in &net.members {
+        if member.identity == identity.local_identity() {
+            continue; // skip self
+        }
+        let peer_id: EndpointId = match member.identity.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        if token.is_cancelled() {
+            return None;
+        }
+        match transport::connect_to_peer_with_alpn(ep, peer_id, alpn).await {
+            Ok(conn) => {
+                tracing::info!(peer_ip = %member.ip, "connected to known peer for reconnection");
+                return Some(conn);
+            }
+            Err(e) => {
+                tracing::debug!(peer = %member.identity, error = %e, "known peer unavailable");
+            }
+        }
+    }
+    None
+}
+
+async fn enter_mesh(
+    initial_conn: iroh::endpoint::Connection,
+    ep: &Endpoint,
+    network_name: &str,
+    identity: &IrohIdentityProvider,
+    alpn: &[u8],
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
-    let alpn = transport::network_alpn(network_name);
-    let coord_ip = coordinator_ip(subnet_index);
+    let my_identity = identity.local_identity();
+    let my_ip = identity.local_ip();
 
-    let (_send, mut recv) = coordinator_conn
+    // Receive initial control message (JoinApproved, MemberSync, or JoinDenied)
+    let (_send, mut recv) = initial_conn
         .accept_bi()
         .await
-        .context("accept control stream from coordinator")?;
+        .context("accept control stream")?;
 
-    let welcome = control::recv_msg(&mut recv).await?;
-    let (my_ip, existing_peers) = match welcome {
-        ControlMsg::Welcome { your_ip, peers } => (your_ip, peers),
-        other => anyhow::bail!("expected Welcome, got {:?}", other),
+    let msg = control::recv_msg(&mut recv).await?;
+    let members = match msg {
+        ControlMsg::JoinApproved { your_ip, members } => {
+            tracing::info!(ip = %your_ip, network = %network_name, "joined network");
+            if your_ip != my_ip {
+                tracing::warn!(
+                    expected = %my_ip,
+                    got = %your_ip,
+                    "coordinator assigned different IP than identity-derived"
+                );
+            }
+            members
+        }
+        ControlMsg::MemberSync { members } => {
+            tracing::info!(network = %network_name, "reconnected via peer");
+            members
+        }
+        ControlMsg::JoinDenied { reason } => {
+            anyhow::bail!("join denied: {reason}");
+        }
+        other => {
+            anyhow::bail!("expected JoinApproved or MemberSync, got {other:?}");
+        }
     };
 
-    tracing::info!(ip = %my_ip, network = %network_name, peers = existing_peers.len(), "joined network");
-
-    // Save network membership to config
-    let peer_entries: Vec<config::PeerEntry> = existing_peers
+    // Save membership to config
+    let member_entries: Vec<config::MemberEntry> = members
         .iter()
-        .map(|p| config::PeerEntry {
-            ip: p.ip,
-            endpoint_id: p.endpoint_id.clone(),
+        .map(|m| config::MemberEntry {
+            identity: m.identity.clone(),
+            ip: m.ip,
+            is_coordinator: m.is_coordinator,
         })
         .collect();
     let mut app_config = config::load()?;
@@ -421,76 +520,83 @@ async fn join_mesh(
         &mut app_config,
         config::NetworkConfig {
             name: network_name.to_string(),
-            coordinator_id: coordinator_node_id.to_string(),
-            assigned_ip: Some(my_ip),
-            subnet_index,
-            peers: peer_entries,
+            coordinator_id: initial_conn.remote_id().to_string(),
+            group_mode: GroupMode::Restricted,
+            my_ip: Some(my_ip),
+            members: member_entries,
         },
     );
     config::save(&app_config)?;
-    tracing::info!(name = %network_name, "saved network to config");
 
-    let tun_dev = tun::TunDevice::create_mesh_subnet(my_ip, subnet_index)
-        .context("failed to create TUN device")?;
+    let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
 
     let peers = PeerTable::new();
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
 
     forward::spawn_tun_writer(tun_dev.share(), tun_rx);
 
-    peers.add(
-        coord_ip,
-        coordinator_conn.clone(),
-        coordinator_conn.remote_id().to_string(),
-    );
+    // Add the initial connection peer to routing table
+    let remote_id = initial_conn.remote_id().to_string();
+    let remote_ip = identity.derive_ip(&remote_id);
+    peers.add(remote_ip, initial_conn.clone(), remote_id);
     forward::spawn_peer_reader(
-        coordinator_conn.clone(),
+        initial_conn.clone(),
         tun_tx.clone(),
         token.clone(),
         stats.clone(),
     );
 
-    for peer_info in &existing_peers {
-        let peer_id: EndpointId = peer_info
-            .endpoint_id
-            .parse()
-            .context("invalid peer endpoint id")?;
-        match transport::connect_to_peer_with_alpn(ep, peer_id, &alpn).await {
+    // Connect to all other known members
+    for member in &members {
+        if member.identity == my_identity {
+            continue;
+        }
+        if member.identity == initial_conn.remote_id().to_string() {
+            continue; // already connected
+        }
+        let peer_id: EndpointId = match member.identity.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        match transport::connect_to_peer_with_alpn(ep, peer_id, alpn).await {
             Ok(conn) => {
-                let (mut send, _peer_recv) = conn.open_bi().await?;
-                control::send_msg(&mut send, &ControlMsg::MeshHello { ip: my_ip }).await?;
+                let (mut send, _recv) = conn.open_bi().await?;
+                control::send_msg(
+                    &mut send,
+                    &ControlMsg::MeshHello {
+                        identity: my_identity.clone(),
+                        ip: my_ip,
+                    },
+                )
+                .await?;
 
-                peers.add(peer_info.ip, conn.clone(), peer_info.endpoint_id.clone());
+                peers.add(member.ip, conn.clone(), member.identity.clone());
                 forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
-                tracing::info!(peer_ip = %peer_info.ip, "connected to mesh peer");
+                tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
             Err(e) => {
-                tracing::warn!(peer_ip = %peer_info.ip, error = %e, "failed to connect to mesh peer");
+                tracing::warn!(peer_ip = %member.ip, error = %e, "mesh peer unavailable");
             }
         }
     }
 
+    // Listen for control messages from initial connection
     let _control_listener = tokio::spawn({
-        let coordinator_conn = coordinator_conn.clone();
-        let peers = peers.clone();
+        let initial_conn = initial_conn.clone();
         let token = token.clone();
         async move {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
-                    result = coordinator_conn.accept_bi() => {
+                    result = initial_conn.accept_bi() => {
                         match result {
                             Ok((_send, mut recv)) => {
                                 match control::recv_msg(&mut recv).await {
-                                    Ok(ControlMsg::PeerJoined(info)) => {
-                                        tracing::info!(peer_ip = %info.ip, "new peer announced");
-                                    }
-                                    Ok(ControlMsg::PeerLeft { ip }) => {
-                                        tracing::info!(peer_ip = %ip, "peer left");
-                                        peers.remove(&ip);
+                                    Ok(ControlMsg::MemberSync { members }) => {
+                                        tracing::info!(count = members.len(), "member list updated");
                                     }
                                     Ok(other) => {
-                                        tracing::warn!(?other, "unexpected control message");
+                                        tracing::debug!(?other, "unhandled control message");
                                     }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "control message error");
@@ -505,13 +611,15 @@ async fn join_mesh(
         }
     });
 
+    // Accept incoming mesh connections (MeshHello + ReconnectRequest)
     let _mesh_acceptor = tokio::spawn({
         let ep = ep.clone();
         let peers = peers.clone();
         let token = token.clone();
         let stats = stats.clone();
         let tun_tx = tun_tx.clone();
-        let expected_alpn = alpn.clone();
+        let expected_alpn = alpn.to_vec();
+        let member_list: Vec<Member> = members.clone();
         async move {
             loop {
                 tokio::select! {
@@ -519,25 +627,45 @@ async fn join_mesh(
                     result = transport::accept_connection_with_alpn(&ep) => {
                         match result {
                             Ok((conn, conn_alpn)) => {
-                                // Strict isolation: only accept connections for our network
                                 if conn_alpn != expected_alpn {
-                                    tracing::debug!(
-                                        expected = %String::from_utf8_lossy(&expected_alpn),
-                                        got = %String::from_utf8_lossy(&conn_alpn),
-                                        "ignoring connection for different network"
-                                    );
                                     continue;
                                 }
                                 match conn.accept_bi().await {
                                     Ok((_send, mut recv)) => {
-                                        if let Ok(ControlMsg::MeshHello { ip }) = control::recv_msg(&mut recv).await {
-                                            tracing::info!(peer_ip = %ip, "mesh peer connected");
-                                            peers.add(ip, conn.clone(), conn.remote_id().to_string());
-                                            forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                        match control::recv_msg(&mut recv).await {
+                                            Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
+                                                tracing::info!(peer_ip = %ip, "mesh peer connected");
+                                                peers.add(ip, conn.clone(), peer_identity);
+                                                forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                            }
+                                            Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
+                                                let is_known = member_list.iter().any(|m| m.identity == peer_identity);
+                                                if is_known {
+                                                    tracing::info!(peer_ip = %ip, "known peer reconnecting");
+                                                    peers.add(ip, conn.clone(), peer_identity);
+
+                                                    if let Ok((mut send, _)) = conn.open_bi().await {
+                                                        let _ = control::send_msg(
+                                                            &mut send,
+                                                            &ControlMsg::MemberSync { members: member_list.clone() },
+                                                        ).await;
+                                                    }
+
+                                                    forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                                } else {
+                                                    tracing::warn!(peer = %peer_identity, "unknown peer reconnect attempt");
+                                                }
+                                            }
+                                            Ok(other) => {
+                                                tracing::debug!(?other, "unexpected mesh message");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "mesh handshake failed");
+                                            }
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!(error = %e, "mesh handshake failed");
+                                        tracing::warn!(error = %e, "mesh accept failed");
                                     }
                                 }
                             }
@@ -554,6 +682,37 @@ async fn join_mesh(
     forward::run_mesh(tun_dev, peers, tun_tx, token, stats).await
 }
 
+fn save_network_config(
+    app_config: &mut config::AppConfig,
+    name: &str,
+    ep: &Endpoint,
+    mode: GroupMode,
+    my_ip: Option<Ipv4Addr>,
+    member_list: &MemberList,
+) -> Result<()> {
+    let member_entries: Vec<config::MemberEntry> = member_list
+        .all()
+        .into_iter()
+        .map(|m| config::MemberEntry {
+            identity: m.identity.clone(),
+            ip: m.ip,
+            is_coordinator: m.is_coordinator,
+        })
+        .collect();
+
+    config::upsert_network(
+        app_config,
+        config::NetworkConfig {
+            name: name.to_string(),
+            coordinator_id: ep.id().to_string(),
+            group_mode: mode,
+            my_ip,
+            members: member_entries,
+        },
+    );
+    config::save(app_config)
+}
+
 fn cmd_list() -> Result<()> {
     let app_config = config::load()?;
     if app_config.networks.is_empty() {
@@ -562,15 +721,16 @@ fn cmd_list() -> Result<()> {
     }
     for net in &app_config.networks {
         let ip_str = net
-            .assigned_ip
+            .my_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "coordinator".to_string());
         println!(
-            "{} (coordinator: {}, ip: {}, peers: {})",
+            "{} (coordinator: {}, ip: {}, members: {}, mode: {:?})",
             net.name,
             net.coordinator_id,
             ip_str,
-            net.peers.len()
+            net.members.len(),
+            net.group_mode,
         );
     }
     Ok(())
@@ -584,23 +744,23 @@ fn cmd_status() -> Result<()> {
     }
     println!("Networks:");
     for net in &app_config.networks {
-        let role = if net.assigned_ip.is_none() {
+        let role = if net.my_ip.is_none() {
             "coordinator"
         } else {
             "member"
         };
         let ip_str = net
-            .assigned_ip
+            .my_ip
             .map(|ip| ip.to_string())
-            .unwrap_or_else(|| coordinator_ip(net.subnet_index).to_string());
-        println!("  {} [{}]", net.name, role);
+            .unwrap_or_else(|| "pending".to_string());
+        println!("  {} [{}] ({})", net.name, role, net.group_mode);
         println!("    IP: {}", ip_str);
-        println!("    Subnet: 100.64.{}.0/24", net.subnet_index);
         println!("    Coordinator: {}", net.coordinator_id);
-        if !net.peers.is_empty() {
-            println!("    Peers:");
-            for peer in &net.peers {
-                println!("      {} ({})", peer.ip, peer.endpoint_id);
+        if !net.members.is_empty() {
+            println!("    Members:");
+            for member in &net.members {
+                let role_tag = if member.is_coordinator { " [coord]" } else { "" };
+                println!("      {} ({}){}", member.ip, member.identity, role_tag);
             }
         }
     }
@@ -626,8 +786,8 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
     }
 
     let key = identity::load_or_create()?;
+    let public_key = key.public();
 
-    // Collect all ALPNs upfront so the shared endpoint serves all networks
     let alpns: Vec<Vec<u8>> = app_config
         .networks
         .iter()
@@ -636,30 +796,38 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
 
     let ep = transport::create_endpoint_with_alpns(key, alpns).await?;
 
+    // Single TUN for all networks
+    let identity = IrohIdentityProvider::new(public_key);
+    let my_ip = identity.local_ip();
+    let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
+    let peers = PeerTable::new();
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    forward::spawn_tun_writer(tun_dev.share(), tun_rx);
+    tokio::spawn(forward::run_mesh(
+        tun_dev,
+        peers.clone(),
+        tun_tx.clone(),
+        token.clone(),
+        stats.clone(),
+    ));
+
     let mut handles = Vec::new();
     for net in &app_config.networks {
-        let subnet_index = net.subnet_index;
         let alpn = transport::network_alpn(&net.name);
 
-        if net.assigned_ip.is_some() {
+        if net.my_ip.is_some() {
+            // We're a member — join
             let coordinator_id: EndpointId = net
                 .coordinator_id
                 .parse()
                 .context("invalid coordinator id in config")?;
             let name = net.name.clone();
             let ep = ep.clone();
-            let token = token.clone();
-            let stats = stats.clone();
             handles.push(tokio::spawn(async move {
-                tracing::info!(network = %name, subnet_index, "connecting...");
+                tracing::info!(network = %name, "connecting...");
                 match transport::connect_to_peer_with_alpn(&ep, coordinator_id, &alpn).await {
-                    Ok(conn) => {
-                        if let Err(e) =
-                            join_mesh(conn, &ep, &name, coordinator_id, subnet_index, token, stats)
-                                .await
-                        {
-                            tracing::warn!(network = %name, error = %e, "disconnected");
-                        }
+                    Ok(_conn) => {
+                        tracing::info!(network = %name, "connected");
                     }
                     Err(e) => {
                         tracing::warn!(network = %name, error = %e, "failed to connect");
@@ -667,16 +835,32 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                 }
             }));
         } else {
+            // We're the coordinator
             let name = net.name.clone();
+            let mode = net.group_mode;
             let ep = ep.clone();
             let token = token.clone();
             let stats = stats.clone();
+            let peers = peers.clone();
+            let tun_tx = tun_tx.clone();
+            let identity = IrohIdentityProvider::new(ep.id());
             handles.push(tokio::spawn(async move {
-                tracing::info!(network = %name, subnet_index, "starting coordinator...");
-                let mut app_config = config::load().unwrap_or_default();
-                if let Err(e) =
-                    cmd_create_on_endpoint(&name, &ep, subnet_index, token, stats, &mut app_config)
-                        .await
+                tracing::info!(network = %name, "starting coordinator...");
+                let policy = policy_for_mode(mode);
+                let mut member_list = MemberList::new();
+                member_list
+                    .add(Member {
+                        identity: identity.local_identity(),
+                        ip: identity.local_ip(),
+                        is_coordinator: true,
+                    })
+                    .unwrap();
+                let member_list = Arc::new(std::sync::RwLock::new(member_list));
+                let alpn = transport::network_alpn(&name);
+                if let Err(e) = run_accept_loop(
+                    &ep, &alpn, &identity, &*policy, member_list, peers, tun_tx, token, stats,
+                )
+                .await
                 {
                     tracing::warn!(network = %name, error = %e, "coordinator stopped");
                 }

@@ -3,6 +3,7 @@ mod control;
 mod forward;
 mod identity;
 mod peers;
+mod room_code;
 mod shutdown;
 mod stats;
 mod transport;
@@ -42,10 +43,10 @@ enum Command {
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// Join an existing network using a node ID
+    /// Join an existing network using a node ID or room code
     Join {
-        /// The endpoint ID of the network creator
-        node_id: EndpointId,
+        /// The endpoint ID or room code of the network creator
+        node_id: String,
         /// Network name (defaults to "default")
         #[arg(long, default_value = "default")]
         name: String,
@@ -100,6 +101,8 @@ async fn main() -> Result<()> {
         }
         Command::Join { node_id, name } => {
             check_root();
+            let node_id = room_code::parse_node_id(&node_id)
+                .context("invalid node ID or room code")?;
             let token = shutdown::token();
             let stats = stats::Stats::new();
             stats.spawn_logger(token.clone());
@@ -132,9 +135,12 @@ async fn cmd_create(name: &str, token: CancellationToken, stats: Arc<Stats>) -> 
     let key = identity::load_or_create()?;
     let ep = transport::create_endpoint(key).await?;
 
+    let room_code = room_code::encode(&ep.id());
+
     tracing::info!(name = %name, "network created");
     tracing::info!(ip = %COORDINATOR_IP, "your virtual IP");
     tracing::info!(node_id = %ep.id(), "share this node ID with peers");
+    tracing::info!(room_code = %room_code, "or share this room code");
 
     // Save network to config
     let mut app_config = config::load()?;

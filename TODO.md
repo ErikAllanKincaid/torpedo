@@ -70,7 +70,7 @@ Make it pleasant to use day-to-day.
 
 ### Usability
 
-- [ ] Short room codes instead of raw 52-character EndpointIds (e.g., `pitopi join abc-def-ghi`)
+- [x] Short room codes instead of raw 52-character EndpointIds (e.g., `pitopi join abc-def-ghi`)
 - [x] `pitopi status` — show active networks, connected peers, IPs, connection quality (direct vs relay, latency, throughput)
 - [ ] Colored terminal output — connection events, errors, status
 - [x] Shell completions (bash, zsh, fish) via clap

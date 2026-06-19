@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock};
 
 use iroh::endpoint::Connection;
 
-use crate::control::PeerInfo;
 
 pub struct IpAllocator {
     subnet_index: u8,
@@ -67,17 +66,6 @@ impl PeerTable {
             .collect()
     }
 
-    pub fn peer_infos(&self) -> Vec<PeerInfo> {
-        self.inner
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(ip, e)| PeerInfo {
-                ip: *ip,
-                endpoint_id: e.endpoint_id.clone(),
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]

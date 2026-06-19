@@ -4,26 +4,30 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub ip: Ipv4Addr,
-    pub endpoint_id: String,
-}
+use crate::membership::Member;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
-    Welcome {
+    JoinApproved {
         your_ip: Ipv4Addr,
-        peers: Vec<PeerInfo>,
+        members: Vec<Member>,
     },
-    PeerJoined(PeerInfo),
-    PeerLeft {
+    JoinDenied {
+        reason: String,
+    },
+    MemberSync {
+        members: Vec<Member>,
+    },
+    ReconnectRequest {
+        identity: String,
         ip: Ipv4Addr,
     },
     MeshHello {
+        identity: String,
         ip: Ipv4Addr,
     },
     MeshWelcome {
+        identity: String,
         ip: Ipv4Addr,
     },
     AdvertiseServices {
@@ -78,12 +82,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_roundtrip_welcome() {
-        let msg = ControlMsg::Welcome {
+    fn test_roundtrip_join_approved_basic() {
+        let msg = ControlMsg::JoinApproved {
             your_ip: Ipv4Addr::new(100, 64, 0, 3),
-            peers: vec![PeerInfo {
+            members: vec![Member {
+                identity: "test-id-abc123".to_string(),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
-                endpoint_id: "test-id-abc123".to_string(),
+                is_coordinator: true,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -92,19 +97,77 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_peer_joined() {
-        let msg = ControlMsg::PeerJoined(PeerInfo {
-            ip: Ipv4Addr::new(100, 64, 0, 5),
-            endpoint_id: "node-xyz".to_string(),
-        });
+    fn test_roundtrip_mesh_hello_basic() {
+        let msg = ControlMsg::MeshHello {
+            identity: "peer-abc".to_string(),
+            ip: Ipv4Addr::new(100, 64, 0, 4),
+        };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
     }
 
     #[test]
-    fn test_roundtrip_mesh_hello() {
+    fn test_roundtrip_join_approved() {
+        let msg = ControlMsg::JoinApproved {
+            your_ip: Ipv4Addr::new(100, 64, 10, 5),
+            members: vec![Member {
+                identity: "coord-id".to_string(),
+                ip: Ipv4Addr::new(100, 64, 5, 3),
+                is_coordinator: true,
+            }],
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_join_denied() {
+        let msg = ControlMsg::JoinDenied {
+            reason: "not authorized".to_string(),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_member_sync() {
+        let msg = ControlMsg::MemberSync {
+            members: vec![
+                Member {
+                    identity: "a".to_string(),
+                    ip: Ipv4Addr::new(100, 64, 0, 2),
+                    is_coordinator: true,
+                },
+                Member {
+                    identity: "b".to_string(),
+                    ip: Ipv4Addr::new(100, 64, 0, 3),
+                    is_coordinator: false,
+                },
+            ],
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_reconnect_request() {
+        let msg = ControlMsg::ReconnectRequest {
+            identity: "returning-peer".to_string(),
+            ip: Ipv4Addr::new(100, 64, 7, 42),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_mesh_hello_with_identity() {
         let msg = ControlMsg::MeshHello {
+            identity: "peer-xyz".to_string(),
             ip: Ipv4Addr::new(100, 64, 0, 4),
         };
         let bytes = encode_msg(&msg);

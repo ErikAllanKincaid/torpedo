@@ -30,8 +30,16 @@ enum Command {
     },
 }
 
+fn check_root() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("pitopi requires root privileges to create TUN devices. Run with sudo.");
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    check_root();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();

@@ -463,12 +463,18 @@ async fn try_reconnect_to_known_peers(
     None
 }
 
-async fn enter_mesh(
+/// Shared join logic: handshake + peer connections + listeners.
+/// Does NOT create a TUN device or run the forwarding loop.
+/// Returns Ok(()) once setup is complete; background tasks run until `token` is cancelled.
+#[allow(clippy::too_many_arguments)]
+async fn join_mesh_shared(
     initial_conn: iroh::endpoint::Connection,
     ep: &Endpoint,
     network_name: &str,
     identity: &IrohIdentityProvider,
     alpn: &[u8],
+    peers: PeerTable,
+    tun_tx: mpsc::Sender<Vec<u8>>,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -528,13 +534,6 @@ async fn enter_mesh(
     );
     config::save(&app_config)?;
 
-    let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
-
-    let peers = PeerTable::new();
-    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
-
-    forward::spawn_tun_writer(tun_dev.share(), tun_rx);
-
     // Add the initial connection peer to routing table
     let remote_id = initial_conn.remote_id().to_string();
     let remote_ip = identity.derive_ip(&remote_id);
@@ -580,10 +579,14 @@ async fn enter_mesh(
         }
     }
 
+    // Shared live member list for mesh_acceptor (updated on ReconnectRequest)
+    let live_members = Arc::new(std::sync::RwLock::new(members.clone()));
+
     // Listen for control messages from initial connection
     let _control_listener = tokio::spawn({
         let initial_conn = initial_conn.clone();
         let token = token.clone();
+        let live_members = live_members.clone();
         async move {
             loop {
                 tokio::select! {
@@ -594,6 +597,7 @@ async fn enter_mesh(
                                 match control::recv_msg(&mut recv).await {
                                     Ok(ControlMsg::MemberSync { members }) => {
                                         tracing::info!(count = members.len(), "member list updated");
+                                        *live_members.write().unwrap() = members;
                                     }
                                     Ok(other) => {
                                         tracing::debug!(?other, "unhandled control message");
@@ -619,7 +623,7 @@ async fn enter_mesh(
         let stats = stats.clone();
         let tun_tx = tun_tx.clone();
         let expected_alpn = alpn.to_vec();
-        let member_list: Vec<Member> = members.clone();
+        let live_members = live_members.clone();
         async move {
             loop {
                 tokio::select! {
@@ -632,22 +636,32 @@ async fn enter_mesh(
                                 }
                                 match conn.accept_bi().await {
                                     Ok((_send, mut recv)) => {
+                                        let transport_id = conn.remote_id().to_string();
                                         match control::recv_msg(&mut recv).await {
                                             Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
+                                                if peer_identity != transport_id {
+                                                    tracing::warn!(claimed = %peer_identity, actual = %transport_id, "identity mismatch in MeshHello");
+                                                    continue;
+                                                }
                                                 tracing::info!(peer_ip = %ip, "mesh peer connected");
                                                 peers.add(ip, conn.clone(), peer_identity);
                                                 forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
                                             }
                                             Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
-                                                let is_known = member_list.iter().any(|m| m.identity == peer_identity);
+                                                if peer_identity != transport_id {
+                                                    tracing::warn!(claimed = %peer_identity, actual = %transport_id, "identity mismatch in ReconnectRequest");
+                                                    continue;
+                                                }
+                                                let is_known = live_members.read().unwrap().iter().any(|m| m.identity == peer_identity);
                                                 if is_known {
                                                     tracing::info!(peer_ip = %ip, "known peer reconnecting");
                                                     peers.add(ip, conn.clone(), peer_identity);
 
+                                                    let current_members = live_members.read().unwrap().clone();
                                                     if let Ok((mut send, _)) = conn.open_bi().await {
                                                         let _ = control::send_msg(
                                                             &mut send,
-                                                            &ControlMsg::MemberSync { members: member_list.clone() },
+                                                            &ControlMsg::MemberSync { members: current_members },
                                                         ).await;
                                                     }
 
@@ -678,6 +692,38 @@ async fn enter_mesh(
             }
         }
     });
+
+    Ok(())
+}
+
+async fn enter_mesh(
+    initial_conn: iroh::endpoint::Connection,
+    ep: &Endpoint,
+    network_name: &str,
+    identity: &IrohIdentityProvider,
+    alpn: &[u8],
+    token: CancellationToken,
+    stats: Arc<Stats>,
+) -> Result<()> {
+    let my_ip = identity.local_ip();
+
+    let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
+    let peers = PeerTable::new();
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    forward::spawn_tun_writer(tun_dev.share(), tun_rx);
+
+    join_mesh_shared(
+        initial_conn,
+        ep,
+        network_name,
+        identity,
+        alpn,
+        peers.clone(),
+        tun_tx.clone(),
+        token.clone(),
+        stats.clone(),
+    )
+    .await?;
 
     forward::run_mesh(tun_dev, peers, tun_tx, token, stats).await
 }
@@ -816,18 +862,38 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
         let alpn = transport::network_alpn(&net.name);
 
         if net.my_ip.is_some() {
-            // We're a member — join
+            // We're a member — join using the shared TUN/peers
             let coordinator_id: EndpointId = net
                 .coordinator_id
                 .parse()
                 .context("invalid coordinator id in config")?;
             let name = net.name.clone();
             let ep = ep.clone();
+            let identity = identity.clone();
+            let peers = peers.clone();
+            let tun_tx = tun_tx.clone();
+            let token = token.clone();
+            let stats = stats.clone();
             handles.push(tokio::spawn(async move {
                 tracing::info!(network = %name, "connecting...");
                 match transport::connect_to_peer_with_alpn(&ep, coordinator_id, &alpn).await {
-                    Ok(_conn) => {
+                    Ok(conn) => {
                         tracing::info!(network = %name, "connected");
+                        if let Err(e) = join_mesh_shared(
+                            conn,
+                            &ep,
+                            &name,
+                            &identity,
+                            &alpn,
+                            peers,
+                            tun_tx,
+                            token,
+                            stats,
+                        )
+                        .await
+                        {
+                            tracing::warn!(network = %name, error = %e, "join_mesh_shared failed");
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(network = %name, error = %e, "failed to connect");

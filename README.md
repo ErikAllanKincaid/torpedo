@@ -87,18 +87,45 @@ pitopi status    # shows both networks with live peer info
 
 Networks are fully isolated — different encryption contexts, different peer sets, no cross-talk.
 
+### Access control
+
+Coordinators can define who can reach whom within a network using identity/tag-based ACL rules:
+
+```bash
+# Tag peers by role
+pitopi acl gaming tag servers ab3f... d92c...
+pitopi acl gaming tag admins ee11...
+
+# Allow rules (no rules = open; any rules = deny-all except allowed)
+pitopi acl gaming allow admins -> all       # admins reach everyone
+pitopi acl gaming allow all -> servers      # everyone reaches servers
+
+# Show current ACL
+pitopi acl gaming show
+
+# Push changes to all peers
+pitopi acl gaming apply
+```
+
+ACL rules are distributed to all peers via iroh-blobs and enforced at the packet forwarding layer on every node. ACL state is persisted to `~/.config/pitopi/acl/<network>.acl`.
+
 ## Commands
 
 | Command | Description | Needs daemon |
 |---------|-------------|:---:|
 | `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
 | `sudo pitopi up` | Alias for `daemon` | — |
-| `pitopi create --name NAME` | Create a network (you become coordinator) | Yes |
-| `pitopi join ROOM-CODE` | Join a network using a room code | Yes |
+| `pitopi create` | Create a network (generates three-word name) | Yes |
+| `pitopi join NAME` | Join a network by three-word name via DHT | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
+| `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show saved networks from config file | No |
+| `pitopi acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
+| `pitopi acl NAME allow SRC -> DST` | Add an allow rule (coordinator) | Yes |
+| `pitopi acl NAME show` | Display current ACL state | Yes |
+| `pitopi acl NAME apply` | Push ACL changes to all peers | Yes |
 | `pitopi install-service` | Install systemd/launchd service | No |
 | `pitopi uninstall-service` | Remove system service | No |
 | `pitopi completions SHELL` | Generate shell completions | No |
@@ -156,7 +183,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Persistent network config
 - [x] Room codes for easy sharing
 - [x] DHT membership publishing for offline coordinator resilience
-- [x] ACL policy engine and audit logging
+- [x] Distributed ACLs with tag-based allow rules (coordinator-managed, enforced on all peers)
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
 - [ ] Social discovery (Discord, Slack, Steam)

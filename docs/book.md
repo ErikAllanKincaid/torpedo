@@ -318,6 +318,12 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show saved networks from config file | No |
+| `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
+| `pitopi acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
+| `pitopi acl NAME allow SRC -> DST` | Add an allow rule | Yes |
+| `pitopi acl NAME remove INDEX` | Remove a rule by index | Yes |
+| `pitopi acl NAME show` | Display current ACL state | Yes |
+| `pitopi acl NAME apply` | Re-publish current ACL to all peers | Yes |
 | `pitopi install-service` | Install systemd/launchd service | No |
 | `pitopi uninstall-service` | Remove system service | No |
 | `pitopi completions SHELL` | Generate shell completions | No |
@@ -1068,166 +1074,128 @@ From those keys the joiner can resolve the seed list and membership blob without
 
 **Module:** `src/acl.rs`
 
-The ACL module provides a packet-level firewall for filtering traffic at the forwarding layer. While not yet wired into the main forwarding loop, it defines the data structures and logic for rule-based packet filtering.
+Pitopi supports distributed, identity/tag-based ACLs. The coordinator manages allow rules that are published to all peers and enforced at the packet forwarding layer.
 
-### Layered policy model
+### Policy model
 
-Access control in pitopi is layered -- both the network admin (coordinator) and individual users define policy. The most restrictive rule wins:
+ACLs are allow-only. The semantics are simple:
 
-```
-  .----------------------------------------------------------------------.
-  |                     Network (coordinator's ACL)                       |
-  |                                                                       |
-  |   Admin sets network-wide rules:                                      |
-  |     - tag:tech cannot access tag:accounting                           |
-  |     - tag:accounting cannot access tag:tech                           |
-  |     - everyone can access tag:infra                                   |
-  |                                                                       |
-  |   .--------------------.  .--------------------.  .----------------. |
-  |   |  User A            |  |  User B            |  |  Server C      | |
-  |   |  tags: [tech]      |  |  tags: [accounting]|  |  tags: [infra] | |
-  |   |                    |  |                    |  |                | |
-  |   |  User's own ACL:   |  |  User's own ACL:   |  |  Server ACL:   | |
-  |   |  "block all my     |  |  "allow only       |  |  "allow only   | |
-  |   |   ports except     |  |   port 443"        |  |   port 25565"  | |
-  |   |   22 and 8080"     |  |                    |  |                | |
-  |   '--------------------'  '--------------------'  '----------------' |
-  '----------------------------------------------------------------------'
+- **No rules:** all traffic is allowed (open network).
+- **Any rules:** only explicitly allowed traffic passes; everything else is denied.
 
-  Packet from User A to Server C (port 25565):
-    1. Admin ACL:  tech -> infra?  ALLOW (admin says everyone can reach infra)
-    2. User A ACL: outbound?       ALLOW (User A doesn't restrict outbound)
-    3. Server ACL: inbound 25565?  ALLOW (Server C allows 25565)
-    --> packet delivered
+This is an intentionally conservative model: the moment you add any rule, the default becomes deny-all.
 
-  Packet from User A to User B (port 443):
-    1. Admin ACL:  tech -> accounting?  DENY  (admin blocks cross-department)
-    --> packet dropped (never reaches User B's ACL)
-```
+ACLs are enforced at the forwarding layer on every peer:
+- **Outbound** (`run_mesh`): packets read from the TUN device are checked before being sent to the destination peer.
+- **Inbound** (`spawn_peer_reader`): packets received from peers are checked before being written to the local TUN device.
 
-The admin's network-wide policy is evaluated first. If allowed, the sender's outbound ACL is checked, then the receiver's inbound ACL. All three must allow the packet.
-
-Pitopi's own control traffic (QUIC streams for membership, mesh hello, etc.) is always exempt -- ACLs only filter data-plane packets tunneled through the TUN device.
+Control traffic (QUIC streams for membership, mesh hello, etc.) is always exempt — ACLs only filter data-plane packets tunneled through the TUN device.
 
 ### Tags
 
-Tags are labels attached to peers by the coordinator. They enable group-based policies without listing individual IPs:
+Tags are named labels that group peers. They enable group-based rules without listing individual endpoint IDs:
 
 ```
-  .---------- "company" network -----------.
-  |                                         |
-  |  tag:tech         tag:accounting        |
-  |  .----------.     .----------.          |
-  |  | (User 1) |     | (User 4) |         |
-  |  | (User 2) |     | (User 5) |         |
-  |  | (User 3) |     | (User 6) |         |
-  |  '----------'     '----------'          |
-  |         \             /                 |
-  |          \ BLOCKED   /                  |
-  |           \  by     /                   |
-  |            \ admin /                    |
-  |             X    X                      |
-  |            / \  / \                     |
-  |           / ALLOWED\                    |
-  |          /    by    \                   |
-  |         /    admin   \                  |
-  |  tag:infra                              |
-  |  .-----------------------------.        |
-  |  | (Jenkins) (DB) (Monitoring) |        |
-  |  '-----------------------------'        |
-  '-----------------------------------------'
+pitopi acl gentle-amber-fox tag servers ab3f... d92c...
+# assigns the "servers" tag to two peers
 
-  Admin ACL:
-    deny  tag:tech      -> tag:accounting
-    deny  tag:accounting -> tag:tech
-    allow *             -> tag:infra
-    allow tag:infra     -> *
+pitopi acl gentle-amber-fox allow servers -> servers
+# allow all tagged servers to reach each other
 ```
 
-Tags are assigned at approval time and stored in the member/approved lists. A peer can have multiple tags.
+Targets in allow rules can be:
+- A tag name (e.g., `servers`) — matches any peer with that tag
+- `all` — matches any peer in the network
+- An endpoint ID prefix — matches a specific peer
 
-### User self-policy
+### CLI commands
 
-Every user can define their own inbound ACL, independent of the admin's network policy. This lets users lock down their own device:
+All ACL commands are scoped to a network. Only the coordinator should modify ACLs; peers apply coordinator-published changes.
+
+```bash
+# Assign tags to peers (by endpoint ID prefix)
+pitopi acl gentle-amber-fox tag servers ab3f... d92c...
+
+# Remove a tag from peers
+pitopi acl gentle-amber-fox untag servers ab3f...
+
+# Add an allow rule: src -> dst
+pitopi acl gentle-amber-fox allow servers -> servers
+pitopi acl gentle-amber-fox allow all -> servers
+
+# Remove a rule by index (shown in 'show' output)
+pitopi acl gentle-amber-fox remove 0
+
+# Show current ACL state
+pitopi acl gentle-amber-fox show
+
+# Re-publish the current ACL to all peers (force push)
+pitopi acl gentle-amber-fox apply
+```
+
+### File format
+
+ACLs are persisted to `~/.config/pitopi/acl/<network>.acl` as a plain-text file:
 
 ```
-  User A's local ACL (~/.config/pitopi/acl.toml):
-
-    default = "deny-all"
-
-    [[rules]]
-    port = 22
-    allow = true
-
-    [[rules]]
-    port = 8080
-    allow = true
-
-  Effect: User A accepts SSH and web traffic, drops everything else.
-  Even if the admin's network ACL allows traffic to User A,
-  User A's own policy has the final say on inbound packets.
+tag servers ab3f1234... d92c5678...
+tag admins aa11...
+allow servers -> servers
+allow admins -> all
 ```
 
-### Policy structure (current implementation)
+Lines starting with `tag` define tag assignments. Lines starting with `allow` define rules. The file is reloaded on daemon startup.
 
-The current ACL implementation works at the IP+port level:
+### Distribution
+
+ACL state is distributed using the same iroh-blobs + pkarr pattern as membership:
+
+1. Coordinator serializes `AclData` to canonical msgpack, hashes with blake3.
+2. Publishes the hash to the ACL pkarr record (4th record type, keyed by `derive_acl_key`).
+3. Broadcasts an `AclUpdated { acl_hash }` control message to all connected peers.
+4. Peers receive `AclUpdated`, fetch the blob from the coordinator via iroh-blobs, verify the blake3 hash, and load the new ACL into memory.
+
+On join, the Welcome message includes `acl_dht_id` so new peers can fetch the current ACL from the DHT even if they missed the broadcast.
+
+### Data structures
 
 ```rust
-pub struct AclPolicy {
-    pub default: DefaultPolicy,  // DenyAll, AllowSameNetwork, or AllowAll
-    pub rules: Vec<AclRule>,
+pub struct AclData {
+    pub tags: Vec<TagAssignment>,   // peer → tag label mappings
+    pub rules: Vec<AclRule>,        // ordered allow rules
+}
+
+pub struct TagAssignment {
+    pub tag: String,
+    pub peers: Vec<EndpointId>,
 }
 
 pub struct AclRule {
-    pub src: Ipv4Addr,
-    pub dst: Ipv4Addr,
-    pub port: Option<u16>,
-    pub allow: bool,
+    pub src: AclTarget,
+    pub dst: AclTarget,
+}
+
+pub enum AclTarget {
+    EndpointId(EndpointId),
+    Tag(String),
+    All,
 }
 ```
 
-### Evaluation
+### Example: server network
 
-Rules are evaluated in order. The first rule matching the packet's source, destination, and port determines the action. If no rule matches, the default policy applies.
+```bash
+# Tag all game servers
+pitopi acl gaming tag servers server1... server2... server3...
 
-Port matching works for TCP and UDP packets. The destination port is extracted from bytes 2-3 of the transport header (after the IP header). For ICMP and other protocols without ports, port-based rules don't match.
+# Allow all members to reach servers
+pitopi acl gaming allow all -> servers
 
-### Example use cases
+# Allow servers to reach each other (for replication)
+pitopi acl gaming allow servers -> servers
 
-**Block all traffic except Minecraft:**
-```rust
-let mut policy = AclPolicy::deny_all();
-policy.rules.push(AclRule {
-    src: Ipv4Addr::new(100, 64, 0, 2),
-    dst: Ipv4Addr::new(100, 64, 0, 1),
-    port: Some(25565),
-    allow: true,
-});
-```
-
-**Allow all traffic except from a specific peer:**
-```rust
-let mut policy = AclPolicy::allow_all();
-policy.rules.push(AclRule {
-    src: Ipv4Addr::new(100, 64, 0, 3),
-    dst: Ipv4Addr::new(100, 64, 0, 1),
-    port: None,
-    allow: false,
-});
-```
-
-### Serialization
-
-The policy is serializable to TOML, enabling future file-based ACL configuration:
-
-```toml
-default = "deny-all"
-
-[[rules]]
-src = "100.64.0.2"
-dst = "100.64.0.1"
-port = 25565
-allow = true
+# Result: regular members cannot reach each other directly —
+# all traffic must go through a server
 ```
 
 ---
@@ -1348,9 +1316,9 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 **Module:** `src/dht.rs`
 
-Pitopi publishes network membership to iroh's pkarr relay so that peers can discover each other even when the coordinator is offline. Three pkarr record types work together to enable coordinator-free joins starting from just a three-word name.
+Pitopi publishes network membership and ACL data to iroh's pkarr relay so that peers can discover each other and fetch policy even when the coordinator is offline. Four pkarr record types work together to enable coordinator-free joins starting from just a three-word name.
 
-### Three-record model
+### Four-record model
 
 ```
   User types:  "gentle-amber-fox"
@@ -1363,18 +1331,18 @@ Pitopi publishes network membership to iroh's pkarr relay so that peers can disc
           .---------+---------.
           |                   |
           v                   v
-  [2] Seed list record    [3] Membership record
-      (keyed by              (keyed by
-       network_pkarr_pubkey)  membership_dht_pubkey)
-        → online peer          → blake3 hash of
-          EndpointIds            canonical member blob
-                    |                   |
-                    '------- both ------'
+  [2] Seed list record    [3] Membership record    [4] ACL record
+      (keyed by              (keyed by                (keyed by
+       network_pkarr_pubkey)  membership_dht_pubkey)   acl_dht_pubkey)
+        → online peer          → blake3 hash of         → blake3 hash of
+          EndpointIds            canonical member blob    canonical ACL blob
+                    |                   |                       |
+                    '------- all -------+----------- -----------'
                                 |
                                 v
-                    fetch blob from any seed peer
-                    verify blake3 hash
-                    get full member + approved lists
+                    fetch blobs from any seed peer
+                    verify blake3 hashes
+                    get full member + approved lists + ACL rules
 ```
 
 #### Record 1: Directory record
@@ -1417,6 +1385,19 @@ Maps the `membership_dht_pubkey` to a blake3 hash of the canonical membership bl
 The full membership data is serialized as msgpack (sorted by identity for determinism) and stored in each peer's iroh-blobs store (`FsStore`). Every peer serves blobs via the iroh-blobs protocol (`/iroh-bytes/4` ALPN). The record contains only the hash — not member entries — keeping it well within DNS TXT record size limits regardless of network size.
 
 `MembershipData` now includes `network_secret` and `membership_signing_key` fields so peers receiving it can independently publish seed list records and verify DHT keys.
+
+#### Record 4: ACL record
+
+Maps the `acl_dht_pubkey` (derived from the coordinator's secret key + network name via `blake3::derive_key("pitopi/acl/...")`) to a blake3 hash of the canonical ACL blob:
+
+```rust
+pub fn derive_acl_key(coordinator_key: &SecretKey, network_name: &str) -> SecretKey { ... }
+pub fn acl_dht_id(coordinator_key: &SecretKey, network_name: &str) -> PublicKey { ... }
+pub async fn publish_acl(acl: &AclData, key: &SecretKey) -> Result<()> { ... }
+pub async fn resolve_acl_hash(pubkey: &PublicKey) -> Result<Hash> { ... }
+```
+
+The full ACL blob is serialized as msgpack (sorted for determinism) and stored in the iroh-blobs store. The record contains only the hash. Peers receive `AclUpdated` pushes in real time; the DHT record is a fallback for joiners and reconnecting peers. Only the coordinator can publish ACL updates (only they hold the `coordinator_key`).
 
 ### Membership data exchange via iroh-blobs
 
@@ -1905,11 +1886,12 @@ No peer can assign a different IP than what the identity hash produces. This mea
 
 ### DHT record integrity
 
-Pitopi uses three pkarr record types with different trust levels:
+Pitopi uses four pkarr record types with different trust levels:
 
 - **Directory records** map the network name to DHT public keys. They are keyed by a deterministic hash of the network name (no secret required to look up, but no secret to forge either — the record is informational).
 - **Seed list records** are signed by `network_pkarr_pubkey`, derived from `network_secret`. Only peers in possession of the membership blob (which contains `network_secret`) can publish or update seed lists.
 - **Membership records** are signed by `membership_signing_key`, derived from the coordinator's private secret key. Only the coordinator can publish membership updates. The pkarr relay verifies signatures, and peers verify the blake3 hash of the membership blob before trusting its contents.
+- **ACL records** are signed by `acl_signing_key`, derived from the coordinator's private secret key + network name. Only the coordinator can publish ACL updates. Peers verify the blake3 hash of the ACL blob before applying it.
 
 A rogue peer outside the network cannot forge any of these records without either the coordinator's private key (for membership) or the `network_secret` from the membership blob (for seed lists).
 

@@ -25,6 +25,14 @@ cargo -q run -- nuke gentle-amber-fox       # publish empty membership + leave
 cargo -q run -- status              # live peer info from daemon
 cargo -q run -- down                # shut down the daemon
 
+# ACL management (coordinator only, requires daemon running)
+cargo -q run -- acl gentle-amber-fox tag servers ab3f d92c
+cargo -q run -- acl gentle-amber-fox untag servers ab3f
+cargo -q run -- acl gentle-amber-fox allow servers -> servers
+cargo -q run -- acl gentle-amber-fox remove 0
+cargo -q run -- acl gentle-amber-fox show
+cargo -q run -- acl gentle-amber-fox apply   # re-publish current ACL to peers
+
 # Standalone (no daemon needed)
 cargo -q run -- list                # show saved networks from config
 
@@ -53,20 +61,20 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 ### Modules
 
-- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create` (no --name, daemon generates name), `pitopi join <three-word-name>`, `pitopi nuke <name>`
-- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable), NetworkHandle per active network, IPC server over Unix socket, coordinator accept loop, joiner mesh logic, reconnect loop, DHT publishers (membership + seed list), membership poller, three-word name generation, `nuke_network()`, `restore_coordinator_network()`
+- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create` (no --name, daemon generates name), `pitopi join <three-word-name>`, `pitopi nuke <name>`, `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands
+- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable), NetworkHandle per active network, IPC server over Unix socket, coordinator accept loop, joiner mesh logic, reconnect loop, DHT publishers (membership + seed list + ACL), membership poller, three-word name generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL fetch on join via `acl_dht_id` from Welcome, ACL load from file on startup, empty ACL publish on nuke
 - `src/network_name.rs` — three-word name generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
-- `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join` takes `name: String`, `IpcRequest::Nuke { name, force }`
+- `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join` takes `name: String`, `IpcRequest::Nuke { name, force }`, `IpcRequest::AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`; `IpcResponse::AclState`
 - `src/identity.rs` — persistent Ed25519 keypair at `~/.config/pitopi/secret_key`
 - `src/membership.rs` — IdentityProvider trait, FNV-1a IP derivation, MemberList, ApprovedList, GroupMode, MembershipPolicy, canonical msgpack serialization + blake3 hashing (MembershipData); `MembershipData` now includes `network_secret: [u8; 32]` and `membership_signing_key: [u8; 32]`; `canonical_membership_bytes_with_secrets()`
 - `src/transport.rs` — iroh endpoint setup, per-network ALPN, connect/accept
 - `src/tun.rs` — TUN device creation with /10 netmask, split into TunReader/TunWriter for lock-free I/O
-- `src/forward.rs` — multi-peer forwarding: TUN → routing table → correct peer connection, DisconnectEvent notification on peer drop
-- `src/dht.rs` — three pkarr record types: directory record (human name → network keys, `derive_directory_key`, `directory_dht_id`, `encode/decode_directory_record`, `publish/resolve_directory`), seed list record (network secret → online peer endpoints, `encode/decode_seed_list_record`, `publish/resolve_seed_list`), membership record (coordinator key → blob hash, existing logic)
-- `src/control.rs` — control protocol: Welcome, MemberApproved, JoinApproved, JoinDenied, MemberSync, MeshHello, MeshWelcome, ReconnectRequest, AdvertiseServices
-- `src/peers.rs` — PeerTable (routing by dest IP), PeerEntry with Connection + endpoint_id + network name, remove_by_network for teardown
+- `src/forward.rs` — multi-peer forwarding: TUN → routing table → correct peer connection, DisconnectEvent notification on peer drop; ACL enforcement in `run_mesh` (outbound: local→peer) and `spawn_peer_reader` (inbound: peer→local); denied packets dropped with `stats.record_drop()`
+- `src/dht.rs` — four pkarr record types: directory record (human name → network keys, `derive_directory_key`, `directory_dht_id`, `encode/decode_directory_record`, `publish/resolve_directory`), seed list record (network secret → online peer endpoints, `encode/decode_seed_list_record`, `publish/resolve_seed_list`), membership record (coordinator key → blob hash, existing logic), ACL record (coordinator key + network name → ACL blob hash, `derive_acl_key`, `acl_dht_id`, `publish_acl`, `resolve_acl_hash`)
+- `src/control.rs` — control protocol: Welcome, MemberApproved, JoinApproved, JoinDenied, MemberSync, MeshHello, MeshWelcome, ReconnectRequest, AdvertiseServices, `AclUpdated { acl_hash }`; Welcome includes `acl_dht_id`
+- `src/peers.rs` — PeerTable (routing by dest IP), PeerEntry with Connection + endpoint_id + network name, remove_by_network for teardown; `SharedAcl` type, `PeerTable::lookup_full()` for ACL-aware routing
 - `src/config.rs` — persistent network config at `~/.config/pitopi/networks.toml` (members + approved list); `NetworkConfig` has `network_pkarr_pubkey: Option<String>` and `membership_dht_pubkey: Option<String>` instead of `coordinator_id`
-- `src/acl.rs` — ACL policy engine: default policies, per-rule src/dst/port matching, packet filtering (not yet wired in)
+- `src/acl.rs` — identity/tag-based ACL policy engine: AclData (tags + allow-only rules), canonical msgpack serialization + blake3 hashing, rule evaluation by EndpointId with tag support, `.acl` file parser/formatter; distributed via iroh blobs; no rules = allow-all, any rules = deny-all except explicit allows
 - `src/audit.rs` — append-only audit log at `~/.config/pitopi/audit.log` (not yet wired in)
 - `src/stats.rs` — packet/byte counters with periodic logging
 - `src/shutdown.rs` — SIGINT/SIGTERM handling via CancellationToken
@@ -77,17 +85,21 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 **Join:** looks up three-word name via directory DHT → resolves seed list (network secret → online peer endpoints) and membership hash in parallel → fetches membership blob from any reachable seed peer via iroh-blobs → verifies blake3 hash → connects to coordinator or mesh peer → receives Welcome (member list + approved list) → joiner checks own IP for collision → creates TUN device → connects to each existing peer with MeshHello → spawns per-peer datagram readers → runs mesh forwarding loop.
 
-**Nuke:** publishes empty membership record + empty seed list to pkarr (announcing the network is gone) → leaves the network (tears down connections, removes from config).
+**Nuke:** publishes empty membership record, empty seed list, and empty ACL record to pkarr (announcing the network is gone) → leaves the network (tears down connections, removes from config).
+
+**ACL management:** Coordinator uses `pitopi acl` CLI commands (tag/untag/allow/remove/show/apply) to manage identity/tag-based allow rules. Changes are persisted to `~/.config/pitopi/acl/<network>.acl`, serialized as a canonical msgpack blob, hashed with blake3, published to pkarr (4th record type), and broadcast to all peers via `AclUpdated` control message. Peers fetch the blob, verify the hash, and enforce rules at the PeerTable routing layer. No rules = allow-all; any rules = deny-all except explicitly allowed traffic.
 
 **Gatekeeper model:** coordinator approves identities and broadcasts MemberApproved. Any peer can then welcome an approved identity when it connects. The coordinator doesn't need to be online when the approved peer actually joins.
 
-**DHT membership (three-record model):** Three pkarr record types enable coordinator-free joins:
+**DHT membership (four-record model):** Four pkarr record types enable coordinator-free joins and distributed ACL distribution:
 
 1. **Directory record** (`derive_directory_key` from blake3 of network name): maps the human-readable three-word name → `{network_secret, membership_signing_key}`. Any peer can look up a network by name.
 
 2. **Seed list record** (derived from `network_secret`): maps the network secret → list of online peer `EndpointId`s. Updated by `spawn_seed_list_publisher()` every 300s. Joiners use this to find online peers to fetch the membership blob from.
 
 3. **Membership record** (derived from coordinator's secret key + network name via `blake3::derive_key`): stores a blake3 hash of canonical membership data (msgpack-serialized, sorted by identity). Joiners resolve the hash then fetch the full blob from any seed peer via iroh-blobs, verifying the hash before trusting the data.
+
+4. **ACL record** (derived from coordinator's secret key + network name via `blake3::derive_key("pitopi/acl/...")`): stores a blake3 hash of canonical ACL data (msgpack-serialized). Peers fetch the full blob via iroh-blobs. Coordinator pushes `AclUpdated` to all peers on change — no polling needed.
 
 `MembershipData` includes `network_secret` and `membership_signing_key` fields so all peers can republish seed list records. A background `spawn_membership_poller()` checks the membership hash every 60s and reconciles any changes (new members approved while a peer was offline).
 
@@ -102,14 +114,14 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 ## Key Dependencies
 
 - `iroh` — P2P QUIC transport with NAT traversal and relay fallback
-- `iroh-blobs` — content-addressed blob transfer for membership data exchange (FsStore, BlobsProtocol)
+- `iroh-blobs` — content-addressed blob transfer for membership and ACL data exchange (FsStore, BlobsProtocol)
 - `iroh-dns` — pkarr `SignedPacket` for DHT membership records
 - `blake3` — key derivation for per-network DHT signing keys, membership data hashing
 - `rand` — random three-word network name generation (`network_name::generate_name()`)
 - `tun` — cross-platform TUN device (macOS utun, Linux /dev/net/tun)
 - `tokio` — async runtime
 - `clap` + `clap_complete` — CLI parsing and shell completions
-- `rmp-serde` — msgpack serialization for canonical membership data (compact, deterministic)
+- `rmp-serde` — msgpack serialization for canonical membership and ACL data (compact, deterministic)
 - `serde` + `serde_json` + `toml` — serialization for control messages and config
 - `dirs` — platform config directory resolution
 
@@ -122,6 +134,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - TUN MTU: 1200 (fits within QUIC datagram limits)
 - Identity persists to `~/.config/pitopi/secret_key` — same EndpointId across restarts
 - Config persists to `~/.config/pitopi/networks.toml`
+- ACL rules persist to `~/.config/pitopi/acl/<network>.acl` (text format: `tag <name> <peer-ids>` and `allow <src> -> <dst>` lines)
 - macOS TUN requires destination address (point-to-point interface)
 - Control messages: length-prefixed JSON (4-byte BE length + JSON body) over QUIC bidirectional streams
 - Three-word names: adjective-noun-noun format (e.g., `gentle-amber-fox`), generated by `network_name::generate_name()` at create time; used as the human-friendly network identifier for joining via DHT lookup; replaces room codes entirely

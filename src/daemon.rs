@@ -99,11 +99,7 @@ impl DaemonState {
             IpcRequest::Create { mode } => self.create_network(mode).await,
             IpcRequest::Join { name } => self.join_network(&name).await,
             IpcRequest::Leave { name } => self.leave_network(&name).await,
-            IpcRequest::Nuke { name, force: _ } => {
-                // TODO(task-8): implement nuke
-                let _ = name;
-                IpcResponse::Error { message: "nuke not yet implemented".to_string() }
-            }
+            IpcRequest::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcRequest::Status => self.status(),
             IpcRequest::Shutdown => {
                 self.shutdown_token.cancel();
@@ -754,6 +750,66 @@ impl DaemonState {
             name: name.to_string(),
             my_ip,
         })
+    }
+
+    async fn nuke_network(&self, name: &str, force: bool) -> IpcResponse {
+        // Check we're the coordinator and whether other members exist
+        let (is_coordinator, has_other_members) = {
+            let networks = self.networks.read().unwrap();
+            let handle = match networks.get(name) {
+                Some(h) => h,
+                None => return IpcResponse::Error {
+                    message: format!("not in network '{name}'"),
+                },
+            };
+            let state = handle.state.read().unwrap();
+            let my_id = self.endpoint.id();
+            let is_coord = state.members.get(&my_id)
+                .map(|m| m.is_coordinator)
+                .unwrap_or(false);
+            let others = state.members.all().len() > 1;
+            (is_coord, others)
+        };
+
+        if !is_coordinator {
+            return IpcResponse::Error {
+                message: "only the coordinator can nuke a network".to_string(),
+            };
+        }
+
+        if has_other_members && !force {
+            return IpcResponse::Error {
+                message: "network has other members — use --force to destroy, or transfer ownership first".to_string(),
+            };
+        }
+
+        // Publish empty membership and empty seed list to DHT
+        if let Ok(client) = dht::create_pkarr_client(&self.endpoint) {
+            let membership_key = dht::derive_membership_key(&self.secret_key, name);
+
+            // Publish empty membership hash
+            let empty_members = MemberList::new();
+            let empty_approved = ApprovedList::new();
+            let empty_hash = membership_hash(&empty_members, &empty_approved);
+            if let Err(e) = dht::publish_membership(&client, &membership_key, &empty_hash).await {
+                tracing::warn!(error = %e, "failed to publish empty membership on nuke");
+            }
+
+            // Publish empty seed list
+            let network_secret = {
+                let networks = self.networks.read().unwrap();
+                let handle = networks.get(name).unwrap();
+                let state = handle.state.read().unwrap();
+                state.network_secret
+            };
+            let seed_key = SecretKey::from_bytes(&network_secret);
+            if let Err(e) = dht::publish_seed_list(&client, &seed_key, &[]).await {
+                tracing::warn!(error = %e, "failed to publish empty seed list on nuke");
+            }
+        }
+
+        // Leave the network (handles cleanup, config removal, etc.)
+        self.leave_network(name).await
     }
 
     async fn leave_network(&self, name: &str) -> IpcResponse {

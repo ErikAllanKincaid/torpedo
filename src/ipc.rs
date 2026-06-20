@@ -25,6 +25,31 @@ pub enum IpcRequest {
     },
     Status,
     Shutdown,
+    AclTag {
+        network: String,
+        tag: String,
+        peer_ids: Vec<String>,
+    },
+    AclUntag {
+        network: String,
+        tag: String,
+        peer_id: String,
+    },
+    AclAllow {
+        network: String,
+        src: String,
+        dst: String,
+    },
+    AclRemove {
+        network: String,
+        index: usize,
+    },
+    AclShow {
+        network: String,
+    },
+    AclApply {
+        network: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +71,9 @@ pub enum IpcResponse {
     Status {
         endpoint_id: String,
         networks: Vec<NetworkStatus>,
+    },
+    AclState {
+        display: String,
     },
 }
 
@@ -140,6 +168,40 @@ mod tests {
             IpcResponse::Created { name, my_ip } => {
                 assert_eq!(name, "test");
                 assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_acl_tag_roundtrip() {
+        let req = IpcRequest::AclTag {
+            network: "gentle-amber-fox".to_string(),
+            tag: "servers".to_string(),
+            peer_ids: vec!["ab3f".to_string(), "d92c".to_string()],
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let decoded: IpcRequest = serde_json::from_slice(&json).unwrap();
+        match decoded {
+            IpcRequest::AclTag { network, tag, peer_ids } => {
+                assert_eq!(network, "gentle-amber-fox");
+                assert_eq!(tag, "servers");
+                assert_eq!(peer_ids.len(), 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_acl_state_response_roundtrip() {
+        let resp = IpcResponse::AclState {
+            display: "Tags:\n  servers: ab3f\n".to_string(),
+        };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
+        match decoded {
+            IpcResponse::AclState { display } => {
+                assert!(display.contains("servers"));
             }
             _ => panic!("wrong variant"),
         }

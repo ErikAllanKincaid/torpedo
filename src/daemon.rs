@@ -105,6 +105,14 @@ impl DaemonState {
                 self.shutdown_token.cancel();
                 IpcResponse::Ok { message: "shutting down".to_string() }
             }
+            IpcRequest::AclTag { .. }
+            | IpcRequest::AclUntag { .. }
+            | IpcRequest::AclAllow { .. }
+            | IpcRequest::AclRemove { .. }
+            | IpcRequest::AclShow { .. }
+            | IpcRequest::AclApply { .. } => IpcResponse::Error {
+                message: "ACL commands not yet implemented".to_string(),
+            },
         }
     }
 

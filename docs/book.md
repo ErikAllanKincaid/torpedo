@@ -16,7 +16,7 @@ A complete guide to pitopi's architecture, protocols, and internals.
 8. [Packet Forwarding](#8-packet-forwarding)
 9. [Peer Table](#9-peer-table)
 10. [Configuration](#10-configuration)
-11. [Room Codes](#11-room-codes)
+11. [Three-Word Names](#11-three-word-names)
 12. [Access Control](#12-access-control)
 13. [Audit Logging](#13-audit-logging)
 14. [Statistics](#14-statistics)
@@ -127,23 +127,26 @@ In a company, different departments run separate networks. Shared services (like
 
 ### Joining a network (invitation)
 
-The coordinator creates a network and shares its room code. That code is the invitation:
+The coordinator creates a network and gets a three-word name. That name is the invitation:
 
 ```
                                          .-------------------------.
                                          |    User's network       |
   (Friend 1) <--- invitation ---------- |                         |
-                   (room code)           |     (User's device)     |
+                   (three-word name)     |     (User's device)     |
                                          |                         |
                                          '-------------------------'
 
-  1.  User creates network:    sudo pitopi create --name gaming
-      --> prints room code:    gaming/ybnr-xfmo-...
+  1.  User creates network:    pitopi create
+      --> prints network name: gentle-amber-fox
+          (adjective-noun-noun, randomly generated)
 
-  2.  User shares room code with Friend 1 (chat, email, etc.)
+  2.  User shares name with Friend 1 (chat, email, etc.)
 
-  3.  Friend 1 joins:          sudo pitopi join gaming/ybnr-xfmo-...
-      --> coordinator approves
+  3.  Friend 1 joins:          pitopi join gentle-amber-fox
+      --> daemon resolves name via directory DHT
+      --> fetches member list from online peers via iroh-blobs
+      --> coordinator approves (or peer welcomes if already approved)
       --> Friend 1 gets Welcome (member list, approved list)
       --> Friend 1 connects to all existing peers
       --> full mesh established
@@ -227,28 +230,37 @@ The daemon is a long-lived process that owns the iroh endpoint, TUN device, and 
 In another terminal, create a network:
 
 ```bash
-pitopi create --name gaming
+pitopi create
 ```
 
 This produces output like:
 
 ```
-Network 'gaming' created.
+Network 'gentle-amber-fox' created.
   IP: 100.64.23.142
-  Room code: gaming/ybnj-raqe-c5s6-...
 ```
 
-The coordinator's IP is deterministically derived from their cryptographic identity. The room code is a human-friendly encoding of the coordinator's EndpointId.
+The daemon automatically generates a three-word name (adjective-noun-noun) and publishes the network to the DHT. The coordinator's IP is deterministically derived from their cryptographic identity.
 
 ### Joining a network
 
-Other peers join by providing the room code:
+Other peers join by providing the three-word name:
 
 ```bash
-pitopi join gaming/ybnj-raqe-c5s6-...
+pitopi join gentle-amber-fox
 ```
 
-The joiner connects to the coordinator, receives approval and a member list, and establishes direct connections to every other peer in the mesh.
+The daemon resolves the name via the directory DHT, fetches the current member list from online peers, connects to the coordinator (or any peer), receives approval and a member list, and establishes direct connections to every other peer in the mesh.
+
+### Nuking a network
+
+To permanently remove a network and announce its removal to all peers:
+
+```bash
+pitopi nuke gentle-amber-fox
+```
+
+This publishes empty membership and seed list records to the DHT (so new joiners know the network no longer exists), then leaves the network. Use `--force` to skip the confirmation prompt.
 
 ### Checking status
 
@@ -299,9 +311,10 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 |---------|-------------|:---:|
 | `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
 | `sudo pitopi up` | Alias for `daemon` | — |
-| `pitopi create --name NAME` | Create a network (you become coordinator) | Yes |
-| `pitopi join ROOM-CODE` | Join a network using a room code | Yes |
+| `pitopi create` | Create a network (generates three-word name) | Yes |
+| `pitopi join NAME` | Join a network by three-word name via DHT lookup | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
+| `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show saved networks from config file | No |
@@ -450,6 +463,21 @@ The approve-then-promote lifecycle:
 2. Coordinator broadcasts `MemberApproved` → all peers add the entry to their local approved lists
 3. Approved peer connects to any peer → welcoming peer removes from `ApprovedList`, adds to `MemberList`
 4. Welcoming peer broadcasts `MemberSync` → all peers update their member lists
+
+### MembershipData and canonical serialization
+
+`MembershipData` is the canonical, serializable form of network membership state. It is serialized to msgpack (sorted by identity for determinism) and stored in the iroh-blobs store. It is also blake3-hashed to produce the hash published to the membership DHT record.
+
+```rust
+pub struct MembershipData {
+    pub members: Vec<MemberEntry>,
+    pub approved: Vec<ApprovedConfigEntry>,
+    pub network_secret: [u8; 32],           // for seed list record signing
+    pub membership_signing_key: [u8; 32],   // coordinator's per-network DHT signing key
+}
+```
+
+Including `network_secret` and `membership_signing_key` in the blob means every peer that receives the membership data can independently publish seed list records and verify DHT keys — not just the coordinator. `canonical_membership_bytes_with_secrets()` produces the canonical msgpack bytes for hashing and storage.
 
 ### NetworkState
 
@@ -900,10 +928,11 @@ Pitopi persists network memberships to `~/.config/pitopi/networks.toml` so that 
 
 ```toml
 [[networks]]
-name = "gaming"
-coordinator_id = "abc123def456..."
+name = "gentle-amber-fox"
 group_mode = "open"
 my_ip = "100.64.23.142"
+network_pkarr_pubkey = "abc123def456..."
+membership_dht_pubkey = "def456ghi789..."
 
 [[networks.members]]
 identity = "abc123def456..."
@@ -921,9 +950,9 @@ ip = "100.64.7.99"
 
 [[networks]]
 name = "work"
-coordinator_id = "xyz789..."
 group_mode = "restricted"
-membership_dht_id = "def456..."
+network_pkarr_pubkey = "xyz789..."
+membership_dht_pubkey = "uvw012..."
 ```
 
 ### Data model
@@ -938,15 +967,17 @@ pub struct AppConfig {
 **NetworkConfig** -- a single network membership:
 ```rust
 pub struct NetworkConfig {
-    pub name: String,                       // human-readable name
-    pub coordinator_id: EndpointId,         // EndpointId of the coordinator
-    pub group_mode: GroupMode,              // Open or Restricted
-    pub my_ip: Option<Ipv4Addr>,           // our IP (None if we're the coordinator)
-    pub members: Vec<MemberEntry>,          // connected members
-    pub approved: Vec<ApprovedConfigEntry>, // approved but not yet connected
-    pub membership_dht_id: Option<String>, // DHT signing key for offline discovery
+    pub name: String,                              // three-word network name
+    pub group_mode: GroupMode,                     // Open or Restricted
+    pub my_ip: Option<Ipv4Addr>,                  // our IP (None if we're the coordinator)
+    pub members: Vec<MemberEntry>,                 // connected members
+    pub approved: Vec<ApprovedConfigEntry>,        // approved but not yet connected
+    pub network_pkarr_pubkey: Option<String>,      // DHT public key for seed list record
+    pub membership_dht_pubkey: Option<String>,     // DHT public key for membership blob hash
 }
 ```
+
+Note: `coordinator_id` was removed. The coordinator is identified by `is_coordinator: true` in the members list. The two DHT pubkeys are used for the directory → seed list → membership three-step lookup.
 
 **MemberEntry** -- a connected member:
 ```rust
@@ -992,38 +1023,44 @@ Config is written at several points:
 
 ---
 
-## 11. Room Codes
+## 11. Three-Word Names
 
-**Module:** `src/room_code.rs`
+**Module:** `src/network_name.rs`
 
-EndpointIds are 32-byte binary values. Their hex representation is 64 characters long -- not something you'd want to read aloud to a friend. Room codes solve this by encoding the EndpointId in z-base-32 with dashes for readability.
+EndpointIds are 32-byte binary values, far too unwieldy to share with friends. Pitopi solves this with randomly generated three-word names in the format `adjective-noun-noun` (e.g., `gentle-amber-fox`). These names are memorable, speakable, and easy to share over chat or voice.
 
-### Encoding
+### Generation
 
-Room codes encode both the network name and the coordinator's EndpointId. The EndpointId is encoded in z-base-32, a human-oriented encoding that avoids visually ambiguous characters (no 0/O, 1/l confusion). Dashes are added every 4 characters:
+`generate_name()` selects one word from each of three embedded word lists (adjectives, first-nouns, second-nouns) using a cryptographically random index:
+
+```rust
+pub fn generate_name() -> String {
+    // Uses rand::random to pick indices into embedded word lists
+    // Returns "adjective-noun-noun"
+}
+```
+
+The word lists are embedded at compile time. The combination space is large enough that collisions are extremely rare for typical usage.
+
+### Validation
+
+`is_valid_name(s: &str) -> bool` checks that a string matches the three-word format (all lowercase, hyphen-separated, each word from the known lists). This is used to validate user input on `pitopi join`.
+
+### How names replace room codes
+
+Previously, `pitopi join` required a room code containing the coordinator's EndpointId:
 
 ```
 gaming/ybnj-raqe-c5s6-k7mp-...
 ```
 
-The network name prefix means the `--name` flag is not needed on join — the room code is self-sufficient.
+Now, the name is self-sufficient for joining because the DHT stores a directory record mapping the name to the network's keys:
 
-### Parsing
-
-The `parse_input()` function accepts both raw EndpointId strings and room codes:
-
-```rust
-pub fn parse_input(input: &str) -> Result<RoomCode> {
-    // Try raw EndpointId first (no network name)
-    if let Ok(id) = input.parse::<EndpointId>() {
-        return Ok(RoomCode { network_name: String::new(), endpoint_id: id });
-    }
-    // Otherwise parse as name/code
-    decode(input).context("could not parse as EndpointId or room code")
-}
+```
+gentle-amber-fox   →   (network_pkarr_pubkey, membership_dht_pubkey)
 ```
 
-This flexibility means users can paste either format in the `join` command. When using a raw EndpointId, the `--name` flag is required.
+From those keys the joiner can resolve the seed list and membership blob without knowing the coordinator's EndpointId in advance. This makes pitopi fully coordinator-optional from the user's perspective: once the network is created and the name is shared, the coordinator can go offline and new peers can still join through the mesh.
 
 ---
 
@@ -1311,69 +1348,122 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 **Module:** `src/dht.rs`
 
-Pitopi publishes network membership to iroh's pkarr relay so that peers can discover each other even when the coordinator is offline. This is a best-effort enhancement -- peers always fall back to local config and direct connections if DHT resolution fails.
+Pitopi publishes network membership to iroh's pkarr relay so that peers can discover each other even when the coordinator is offline. Three pkarr record types work together to enable coordinator-free joins starting from just a three-word name.
 
-### How it works
-
-The coordinator derives a per-network Ed25519 signing key from its secret key using blake3 key derivation:
+### Three-record model
 
 ```
-coordinator_secret_key + "pitopi/membership/{network_name}" → blake3::derive_key → membership_key
+  User types:  "gentle-amber-fox"
+                    |
+                    v
+  [1] Directory record  (keyed by blake3 hash of network name)
+        → network_pkarr_pubkey
+        → membership_dht_pubkey
+                    |
+          .---------+---------.
+          |                   |
+          v                   v
+  [2] Seed list record    [3] Membership record
+      (keyed by              (keyed by
+       network_pkarr_pubkey)  membership_dht_pubkey)
+        → online peer          → blake3 hash of
+          EndpointIds            canonical member blob
+                    |                   |
+                    '------- both ------'
+                                |
+                                v
+                    fetch blob from any seed peer
+                    verify blake3 hash
+                    get full member + approved lists
 ```
 
-The public half of this derived key is the `membership_dht_id` -- a stable identifier that peers use to look up the membership record. Different networks get different derived keys, so they don't collide.
+#### Record 1: Directory record
 
-The coordinator publishes a `SignedPacket` (signed DNS TXT record) to `https://dns.iroh.link/pkarr` under this derived key. The pkarr relay verifies the Ed25519 signature, so only the coordinator can publish under that key.
+Maps a human-readable name to the two DHT public keys needed to look up the rest of the network data:
 
-### Record format
+```rust
+pub fn derive_directory_key(network_name: &str) -> SecretKey { ... }
+pub fn directory_dht_id(network_name: &str) -> PublicKey { ... }
+pub fn encode_directory_record(...) -> SignedPacket { ... }
+pub fn decode_directory_record(packet: &SignedPacket) -> Result<(PublicKey, PublicKey)> { ... }
+pub async fn publish_directory(...) -> Result<()> { ... }
+pub async fn resolve_directory(network_name: &str) -> Result<(PublicKey, PublicKey)> { ... }
+```
 
-The pkarr record contains only a blake3 hash pointer, not the membership data itself:
+The directory key is derived from `blake3::hash("pitopi/directory/{network_name}")`. Any peer that knows the network name can look this up — no coordinator needed. Different names produce different keys, so networks don't collide in the DHT.
+
+#### Record 2: Seed list record
+
+Maps the `network_pkarr_pubkey` to a list of currently online peer `EndpointId`s:
+
+```rust
+pub fn encode_seed_list_record(peers: &[EndpointId], key: &SecretKey) -> SignedPacket { ... }
+pub fn decode_seed_list_record(packet: &SignedPacket) -> Result<Vec<EndpointId>> { ... }
+pub async fn publish_seed_list(peers: &[EndpointId], key: &SecretKey) -> Result<()> { ... }
+pub async fn resolve_seed_list(pubkey: &PublicKey) -> Result<Vec<EndpointId>> { ... }
+```
+
+The `network_pkarr_pubkey` key is derived from the `network_secret` (a random 32-byte value generated at create time). Because `network_secret` is embedded in the membership blob, all online peers can re-publish the seed list — it's not exclusively the coordinator's job. `spawn_seed_list_publisher()` refreshes this record every 300 seconds.
+
+#### Record 3: Membership record
+
+Maps the `membership_dht_pubkey` to a blake3 hash of the canonical membership blob:
 
 ```
 "v1"                        // version sentinel (always first)
-"h,<blake3_hex>"            // blake3 hash of canonical membership data
+"h,<blake3_hex>"            // hash of canonical msgpack-serialized MembershipData
 ```
 
-The full membership data is serialized as msgpack (sorted by identity for determinism) and stored in each peer's persistent blob store (`FsStore` from iroh-blobs). Every peer serves blobs via the iroh-blobs protocol (`/iroh-bytes/4` ALPN), so any peer can provide the membership data to joiners. This removes the ~12-member limit that DNS TXT record size imposed.
+The full membership data is serialized as msgpack (sorted by identity for determinism) and stored in each peer's iroh-blobs store (`FsStore`). Every peer serves blobs via the iroh-blobs protocol (`/iroh-bytes/4` ALPN). The record contains only the hash — not member entries — keeping it well within DNS TXT record size limits regardless of network size.
+
+`MembershipData` now includes `network_secret` and `membership_signing_key` fields so peers receiving it can independently publish seed list records and verify DHT keys.
 
 ### Membership data exchange via iroh-blobs
 
-Every peer maintains a persistent blob store (`FsStore`) and registers a `BlobsProtocol` handler. Whenever membership changes (via Welcome, MemberSync, or direct mutation), the peer computes the canonical msgpack bytes, adds them to the blob store via `blobs().add_slice()`, and the blob becomes available for fetching by any peer that knows the hash.
+Joiners fetch the full membership via iroh-blobs:
 
-Joiners that need the full membership (e.g., when coordinator is offline) fetch it via iroh-blobs:
-
-1. Resolve the blake3 hash from pkarr.
-2. Connect to any known peer from local config using the iroh-blobs ALPN (`/iroh-bytes/4`).
-3. Fetch the blob via `store.remote().fetch(conn, hash)`.
-4. Read the bytes via `store.blobs().get_bytes(hash)`.
-5. Verify `blake3::hash(bytes) == hash` before trusting the data.
-6. Deserialize to get the member and approved lists.
+1. Resolve the directory record to get `(network_pkarr_pubkey, membership_dht_pubkey)`.
+2. Resolve seed list and membership hash **in parallel**.
+3. For each seed peer endpoint, try `try_fetch_blob_from_peer(endpoint_id, hash)`.
+4. Verify `blake3::hash(bytes) == hash` before trusting the data.
+5. Deserialize `MembershipData` to get member list, approved list, secrets, and signing keys.
 
 ### Publishing
 
-The coordinator spawns a background publisher task that:
+Three background tasks keep DHT records fresh:
 
-1. Publishes immediately on startup.
-2. Re-publishes whenever membership changes (triggered via `tokio::sync::Notify`).
-3. Re-publishes every 5 minutes as a periodic refresh.
-4. Stops when the shutdown token fires.
+**Membership publisher** (`spawn_dht_publisher`):
+- Publishes immediately on startup
+- Re-publishes on membership changes (via `tokio::sync::Notify`)
+- Re-publishes every 5 minutes as a periodic refresh
 
-Publishing errors are logged as warnings -- they never crash the coordinator or block the accept loop.
+**Seed list publisher** (`spawn_seed_list_publisher`):
+- Publishes the current list of online peer EndpointIds every 300 seconds
+- Any peer (not just the coordinator) can run this task
 
-### Resolution
+**Membership poller** (`spawn_membership_poller`):
+- Checks the membership hash via pkarr every 60 seconds
+- If the hash changed (new members approved while offline), fetches the new blob and reconciles the member/approved lists
 
-Peers learn the `membership_dht_id` from `Welcome` and `MemberSync` messages and persist it in their network config. When joining a network and the coordinator is unreachable, the joiner:
+Publishing errors are logged as warnings and never crash the coordinator or block the accept loop.
 
-1. Resolves the membership hash from the pkarr relay using the saved DHT ID.
-2. Iterates known members from local config, attempting to connect to each via the iroh-blobs ALPN.
-3. Fetches the membership blob from the first reachable peer using `store.remote().fetch()`.
-4. Verifies the blob hash, deserializes, and connects to all mesh peers via the network ALPN.
+### Three-step join resolution
 
-This is best-effort: if DHT resolution or all peer connections fail, the join fails with an error explaining both the coordinator and fallback failures.
+When `pitopi join gentle-amber-fox` is run:
+
+1. **Directory lookup:** resolve `directory_dht_id("gentle-amber-fox")` → `(network_pkarr_pubkey, membership_dht_pubkey)`.
+2. **Parallel resolution:** simultaneously resolve seed list (→ online peer endpoints) and membership hash (→ blake3 hash of blob).
+3. **Blob fetch:** connect to seed peers one by one via `try_fetch_blob_from_peer()` until one responds. Verify hash, deserialize.
+4. **Mesh join:** use member/approved lists from blob to connect to coordinator or any peer in the mesh.
+
+This is best-effort: if any step fails, pitopi falls back to local config. If all fail, the join fails with an error explaining what went wrong.
 
 ### Security
 
-Only the coordinator possesses the secret key from which the membership signing key is derived. The pkarr relay verifies signatures on publish, and peers resolve by the derived public key. A rogue peer cannot forge membership records without the coordinator's secret key.
+- **Directory records** are keyed by a hash of the public network name — anyone can look up a network by name, but nobody can forge the record since it's not signed by a secret key (the key is deterministic from the name).
+- **Seed list records** are signed by `network_pkarr_pubkey`, derived from `network_secret`. Only peers that have joined the network (and received the membership blob containing `network_secret`) can publish seed lists.
+- **Membership records** are signed by `membership_dht_pubkey`, derived from the coordinator's secret key. Only the coordinator can publish membership updates.
+- Joiners verify the blake3 hash of the membership blob before trusting any data from it.
 
 ---
 
@@ -1383,49 +1473,69 @@ This chapter ties the modules together by walking through the complete lifecycle
 
 ### Creating a network
 
-When a user runs `pitopi create --name gaming --mode open`, the CLI sends an `IpcRequest::Create` to the daemon. The daemon:
+When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends an `IpcRequest::Create` to the daemon. The daemon:
 
-1. **Check not duplicate.** Verify no network named "gaming" is already active.
+1. **Generate three-word name.** Call `network_name::generate_name()` to produce a random adjective-noun-noun name like `gentle-amber-fox`.
 
-2. **Create identity provider.** Wrap the public key in `IrohIdentityProvider`, which derives the coordinator's virtual IP.
+2. **Check not duplicate.** Verify no network with that name is already active (retry generation if needed).
 
-3. **Derive DHT membership key.** Use blake3 to derive a per-network signing key from the coordinator's secret key.
+3. **Create identity provider.** Wrap the public key in `IrohIdentityProvider`, which derives the coordinator's virtual IP.
 
-4. **Update ALPNs.** Call `endpoint.set_alpns()` to add `pitopi/net/gaming` to the shared endpoint.
+4. **Generate network secret.** Create a random `network_secret: [u8; 32]` (used to sign seed list records).
 
-5. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode (`OpenPolicy` for open, `RestrictedPolicy` for restricted).
+5. **Derive DHT keys.** Use `blake3::derive_key` to derive `membership_signing_key` from the coordinator's secret key + network name.
 
-6. **Start DHT publisher.** Create a pkarr client and spawn a background task that publishes membership to the DHT on changes and every 5 minutes.
+6. **Update ALPNs.** Call `endpoint.set_alpns()` to add `pitopi/net/<name>` to the shared endpoint.
 
-7. **Create NetworkHandle.** Insert into the daemon's `networks` map with a child `CancellationToken`.
+7. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode.
 
-8. **Save config.** Write the network to `~/.config/pitopi/networks.toml`.
+8. **Publish to DHT.** Publish directory record (name → keys), seed list record (no peers yet), and membership record (hash of initial member list) to pkarr.
 
-9. **Return response.** Send `IpcResponse::Created` with room code and IP back to the CLI.
+9. **Start DHT publishers.** Spawn `spawn_dht_publisher` (membership, on change + every 5 min) and `spawn_seed_list_publisher` (online peers, every 300s).
+
+10. **Create NetworkHandle.** Insert into the daemon's `networks` map with a child `CancellationToken` and the `network_secret` + `membership_signing_key`.
+
+11. **Save config.** Write the network to `~/.config/pitopi/networks.toml` with `network_pkarr_pubkey` and `membership_dht_pubkey`.
+
+12. **Return response.** Send `IpcResponse::Created` with the generated name and IP back to the CLI.
 
 ### Joining a network
 
-When a user runs `pitopi join gaming/ybnj-raqe-...`, the CLI sends an `IpcRequest::Join` to the daemon. The daemon:
+When a user runs `pitopi join gentle-amber-fox`, the CLI sends an `IpcRequest::Join { name: "gentle-amber-fox" }` to the daemon. The daemon:
 
-1. **Parse room code.** Decode the room code to an `EndpointId` and network name.
+1. **Directory DHT lookup.** Call `dht::resolve_directory("gentle-amber-fox")` to get `(network_pkarr_pubkey, membership_dht_pubkey)`.
 
-2. **Update ALPNs.** Call `endpoint.set_alpns()` to add the network's ALPN.
+2. **Parallel resolution.** Simultaneously resolve the seed list (online peer endpoints) and the membership hash from pkarr.
 
-3. **Connect to coordinator (or any peer).** Use iroh to establish a QUIC connection. The first attempt goes to the coordinator. If the coordinator is offline, the joiner can connect to any peer that has the joiner's identity in its approved list.
+3. **Fetch membership blob.** Try each seed peer endpoint via `try_fetch_blob_from_peer()` until one responds. Verify the blake3 hash matches before trusting the data. Deserialize to get `MembershipData` (members, approved, network_secret, membership_signing_key).
 
-4. **Receive welcome.** Wait for a `Welcome` message on the control stream. This contains the full member list, the current approved list, and the `membership_dht_id` for DHT-based discovery. The joiner also accepts the legacy `JoinApproved` format for backward compatibility.
+4. **Update ALPNs.** Call `endpoint.set_alpns()` to add the network's ALPN.
 
-5. **Check for IP collision.** The joiner checks its own derived IP against the received member list. If a different identity already occupies the same IP, the joiner bails out with an error.
+5. **Connect to coordinator or mesh peer.** Use the member list from the blob to find a reachable peer. The first attempt goes to the coordinator. If offline, try other mesh peers.
 
-6. **Connect to mesh.** For each member in the list (excluding self and the peer who sent the Welcome), open a QUIC connection and send `MeshHello`.
+6. **Receive welcome.** Wait for a `Welcome` message with the current member list, approved list, and DHT IDs.
 
-7. **Start tasks.** Spawn per-peer readers and a reconnect loop (with child `CancellationToken`).
+7. **Check for IP collision.** The joiner checks its own derived IP against the received member list. If a different identity already occupies the same IP, the joiner bails out with an error.
 
-8. **Create NetworkHandle.** Insert into the daemon's `networks` map.
+8. **Connect to mesh.** For each member in the list (excluding self and the peer who sent the Welcome), open a QUIC connection and send `MeshHello`.
 
-9. **Save config.** Write the network membership, approved list, and DHT ID to disk.
+9. **Start tasks.** Spawn per-peer readers, reconnect loop, seed list publisher, and membership poller.
 
-10. **Return response.** Send `IpcResponse::Joined` with assigned IP back to the CLI.
+10. **Create NetworkHandle.** Insert into the daemon's `networks` map.
+
+11. **Save config.** Write the network membership, approved list, `network_pkarr_pubkey`, and `membership_dht_pubkey` to disk.
+
+12. **Return response.** Send `IpcResponse::Joined` with assigned IP back to the CLI.
+
+### Nuking a network
+
+When a user runs `pitopi nuke gentle-amber-fox`, the CLI sends an `IpcRequest::Nuke { name, force }` to the daemon. The daemon:
+
+1. **Publish empty records.** Publish an empty seed list record (no online peers) and an empty membership record to pkarr. This signals to any future joiner that the network is gone.
+
+2. **Leave network.** Cancel the per-network `CancellationToken`, wait for tasks to finish, remove peers from `PeerTable`, remove the ALPN, and delete the config entry.
+
+The `--force` flag skips any confirmation prompt. Without it, the CLI asks the user to confirm before proceeding.
 
 ### Coordinator's accept loop
 
@@ -1539,17 +1649,19 @@ The daemon holds:
 Each active network has:
 
 - **`cancel`** — a child `CancellationToken` of the master. Cancelling it tears down only this network's tasks.
-- **`tasks`** — `JoinHandle`s for the network's background tasks (DHT publisher, reconnect loop, peer cleanup).
+- **`tasks`** — `JoinHandle`s for the network's background tasks (DHT publisher, seed list publisher, membership poller, reconnect loop, peer cleanup).
 - **`role`** — whether we're the coordinator or a member.
 - **`my_ip`** — our virtual IP in this network.
+- **`network_secret`** — 32-byte random secret used to sign seed list DHT records.
+- **`membership_signing_key`** — 32-byte key derived from coordinator secret key, used to sign membership DHT records.
 - **`state`** — the `NetworkState` (member list, approved list, policy).
 
 ### IPC protocol
 
 The Unix socket at `/var/run/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + JSON body. The types are defined in `src/ipc.rs`:
 
-- **`IpcRequest`** — `Create`, `Join`, `Leave`, `Status`, `Shutdown`
-- **`IpcResponse`** — `Ok`, `Error`, `Created`, `Joined`, `Status`
+- **`IpcRequest`** — `Create` (no name field), `Join { name }`, `Leave`, `Nuke { name, force }`, `Status`, `Shutdown`
+- **`IpcResponse`** — `Ok`, `Error`, `Created` (with generated name + IP), `Joined`, `Status`
 
 The daemon accepts one connection at a time, reads a request, processes it, and sends a response. The CLI helpers (`ipc_create`, `ipc_join`, etc.) in `main.rs` handle the client side.
 
@@ -1577,32 +1689,38 @@ Visual reference for how data and control flow through the codebase.
 ### Coordinator startup (`pitopi create`)
 
 ```
-cmd_create()
-  → identity::load_or_create()            load/generate Ed25519 key
-  → dht::derive_membership_key()          blake3 derive per-network DHT key
-  → transport::create_endpoint_with_alpns()  bind iroh QUIC endpoint
+create_network_inner()
+  → network_name::generate_name()         adjective-noun-noun (e.g. gentle-amber-fox)
+  → rand::random::<[u8; 32]>()           generate network_secret
+  → dht::derive_membership_key()          blake3 derive per-network DHT signing key
   → IrohIdentityProvider::new()            derive virtual IP via FNV-1a
   → MemberList::new() + add(self)          first member (is_coordinator: true)
+  → dht::publish_directory(...)           name → (network_pkarr_pubkey, membership_dht_pubkey)
+  → dht::publish_seed_list([])            empty seed list (no peers yet)
+  → dht::publish_membership(hash)         hash of initial member blob
   → config::save()                         persist to networks.toml
   → tun::create(my_ip)                     create TUN device
      ↓
   (TunReader, TunWriter)                   split immediately, no Mutex
      ↓
-  ┌───────────────────────────────────────────────────────────┐
-  │ Background tasks:                                         │
-  │                                                           │
-  │  forward::spawn_tun_writer(TunWriter, tun_rx)             │
-  │    └ reads packets from channel, writes to TUN            │
-  │                                                           │
-  │  forward::run_mesh(TunReader, peers, ...)                  │
-  │    └ reads packets from TUN, routes via PeerTable          │
-  │                                                           │
-  │  spawn_dht_publisher(...)                                  │
-  │    └ publishes membership to DHT on change + every 5 min   │
-  │                                                           │
-  │  spawn_peer_cleanup(disconnect_rx, peers)                  │
-  │    └ removes dead peers from PeerTable on disconnect       │
-  └───────────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────────┐
+  │ Background tasks:                                             │
+  │                                                               │
+  │  forward::spawn_tun_writer(TunWriter, tun_rx)                 │
+  │    └ reads packets from channel, writes to TUN                │
+  │                                                               │
+  │  forward::run_mesh(TunReader, peers, ...)                      │
+  │    └ reads packets from TUN, routes via PeerTable              │
+  │                                                               │
+  │  spawn_dht_publisher(...)                                      │
+  │    └ publishes membership hash on change + every 5 min         │
+  │                                                               │
+  │  spawn_seed_list_publisher(...)                                │
+  │    └ publishes online peer endpoints every 300s               │
+  │                                                               │
+  │  spawn_peer_cleanup(disconnect_rx, peers)                      │
+  │    └ removes dead peers from PeerTable on disconnect          │
+  └───────────────────────────────────────────────────────────────┘
      ↓
   run_accept_loop()                        blocks here
     loop {
@@ -1627,23 +1745,33 @@ cmd_create()
 ### Joiner startup (`pitopi join`)
 
 ```
-cmd_join(node_id, "gaming")
-  → identity::load_or_create()
-  → transport::create_endpoint_with_alpns()
-  → IrohIdentityProvider::new()
-     ↓
+join_network_inner("gentle-amber-fox")
+  → dht::resolve_directory("gentle-amber-fox")
+      → (network_pkarr_pubkey, membership_dht_pubkey)
+         ↓
+  tokio::join!(                            parallel resolution
+    dht::resolve_seed_list(network_pkarr_pubkey),
+    dht::resolve_membership_hash(membership_dht_pubkey),
+  )
+      → (seed_peers, blake3_hash)
+         ↓
+  for each seed_peer in seed_peers:        fetch membership blob
+    try_fetch_blob_from_peer(seed_peer, hash)
+      → verify hash → deserialize MembershipData
+         ↓
   loop {                                   outer reconnect loop
-    conn = connect_to_peer(coordinator)
-      or try_reconnect_to_known_peers()    DHT → local config fallback
+    conn = connect_to_peer(coordinator_or_any_member)
          ↓
     enter_mesh(conn, ...)
       → tun::create(my_ip)                (TunReader, TunWriter)
       → spawn_tun_writer(TunWriter)
       → spawn_reconnect_loop(...)          per-peer auto-reconnect
+      → spawn_seed_list_publisher(...)     publish self as online peer
+      → spawn_membership_poller(...)       check hash every 60s
       → join_mesh_shared(conn, ...)
       │   ↓
-      │   recv Welcome { members, approved, dht_id }
-      │   → config::save()                persist membership
+      │   recv Welcome { members, approved, dht_ids }
+      │   → config::save()                persist membership + DHT pubkeys
       │   → peers.add(coordinator)        add to routing table
       │   → spawn_peer_reader(coordinator_conn)
       │   → for each other member:
@@ -1726,6 +1854,13 @@ spawn_peer_reader detects conn.read_datagram() error
 └──────────────────┘  └──────────────────┘  └────────────────┘
 
 ┌──────────────────┐  ┌──────────────────┐
+│ spawn_seed_list_ │  │ spawn_membership_│
+│ publisher        │  │ poller           │
+│ (all peers)      │  │ (all peers)      │
+│ every 300s       │  │ every 60s        │
+└──────────────────┘  └──────────────────┘
+
+┌──────────────────┐  ┌──────────────────┐
 │ control_listener │  │ mesh_acceptor    │
 │ (joiner only)    │  │ (joiner only)    │
 │ MemberApproved,  │  │ MeshHello,       │
@@ -1770,7 +1905,13 @@ No peer can assign a different IP than what the identity hash produces. This mea
 
 ### DHT record integrity
 
-Membership records published to the pkarr relay are signed with a per-network Ed25519 key derived from the coordinator's secret key. The relay verifies signatures, so only the coordinator can publish or update records for a given network. Peers resolve records by the derived public key (`membership_dht_id`), which they receive through authenticated Welcome/MemberSync messages. A rogue peer cannot forge membership records without the coordinator's private key.
+Pitopi uses three pkarr record types with different trust levels:
+
+- **Directory records** map the network name to DHT public keys. They are keyed by a deterministic hash of the network name (no secret required to look up, but no secret to forge either — the record is informational).
+- **Seed list records** are signed by `network_pkarr_pubkey`, derived from `network_secret`. Only peers in possession of the membership blob (which contains `network_secret`) can publish or update seed lists.
+- **Membership records** are signed by `membership_signing_key`, derived from the coordinator's private secret key. Only the coordinator can publish membership updates. The pkarr relay verifies signatures, and peers verify the blake3 hash of the membership blob before trusting its contents.
+
+A rogue peer outside the network cannot forge any of these records without either the coordinator's private key (for membership) or the `network_secret` from the membership blob (for seed lists).
 
 ### What is NOT protected
 

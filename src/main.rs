@@ -1,5 +1,6 @@
 mod acl;
 mod audit;
+mod dht;
 mod config;
 mod control;
 mod forward;
@@ -61,9 +62,9 @@ enum Command {
     Join {
         /// The endpoint ID or room code of the network creator
         node_id: String,
-        /// Network name (defaults to "default")
-        #[arg(long, default_value = "default")]
-        name: String,
+        /// Network name (override the name from room code)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List saved networks
     List,
@@ -99,7 +100,10 @@ fn check_root() {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     let cli = Cli::parse();
 
@@ -115,12 +119,18 @@ async fn main() -> Result<()> {
         }
         Command::Join { node_id, name } => {
             check_root();
-            let node_id =
-                room_code::parse_node_id(&node_id).context("invalid node ID or room code")?;
+            let parsed = room_code::parse_input(&node_id).context("invalid node ID or room code")?;
+            let network_name = name.unwrap_or_else(|| {
+                if parsed.network_name.is_empty() {
+                    "default".to_string()
+                } else {
+                    parsed.network_name.clone()
+                }
+            });
             let token = shutdown::token();
             let stats = stats::Stats::new();
             stats.spawn_logger(token.clone());
-            cmd_join(node_id, &name, token, stats).await
+            cmd_join(parsed.endpoint_id, &network_name, token, stats).await
         }
         Command::Status => cmd_status(),
         Command::Up => {
@@ -153,7 +163,7 @@ async fn cmd_create(
 
     let identity = IrohIdentityProvider::new(public_key);
     let my_ip = identity.local_ip();
-    let room_code = room_code::encode(&ep.id());
+    let room_code = room_code::encode(name, &ep.id());
     let policy = policy_for_mode(mode);
 
     tracing::info!(name = %name, mode = ?mode, "network created");
@@ -237,7 +247,7 @@ async fn run_accept_loop(
             }
         };
 
-        let remote_id = conn.remote_id().to_string();
+        let remote_id = conn.remote_id();
         let peer_ip = identity.derive_ip(&remote_id);
 
         // Case 1: Known member reconnecting
@@ -273,7 +283,7 @@ async fn run_accept_loop(
                 let mut s = state.write().unwrap();
                 s.approved.remove(&remote_id);
                 let new_member = Member {
-                    identity: remote_id.clone(),
+                    identity: remote_id,
                     ip: peer_ip,
                     is_coordinator: false,
                 };
@@ -335,12 +345,12 @@ async fn run_accept_loop(
             if let Some(existing) = s.members.get_by_ip(peer_ip)
                 && existing.identity != remote_id
             {
-                tracing::warn!(ip = %peer_ip, existing = %existing.identity, new = %remote_id, "IP collision");
+                tracing::warn!(ip = %peer_ip, existing = %existing.identity.fmt_short(), new = %remote_id.fmt_short(), "IP collision");
                 Some(format!("IP collision: {} already assigned", peer_ip))
             } else if let Some(existing) = s.approved.get_by_ip(peer_ip)
                 && existing.identity != remote_id
             {
-                tracing::warn!(ip = %peer_ip, existing = %existing.identity, new = %remote_id, "IP collision (approved list)");
+                tracing::warn!(ip = %peer_ip, existing = %existing.identity.fmt_short(), new = %remote_id.fmt_short(), "IP collision (approved list)");
                 Some(format!("IP collision: {} already assigned", peer_ip))
             } else {
                 None
@@ -357,7 +367,7 @@ async fn run_accept_loop(
         broadcast_control_msg(
             &peers,
             &ControlMsg::MemberApproved {
-                identity: remote_id.clone(),
+                identity: remote_id,
                 ip: peer_ip,
             },
         )
@@ -368,7 +378,7 @@ async fn run_accept_loop(
         let add_collision: Option<String> = {
             let mut s = state.write().unwrap();
             let new_member = Member {
-                identity: remote_id.clone(),
+                identity: remote_id,
                 ip: peer_ip,
                 is_coordinator: false,
             };
@@ -541,20 +551,16 @@ async fn try_reconnect_to_known_peers(
         if member.identity == identity.local_identity() {
             continue; // skip self
         }
-        let peer_id: EndpointId = match member.identity.parse() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
         if token.is_cancelled() {
             return None;
         }
-        match transport::connect_to_peer_with_alpn(ep, peer_id, alpn).await {
+        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
             Ok(conn) => {
                 tracing::info!(peer_ip = %member.ip, "connected to known peer for reconnection");
                 return Some(conn);
             }
             Err(e) => {
-                tracing::debug!(peer = %member.identity, error = %e, "known peer unavailable");
+                tracing::debug!(peer = %member.identity.fmt_short(), error = %e, "known peer unavailable");
             }
         }
     }
@@ -647,7 +653,7 @@ async fn join_mesh_shared(
         &mut app_config,
         config::NetworkConfig {
             name: network_name.to_string(),
-            coordinator_id: initial_conn.remote_id().to_string(),
+            coordinator_id: initial_conn.remote_id(),
             group_mode: GroupMode::Restricted,
             my_ip: Some(my_ip),
             members: member_entries,
@@ -657,7 +663,7 @@ async fn join_mesh_shared(
     config::save(&app_config)?;
 
     // Add the initial connection peer to routing table
-    let remote_id = initial_conn.remote_id().to_string();
+    let remote_id = initial_conn.remote_id();
     let remote_ip = identity.derive_ip(&remote_id);
     peers.add(remote_ip, initial_conn.clone(), remote_id);
     forward::spawn_peer_reader(
@@ -672,14 +678,10 @@ async fn join_mesh_shared(
         if member.identity == my_identity {
             continue;
         }
-        if member.identity == initial_conn.remote_id().to_string() {
+        if member.identity == initial_conn.remote_id() {
             continue; // already connected
         }
-        let peer_id: EndpointId = match member.identity.parse() {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        match transport::connect_to_peer_with_alpn(ep, peer_id, alpn).await {
+        match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
             Ok(conn) => {
                 let (mut send, _recv) = conn.open_bi().await?;
                 control::send_msg(
@@ -768,11 +770,11 @@ async fn join_mesh_shared(
                                 }
                                 match conn.accept_bi().await {
                                     Ok((_send, mut recv)) => {
-                                        let transport_id = conn.remote_id().to_string();
+                                        let transport_id = conn.remote_id();
                                         match control::recv_msg(&mut recv).await {
                                             Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
                                                 if peer_identity != transport_id {
-                                                    tracing::warn!(claimed = %peer_identity, actual = %transport_id, "identity mismatch in MeshHello");
+                                                    tracing::warn!(claimed = %peer_identity.fmt_short(), actual = %transport_id.fmt_short(), "identity mismatch in MeshHello");
                                                     continue;
                                                 }
 
@@ -817,12 +819,12 @@ async fn join_mesh_shared(
                                                     peers.add(ip, conn.clone(), peer_identity);
                                                     forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
                                                 } else {
-                                                    tracing::warn!(peer = %peer_identity, "unknown peer, not approved — rejecting");
+                                                    tracing::warn!(peer = %peer_identity.fmt_short(), "unknown peer, not approved — rejecting");
                                                 }
                                             }
                                             Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
                                                 if peer_identity != transport_id {
-                                                    tracing::warn!(claimed = %peer_identity, actual = %transport_id, "identity mismatch in ReconnectRequest");
+                                                    tracing::warn!(claimed = %peer_identity.fmt_short(), actual = %transport_id.fmt_short(), "identity mismatch in ReconnectRequest");
                                                     continue;
                                                 }
                                                 let is_known = live_state.read().unwrap().members.is_member(&peer_identity);
@@ -941,7 +943,7 @@ fn save_network_config(
         app_config,
         config::NetworkConfig {
             name: name.to_string(),
-            coordinator_id: ep.id().to_string(),
+            coordinator_id: ep.id(),
             group_mode: mode,
             my_ip,
             members: member_entries,
@@ -1059,10 +1061,7 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
 
         if net.my_ip.is_some() {
             // We're a member — join using the shared TUN/peers
-            let coordinator_id: EndpointId = net
-                .coordinator_id
-                .parse()
-                .context("invalid coordinator id in config")?;
+            let coordinator_id: EndpointId = net.coordinator_id;
             let name = net.name.clone();
             let ep = ep.clone();
             let identity = identity.clone();

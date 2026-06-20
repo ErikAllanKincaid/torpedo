@@ -92,9 +92,14 @@ impl DaemonState {
 
     async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
         match req {
-            IpcRequest::Create { name, mode } => self.create_network(&name, mode).await,
-            IpcRequest::Join { node_id, name } => self.join_network(&node_id, name.as_deref()).await,
+            IpcRequest::Create { mode } => self.create_network(mode).await,
+            IpcRequest::Join { name } => self.join_network(&name).await,
             IpcRequest::Leave { name } => self.leave_network(&name).await,
+            IpcRequest::Nuke { name, force: _ } => {
+                // TODO(task-8): implement nuke
+                let _ = name;
+                IpcResponse::Error { message: "nuke not yet implemented".to_string() }
+            }
             IpcRequest::Status => self.status(),
             IpcRequest::Shutdown => {
                 self.shutdown_token.cancel();
@@ -103,7 +108,9 @@ impl DaemonState {
         }
     }
 
-    async fn create_network(&self, name: &str, mode: GroupMode) -> IpcResponse {
+    async fn create_network(&self, mode: GroupMode) -> IpcResponse {
+        // TODO(task-6): generate three-word name here
+        let name = "placeholder-network";
         {
             let networks = self.networks.read().unwrap();
             if networks.contains_key(name) {
@@ -224,13 +231,13 @@ impl DaemonState {
 
         Ok(IpcResponse::Created {
             name: name.to_string(),
-            room_code,
             my_ip,
         })
     }
 
-    async fn join_network(&self, node_id_str: &str, name_override: Option<&str>) -> IpcResponse {
-        match self.join_network_inner(node_id_str, name_override).await {
+    async fn join_network(&self, name: &str) -> IpcResponse {
+        // TODO(task-7): resolve coordinator endpoint from DHT by three-word name
+        match self.join_network_inner(name, None).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
@@ -573,8 +580,8 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
                 match daemon_c.create_network_inner(&name, mode).await {
-                    Ok(IpcResponse::Created { name, room_code, .. }) => {
-                        tracing::info!(network = %name, room_code = %room_code, "restored coordinator network");
+                    Ok(IpcResponse::Created { name, .. }) => {
+                        tracing::info!(network = %name, "restored coordinator network");
                     }
                     Ok(IpcResponse::Error { message }) => {
                         tracing::warn!(network = %name, error = %message, "failed to restore network");

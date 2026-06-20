@@ -68,27 +68,29 @@ struct Cli {
 enum Command {
     /// Create a new network and wait for peers
     Create {
-        /// Network name (defaults to "default")
-        #[arg(long, default_value = "default")]
-        name: String,
         /// Membership mode: open or restricted
         #[arg(long, default_value = "restricted")]
         mode: GroupMode,
     },
-    /// Join an existing network using a node ID or room code
+    /// Join an existing network using its three-word name
     Join {
-        /// The endpoint ID or room code of the network creator
-        node_id: String,
-        /// Network name (override the name from room code)
-        #[arg(long)]
-        name: Option<String>,
+        /// The three-word network name (e.g., gentle-amber-fox)
+        name: String,
     },
     /// List saved networks
     List,
     /// Leave a network (remove from saved config)
     Leave {
-        /// Name of the network to leave
+        /// Three-word network name
         name: String,
+    },
+    /// Destroy a network (coordinator only)
+    Nuke {
+        /// Three-word network name
+        name: String,
+        /// Force destroy even if other members exist
+        #[arg(long)]
+        force: bool,
     },
     /// Show status of active networks
     Status,
@@ -129,8 +131,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list(),
         Command::Leave { name } => ipc_leave(&name).await,
-        Command::Create { name, mode } => ipc_create(&name, mode).await,
-        Command::Join { node_id, name } => ipc_join(&node_id, name.as_deref()).await,
+        Command::Create { mode } => ipc_create(mode).await,
+        Command::Join { name } => ipc_join(&name).await,
+        Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Daemon | Command::Up => {
             check_root();
@@ -184,18 +187,15 @@ fn cmd_list() -> Result<()> {
 // IPC client commands (require daemon running)
 // ---------------------------------------------------------------------------
 
-async fn ipc_create(name: &str, mode: GroupMode) -> Result<()> {
+async fn ipc_create(mode: GroupMode) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create {
-        name: name.to_string(),
-        mode,
-    }).await?;
+    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Created { name, room_code, my_ip } => {
-            println!("Network '{}' created.", name);
+        ipc::IpcResponse::Created { name, my_ip } => {
+            println!("Network created: {}", name);
             println!("  IP: {}", my_ip);
-            println!("  Room code: {}", room_code);
+            println!("  Share this name to invite others");
         }
         ipc::IpcResponse::Error { message } => {
             eprintln!("Error: {}", message);
@@ -205,11 +205,10 @@ async fn ipc_create(name: &str, mode: GroupMode) -> Result<()> {
     Ok(())
 }
 
-async fn ipc_join(node_id: &str, name: Option<&str>) -> Result<()> {
+async fn ipc_join(name: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Join {
-        node_id: node_id.to_string(),
-        name: name.map(String::from),
+        name: name.to_string(),
     }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
@@ -220,6 +219,21 @@ async fn ipc_join(node_id: &str, name: Option<&str>) -> Result<()> {
         ipc::IpcResponse::Error { message } => {
             eprintln!("Error: {}", message);
         }
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send_msg(&mut stream, &ipc::IpcRequest::Nuke {
+        name: name.to_string(),
+        force,
+    }).await?;
+    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    match resp {
+        ipc::IpcResponse::Ok { message } => println!("{}", message),
+        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())

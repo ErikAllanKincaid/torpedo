@@ -398,11 +398,17 @@ impl DaemonState {
             self.blobs_proto.clone(),
         ).await?;
 
-        // Store the secrets from the fetched membership data
+        // Store the secrets from the fetched membership data and refresh snapshot
+        // so the blob store has a hash that matches what the DHT publishes.
         {
             let mut s = state.write().unwrap();
             s.network_secret = data.network_secret;
             s.membership_signing_key = data.membership_signing_key;
+            s.refresh_snapshot();
+        }
+        let snap_bytes = state.read().unwrap().snapshot.as_ref().map(|s| s.msgpack_bytes.clone());
+        if let Some(bytes) = snap_bytes {
+            let _ = self.blob_store.blobs().add_slice(&bytes).await;
         }
 
         // Save config with the DHT pubkeys
@@ -578,18 +584,43 @@ impl DaemonState {
         let network_secret: [u8; 32] = rand::random();
         let network_secret_key = SecretKey::from_bytes(&network_secret);
 
+        // Load persisted members and approved entries from config so we restore
+        // the full membership state, not just the coordinator.
+        let app_config = config::load()?;
+        let net_config = app_config.networks.iter().find(|n| n.name == name);
+
         let mut member_list = MemberList::new();
-        member_list
-            .add(Member {
-                identity: self.identity.local_identity(),
-                ip: my_ip,
-                is_coordinator: true,
-            })
-            .expect("self-add cannot collide");
+        if let Some(nc) = net_config {
+            for entry in &nc.members {
+                let _ = member_list.add(Member {
+                    identity: entry.identity,
+                    ip: entry.ip,
+                    is_coordinator: entry.is_coordinator,
+                });
+            }
+        }
+        // Ensure the coordinator is always present (in case config is missing or incomplete).
+        if !member_list.is_member(&self.identity.local_identity()) {
+            member_list
+                .add(Member {
+                    identity: self.identity.local_identity(),
+                    ip: my_ip,
+                    is_coordinator: true,
+                })
+                .expect("self-add cannot collide");
+        }
+
+        let mut approved_list = ApprovedList::new();
+        if let Some(nc) = net_config {
+            for entry in &nc.approved {
+                let ae = ApprovedEntry { identity: entry.identity, ip: entry.ip };
+                let _ = approved_list.approve(ae, &member_list);
+            }
+        }
 
         let mut net_state = NetworkState {
             members: member_list,
-            approved: ApprovedList::new(),
+            approved: approved_list,
             snapshot: None,
             network_secret,
             membership_signing_key,
@@ -620,7 +651,7 @@ impl DaemonState {
             }
         }
 
-        // Update config with new secrets
+        // Update config with refreshed secrets (members/approved are unchanged).
         let member_entries = net_state.members.all().into_iter().map(|m| config::MemberEntry {
             identity: m.identity,
             ip: m.ip,

@@ -32,7 +32,7 @@ sudo pitopi create --name gaming
 # > Share this code with peers to join
 
 # Join the network (on machine B)
-sudo pitopi join ybnj-raqe-c5s6-... --name gaming
+sudo pitopi join gaming/ybnj-raqe-c5s6-...
 # > Joined network "gaming"
 # > Your IP: 100.64.0.2
 # > Connected to 1 peer(s)
@@ -106,6 +106,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - Coordinator assigns IPs and broadcasts peer list via a control channel (QUIC bidirectional stream)
 - Data flows as QUIC datagrams (low-latency, no head-of-line blocking)
 - Routing table dispatches packets by destination IP from the IPv4 header
+- Split TUN I/O (TunReader/TunWriter) for lock-free concurrent read/write
 - ACL policy engine filters packets at the forwarding layer
 - Per-network ALPN isolation on a single shared iroh endpoint
 
@@ -118,6 +119,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Multiple simultaneous networks with isolation
 - [x] Persistent network config
 - [x] Room codes for easy sharing
+- [x] DHT membership publishing for offline coordinator resilience
 - [x] ACL policy engine and audit logging
 - [x] Systemd/launchd service integration
 - [ ] Daemon architecture (pitopid + thin CLI client)

@@ -21,8 +21,9 @@ A complete guide to pitopi's architecture, protocols, and internals.
 13. [Audit Logging](#13-audit-logging)
 14. [Statistics](#14-statistics)
 15. [Shutdown](#15-shutdown)
-16. [Network Lifecycle](#16-network-lifecycle)
-17. [Security Model](#17-security-model)
+16. [DHT Membership](#16-dht-membership)
+17. [Network Lifecycle](#17-network-lifecycle)
+18. [Security Model](#18-security-model)
 
 ---
 
@@ -208,20 +209,18 @@ All identity operations are abstracted behind a trait to allow swapping the iden
 ```rust
 pub trait IdentityProvider: Send + Sync {
     fn local_ip(&self) -> Ipv4Addr;
-    fn local_identity(&self) -> String;
-    fn derive_ip(&self, peer_identity: &str) -> Ipv4Addr;
-    fn verify_peer(&self, claimed_identity: &str, transport_identity: &str) -> bool;
+    fn local_identity(&self) -> EndpointId;
+    fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
 }
 ```
 
 The current implementation, `IrohIdentityProvider`, wraps an iroh `EndpointId`:
 
 - `local_ip()` returns the FNV-1a-derived IP for this node's EndpointId.
-- `local_identity()` returns the EndpointId as a string.
-- `derive_ip(peer)` hashes any peer identity string to an IP.
-- `verify_peer(claimed, transport)` checks that a peer's claimed identity matches their transport-level identity (simple string equality for iroh, since the QUIC handshake already authenticates the EndpointId).
+- `local_identity()` returns the EndpointId (iroh `PublicKey`).
+- `derive_ip(peer)` converts the EndpointId to a string internally and hashes it to an IP.
 
-This trait is designed to be replaceable. A future Discord-based identity provider could derive IPs from Discord user IDs and verify peers through OAuth tokens, without changing any of the networking or membership logic.
+Identity verification happens at the transport level — the QUIC handshake already authenticates the EndpointId, so `conn.remote_id()` is trusted without additional application-level checks.
 
 ### MemberList
 
@@ -229,13 +228,13 @@ The `MemberList` is an in-memory registry of all members in a network:
 
 ```rust
 pub struct Member {
-    pub identity: String,       // EndpointId as string
+    pub identity: EndpointId,   // iroh public key
     pub ip: Ipv4Addr,           // derived from identity
     pub is_coordinator: bool,   // whether this member created the network
 }
 ```
 
-The list is stored as a `HashMap<String, Member>` keyed by identity. It supports:
+The list is stored as a `HashMap<EndpointId, Member>` keyed by identity. It supports:
 
 - `add(member)` -- insert with IP collision detection
 - `remove(identity)` -- remove a member
@@ -250,12 +249,12 @@ The `ApprovedList` tracks peers that have been approved by the coordinator but h
 
 ```rust
 pub struct ApprovedEntry {
-    pub identity: String,   // EndpointId as string
-    pub ip: Ipv4Addr,       // derived from identity
+    pub identity: EndpointId,   // iroh public key
+    pub ip: Ipv4Addr,           // derived from identity
 }
 ```
 
-The list is stored as a `HashMap<String, ApprovedEntry>` keyed by identity. It supports:
+The list is stored as a `HashMap<EndpointId, ApprovedEntry>` keyed by identity. It supports:
 
 - `approve(entry, &MemberList)` -- add with collision check against both the member list and existing approved entries
 - `is_approved(identity)` -- check if a peer is pre-approved
@@ -401,12 +400,13 @@ Sent by any peer to a newly connecting approved peer. This is the primary join m
         ],
         "approved": [
             { "identity": "jkl012...", "ip": "100.64.7.99" }
-        ]
+        ],
+        "membership_dht_id": "abc123..."
     }
 }
 ```
 
-The `members` list contains every current member. The `approved` list contains peers that have been approved but haven't connected yet. The joiner checks its own derived IP against the member list for collision detection.
+The `members` list contains every current member. The `approved` list contains peers that have been approved but haven't connected yet. The `membership_dht_id` (optional) is the hex-encoded public key of the coordinator's per-network DHT signing key — peers use this to resolve membership from the pkarr relay when the coordinator is offline. The joiner checks its own derived IP against the member list for collision detection.
 
 #### MemberApproved
 
@@ -466,12 +466,13 @@ Broadcast to all existing peers when the member list changes. Also sent to recon
             { "identity": "abc123...", "ip": "100.64.10.5", "is_coordinator": true },
             { "identity": "def456...", "ip": "100.64.23.142", "is_coordinator": false },
             { "identity": "ghi789...", "ip": "100.64.7.42", "is_coordinator": false }
-        ]
+        ],
+        "membership_dht_id": "abc123..."
     }
 }
 ```
 
-This is the primary mechanism for keeping all peers' view of the network in sync.
+This is the primary mechanism for keeping all peers' view of the network in sync. The optional `membership_dht_id` field carries the coordinator's DHT signing key so peers can resolve membership from the pkarr relay.
 
 #### MeshHello
 
@@ -562,15 +563,19 @@ The MTU is set to 1200 bytes, which is conservative but ensures packets fit with
 
 ### Async I/O
 
-The TUN device is wrapped in an `AsyncDevice` from the `tun` crate, which integrates with tokio's event loop. The device is protected by a `tokio::sync::Mutex` and shared between the read loop (which reads outgoing packets from the TUN) and the write path (which writes incoming packets to the TUN).
+The TUN device is split into separate `TunReader` and `TunWriter` halves using the `tun` crate's `AsyncDevice::split()` method. This allows the read loop (outgoing packets) and write path (incoming packets) to operate concurrently without any locking.
 
 ```rust
-pub struct TunDevice {
-    device: Arc<Mutex<AsyncDevice>>,
+pub struct TunReader {
+    reader: DeviceReader,
+}
+
+pub struct TunWriter {
+    writer: DeviceWriter,
 }
 ```
 
-The `share()` method creates a cheap clone by sharing the inner `Arc`, allowing both the reader and writer to hold references to the same device.
+This split/sink pattern is critical for performance — sharing an I/O device behind a Mutex serializes reads and writes, causing packet buffering and latency spikes. With separate halves, outgoing packets can be read from TUN simultaneously with incoming packets being written to TUN.
 
 ### Platform differences
 
@@ -592,10 +597,10 @@ The forwarding module is the data plane of pitopi. It moves packets between the 
 
 ### Architecture
 
-Three concurrent tasks handle forwarding:
+Three concurrent tasks handle forwarding, with the TUN device split into separate read and write halves for lock-free I/O:
 
 ```
-TUN device                    Peer connections
+TunReader                     Peer connections
     |                              |
     v                              v
 run_mesh()                    spawn_peer_reader() [one per peer]
@@ -603,7 +608,7 @@ run_mesh()                    spawn_peer_reader() [one per peer]
   looks up dest IP               sends packets via tun_tx channel
   sends datagram to peer              |
                                       v
-                              spawn_tun_writer()
+                              spawn_tun_writer(TunWriter)
                                 writes packets to TUN
 ```
 
@@ -617,13 +622,12 @@ This is the main forwarding loop. It reads packets from the TUN device in a tigh
 4. If found, send the packet as a QUIC datagram on that peer's connection.
 5. If not found (unknown destination), record a dropped packet in stats.
 
-The function signature reveals its dependencies:
+The function takes ownership of the `TunReader` half:
 
 ```rust
 pub async fn run_mesh(
-    tun: TunDevice,
+    mut tun: TunReader,
     peers: PeerTable,
-    _tun_tx: mpsc::Sender<Vec<u8>>,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()>
@@ -674,13 +678,13 @@ pub struct PeerTable {
 
 pub struct PeerEntry {
     pub conn: Connection,
-    pub endpoint_id: String,
+    pub endpoint_id: EndpointId,
 }
 ```
 
 Each entry maps an IP address to:
 - The QUIC `Connection` object used to send datagrams to that peer.
-- The peer's `endpoint_id` string for identification.
+- The peer's `EndpointId` for identification.
 
 ### Thread safety
 
@@ -737,6 +741,7 @@ ip = "100.64.7.99"
 name = "work"
 coordinator_id = "xyz789..."
 group_mode = "restricted"
+membership_dht_id = "def456..."
 ```
 
 ### Data model
@@ -752,18 +757,19 @@ pub struct AppConfig {
 ```rust
 pub struct NetworkConfig {
     pub name: String,                       // human-readable name
-    pub coordinator_id: String,             // EndpointId of the coordinator
+    pub coordinator_id: EndpointId,         // EndpointId of the coordinator
     pub group_mode: GroupMode,              // Open or Restricted
     pub my_ip: Option<Ipv4Addr>,           // our IP (None if we're the coordinator)
     pub members: Vec<MemberEntry>,          // connected members
     pub approved: Vec<ApprovedConfigEntry>, // approved but not yet connected
+    pub membership_dht_id: Option<String>, // DHT signing key for offline discovery
 }
 ```
 
 **MemberEntry** -- a connected member:
 ```rust
 pub struct MemberEntry {
-    pub identity: String,      // EndpointId as string
+    pub identity: EndpointId,  // iroh public key
     pub ip: Ipv4Addr,          // identity-derived IP
     pub is_coordinator: bool,  // whether this member is the coordinator
 }
@@ -772,12 +778,12 @@ pub struct MemberEntry {
 **ApprovedConfigEntry** -- a pre-approved peer:
 ```rust
 pub struct ApprovedConfigEntry {
-    pub identity: String,  // EndpointId as string
-    pub ip: Ipv4Addr,      // identity-derived IP
+    pub identity: EndpointId,  // iroh public key
+    pub ip: Ipv4Addr,          // identity-derived IP
 }
 ```
 
-The `approved` field uses `#[serde(default)]`, so config files written by older versions (without the field) still deserialize correctly with an empty approved list.
+The `approved` and `membership_dht_id` fields use `#[serde(default)]`, so config files written by older versions (without these fields) still deserialize correctly.
 
 ### Coordinator vs. member
 
@@ -812,28 +818,30 @@ EndpointIds are 32-byte binary values. Their hex representation is 64 characters
 
 ### Encoding
 
-z-base-32 is a human-oriented encoding that uses only lowercase letters and digits, avoiding visually ambiguous characters (no 0/O, 1/l confusion). Pitopi adds dashes every 4 characters:
+Room codes encode both the network name and the coordinator's EndpointId. The EndpointId is encoded in z-base-32, a human-oriented encoding that avoids visually ambiguous characters (no 0/O, 1/l confusion). Dashes are added every 4 characters:
 
 ```
-ybnj-raqe-c5s6-k7mp-...
+gaming/ybnj-raqe-c5s6-k7mp-...
 ```
 
-This produces a room code that's easy to read, type, and share verbally.
+The network name prefix means the `--name` flag is not needed on join — the room code is self-sufficient.
 
 ### Parsing
 
-The `parse_node_id()` function accepts both raw EndpointId strings and room codes:
+The `parse_input()` function accepts both raw EndpointId strings and room codes:
 
 ```rust
-pub fn parse_node_id(input: &str) -> Result<EndpointId> {
+pub fn parse_input(input: &str) -> Result<RoomCode> {
+    // Try raw EndpointId first (no network name)
     if let Ok(id) = input.parse::<EndpointId>() {
-        return Ok(id);
+        return Ok(RoomCode { network_name: String::new(), endpoint_id: id });
     }
+    // Otherwise parse as name/code
     decode(input).context("could not parse as EndpointId or room code")
 }
 ```
 
-This flexibility means users can paste either format in the `join` command.
+This flexibility means users can paste either format in the `join` command. When using a raw EndpointId, the `--name` flag is required.
 
 ---
 
@@ -976,23 +984,10 @@ All counters use `AtomicU64` with `Ordering::Relaxed`, since exact ordering betw
 The `spawn_logger` method starts a background task that logs stats every 30 seconds as deltas (not cumulative totals). This shows recent activity rather than all-time totals:
 
 ```
-INFO rx=42 tx=38 bytes_rx=48.2KB bytes_tx=44.1KB drops=0 (30s)
+INFO (30s) rx=42 tx=38 bytes_rx=49356 bytes_tx=44100 drops=0
 ```
 
-### Session summary
-
-When the shutdown signal is received, the logger prints a final summary:
-
-```
-INFO duration=12m34s total_rx=3421 total_tx=3198 total_bytes=7.2MB session complete
-```
-
-### Byte formatting
-
-Byte counts are formatted for readability:
-- Under 1 KB: `512B`
-- Under 1 MB: `85.2KB`
-- Over 1 MB: `1.1MB`
+Byte counts are logged as raw values (no formatting) for easy parsing and scripting.
 
 ---
 
@@ -1032,7 +1027,65 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 ---
 
-## 16. Network Lifecycle
+## 16. DHT Membership
+
+**Module:** `src/dht.rs`
+
+Pitopi publishes network membership to iroh's pkarr relay so that peers can discover each other even when the coordinator is offline. This is a best-effort enhancement -- peers always fall back to local config and direct connections if DHT resolution fails.
+
+### How it works
+
+The coordinator derives a per-network Ed25519 signing key from its secret key using blake3 key derivation:
+
+```
+coordinator_secret_key + "pitopi/membership/{network_name}" → blake3::derive_key → membership_key
+```
+
+The public half of this derived key is the `membership_dht_id` -- a stable identifier that peers use to look up the membership record. Different networks get different derived keys, so they don't collide.
+
+The coordinator publishes a `SignedPacket` (signed DNS TXT record) to `https://dns.iroh.link/pkarr` under this derived key. The pkarr relay verifies the Ed25519 signature, so only the coordinator can publish under that key.
+
+### Record format
+
+TXT records are stored under the `_pitopi` DNS name:
+
+```
+"v1"                        // version sentinel (always first)
+"c,<hex_identity>"          // coordinator member
+"m,<hex_identity>"          // regular member  
+"a,<hex_identity>"          // approved (not yet connected)
+```
+
+IPs are **not** stored in the record -- they are reconstructed via `derive_ip()` on decode. This keeps entries compact (~66 bytes each), fitting approximately 12 members within the 1000-byte DNS payload limit.
+
+### Publishing
+
+The coordinator spawns a background publisher task that:
+
+1. Publishes immediately on startup.
+2. Re-publishes whenever membership changes (triggered via `tokio::sync::Notify`).
+3. Re-publishes every 5 minutes as a periodic refresh.
+4. Stops when the shutdown token fires.
+
+Publishing errors are logged as warnings -- they never crash the coordinator or block the accept loop.
+
+### Resolution
+
+Peers learn the `membership_dht_id` from `Welcome` and `MemberSync` messages and persist it in their network config. They use it in two scenarios:
+
+1. **Reconnection (`try_reconnect_to_known_peers`):** Before iterating saved members from local config, the peer tries resolving the DHT record for a potentially fresher member list.
+
+2. **Join fallback (`cmd_up` member path):** Before connecting to the coordinator, the peer tries DHT-resolved members. If any are reachable, it joins through them directly.
+
+Both paths are best-effort: if DHT resolution fails, the peer falls through to existing behavior (local config members, then coordinator).
+
+### Security
+
+Only the coordinator possesses the secret key from which the membership signing key is derived. The pkarr relay verifies signatures on publish, and peers resolve by the derived public key. A rogue peer cannot forge membership records without the coordinator's secret key.
+
+---
+
+## 17. Network Lifecycle
 
 This chapter ties the modules together by walking through the complete lifecycle of a network.
 
@@ -1044,17 +1097,21 @@ When a user runs `sudo pitopi create --name gaming --mode open`:
 
 2. **Create identity provider.** Wrap the public key in `IrohIdentityProvider`, which derives the coordinator's virtual IP.
 
-3. **Bind endpoint.** Create an iroh `Endpoint` with the ALPN `pitopi/net/gaming`.
+3. **Derive DHT membership key.** Use blake3 to derive a per-network signing key from the coordinator's secret key.
 
-4. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode (`OpenPolicy` for open, `RestrictedPolicy` for restricted).
+4. **Bind endpoint.** Create an iroh `Endpoint` with the ALPN `pitopi/net/gaming`.
 
-5. **Save config.** Write the network to `~/.config/pitopi/networks.toml`.
+5. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode (`OpenPolicy` for open, `RestrictedPolicy` for restricted).
 
-6. **Create TUN.** Create a TUN device with the coordinator's IP and /10 netmask.
+6. **Start DHT publisher.** Create a pkarr client and spawn a background task that publishes membership to the DHT on changes and every 5 minutes.
 
-7. **Start forwarding.** Spawn the TUN read loop, TUN writer, and begin the accept loop.
+7. **Save config.** Write the network to `~/.config/pitopi/networks.toml`.
 
-8. **Display room code.** Print the z-base-32 room code for sharing.
+8. **Create TUN.** Create a TUN device with the coordinator's IP and /10 netmask.
+
+9. **Start forwarding.** Spawn the TUN read loop, TUN writer, and begin the accept loop.
+
+10. **Display room code.** Print the z-base-32 room code for sharing.
 
 ### Joining a network
 
@@ -1066,11 +1123,11 @@ When a user runs `sudo pitopi join ybnj-raqe-... --name gaming`:
 
 3. **Connect to coordinator (or any peer).** Use iroh to establish a QUIC connection. The first attempt goes to the coordinator. If the coordinator is offline, the joiner can connect to any peer that has the joiner's identity in its approved list.
 
-4. **Receive welcome.** Wait for a `Welcome` message on the control stream. This contains the full member list and the current approved list. The joiner also accepts the legacy `JoinApproved` format for backward compatibility.
+4. **Receive welcome.** Wait for a `Welcome` message on the control stream. This contains the full member list, the current approved list, and the `membership_dht_id` for DHT-based discovery. The joiner also accepts the legacy `JoinApproved` format for backward compatibility.
 
 5. **Check for IP collision.** The joiner checks its own derived IP against the received member list. If a different identity already occupies the same IP, the joiner bails out with an error.
 
-6. **Save config.** Write the network membership and approved list to disk.
+6. **Save config.** Write the network membership, approved list, and DHT ID to disk.
 
 7. **Create TUN.** Create a TUN device with the joiner's IP.
 
@@ -1118,11 +1175,12 @@ When a peer's connection drops (network glitch, machine sleep, etc.):
 1. **Detect disconnection.** The peer reader task exits when `conn.read_datagram()` returns an error.
 
 2. **Reconnect loop.** The `cmd_join` function runs in a loop with exponential backoff. On disconnection, it:
+   - Tries resolving membership from the DHT (if a `membership_dht_id` is saved in config) for a potentially fresher member list.
    - Tries the coordinator first.
    - If the coordinator is unavailable, tries every known peer from the saved config.
    - On successful connection, re-enters the mesh (receives MemberSync, reconnects to peers).
 
-3. **Any peer can help.** Known peers accept reconnection requests because they hold the current member list. This is the "offline coordinator resilience" feature -- if the coordinator goes down, existing members can still reconnect to each other.
+3. **Any peer can help.** Known peers accept reconnection requests because they hold the current member list. This is the "offline coordinator resilience" feature -- if the coordinator goes down, existing members can still reconnect to each other. DHT resolution enhances this by providing a potentially more up-to-date member list than the local config.
 
 ### Bringing all networks up
 
@@ -1142,7 +1200,7 @@ All networks share the same TUN device and routing table, since the address spac
 
 ---
 
-## 17. Security Model
+## 18. Security Model
 
 ### Transport security
 
@@ -1174,6 +1232,10 @@ Virtual IPs are derived from cryptographic identities, not assigned by the coord
 2. The joiner checks its own derived IP against the member list received in the `Welcome` message.
 
 No peer can assign a different IP than what the identity hash produces. This means a peer's IP is a stable, verifiable identifier.
+
+### DHT record integrity
+
+Membership records published to the pkarr relay are signed with a per-network Ed25519 key derived from the coordinator's secret key. The relay verifies signatures, so only the coordinator can publish or update records for a given network. Peers resolve records by the derived public key (`membership_dht_id`), which they receive through authenticated Welcome/MemberSync messages. A rogue peer cannot forge membership records without the coordinator's private key.
 
 ### What is NOT protected
 

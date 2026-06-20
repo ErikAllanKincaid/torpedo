@@ -891,6 +891,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
+    // Check for CGNAT conflicts (e.g. Tailscale) before creating our TUN
+    tun::check_cgnat_conflict()?;
+
     // Single TUN for all networks
     let (tun_reader, tun_writer) = tun::create(my_ip).context("failed to create TUN device")?;
     let peers = PeerTable::new();

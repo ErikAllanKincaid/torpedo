@@ -5,7 +5,7 @@
 
 use std::net::Ipv4Addr;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::{Configuration, DeviceReader, DeviceWriter};
 
@@ -20,6 +20,49 @@ pub struct TunReader {
 /// Write half of the TUN device. Owned by [`forward::spawn_tun_writer`].
 pub struct TunWriter {
     writer: DeviceWriter,
+}
+
+fn is_cgnat(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0xC0) == 64
+}
+
+pub fn check_cgnat_conflict() -> Result<()> {
+    let output = std::process::Command::new("ifconfig")
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return Ok(()),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current_iface = String::new();
+
+    for line in stdout.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ')
+            && let Some(name) = line.split(':').next()
+        {
+            current_iface = name.to_string();
+        }
+        if line.contains("inet ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pos) = parts.iter().position(|&p| p == "inet")
+                && let Some(ip_str) = parts.get(pos + 1)
+                && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+                && is_cgnat(ip)
+            {
+                bail!(
+                    "interface {} already has CGNAT address {} — another VPN \
+                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
+                     Disable it before starting pitopi.",
+                    current_iface, ip
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Creates a TUN device with the given virtual IP and /10 netmask (100.64.0.0/10),

@@ -388,9 +388,44 @@ The 4-byte length prefix allows the receiver to know exactly how many bytes to r
 
 ### Message types
 
-#### JoinApproved
+#### Welcome
 
-Sent by the coordinator (or any authorizing peer in Open mode) to a newly joining peer:
+Sent by any peer to a newly connecting approved peer. This is the primary join message in the gatekeeper model:
+
+```json
+{
+    "Welcome": {
+        "members": [
+            { "identity": "abc123...", "ip": "100.64.10.5", "is_coordinator": true },
+            { "identity": "def456...", "ip": "100.64.23.142", "is_coordinator": false }
+        ],
+        "approved": [
+            { "identity": "jkl012...", "ip": "100.64.7.99" }
+        ]
+    }
+}
+```
+
+The `members` list contains every current member. The `approved` list contains peers that have been approved but haven't connected yet. The joiner checks its own derived IP against the member list for collision detection.
+
+#### MemberApproved
+
+Broadcast by the coordinator to all connected peers when a new identity is approved:
+
+```json
+{
+    "MemberApproved": {
+        "identity": "def456...",
+        "ip": "100.64.23.142"
+    }
+}
+```
+
+Receiving peers add this entry to their local `ApprovedList`. When the approved peer later connects to any of them, they can welcome that peer without needing the coordinator to be online.
+
+#### JoinApproved (legacy)
+
+The original join message, retained for backward compatibility with older peers:
 
 ```json
 {
@@ -404,7 +439,7 @@ Sent by the coordinator (or any authorizing peer in Open mode) to a newly joinin
 }
 ```
 
-The `your_ip` field confirms the joiner's identity-derived IP. The `members` list contains every current member of the network, including the joiner.
+New coordinators send `Welcome` instead. Joiners accept both formats.
 
 #### JoinDenied
 
@@ -418,7 +453,7 @@ Sent when a join is rejected:
 }
 ```
 
-Reasons include "not authorized" (policy rejection) and "IP collision" (hash collision with an existing member).
+Reasons include "not authorized" (policy rejection) and "IP collision: 100.64.x.x already assigned" (hash collision with an existing member or approved peer).
 
 #### MemberSync
 
@@ -694,6 +729,10 @@ identity = "def456ghi789..."
 ip = "100.64.23.142"
 is_coordinator = false
 
+[[networks.approved]]
+identity = "jkl012abc345..."
+ip = "100.64.7.99"
+
 [[networks]]
 name = "work"
 coordinator_id = "xyz789..."
@@ -712,15 +751,16 @@ pub struct AppConfig {
 **NetworkConfig** -- a single network membership:
 ```rust
 pub struct NetworkConfig {
-    pub name: String,              // human-readable name
-    pub coordinator_id: String,    // EndpointId of the coordinator
-    pub group_mode: GroupMode,     // Open or Restricted
-    pub my_ip: Option<Ipv4Addr>,  // our IP (None if we're the coordinator)
-    pub members: Vec<MemberEntry>, // known members
+    pub name: String,                       // human-readable name
+    pub coordinator_id: String,             // EndpointId of the coordinator
+    pub group_mode: GroupMode,              // Open or Restricted
+    pub my_ip: Option<Ipv4Addr>,           // our IP (None if we're the coordinator)
+    pub members: Vec<MemberEntry>,          // connected members
+    pub approved: Vec<ApprovedConfigEntry>, // approved but not yet connected
 }
 ```
 
-**MemberEntry** -- a known member:
+**MemberEntry** -- a connected member:
 ```rust
 pub struct MemberEntry {
     pub identity: String,      // EndpointId as string
@@ -728,6 +768,16 @@ pub struct MemberEntry {
     pub is_coordinator: bool,  // whether this member is the coordinator
 }
 ```
+
+**ApprovedConfigEntry** -- a pre-approved peer:
+```rust
+pub struct ApprovedConfigEntry {
+    pub identity: String,  // EndpointId as string
+    pub ip: Ipv4Addr,      // identity-derived IP
+}
+```
+
+The `approved` field uses `#[serde(default)]`, so config files written by older versions (without the field) still deserialize correctly with an empty approved list.
 
 ### Coordinator vs. member
 
@@ -747,9 +797,10 @@ This distinction drives `cmd_up` behavior -- coordinators start an accept loop, 
 ### When config is written
 
 Config is written at several points:
-1. **Create:** when the coordinator creates a network (saves self as the only member).
-2. **Join:** when a peer receives `JoinApproved` or `MemberSync` (saves the full member list).
-3. **Leave:** when the user runs `pitopi leave` (removes the network entry).
+1. **Create:** when the coordinator creates a network (saves self as the only member, empty approved list).
+2. **Join:** when a peer receives `Welcome` or `MemberSync` (saves both the member list and approved list).
+3. **Accept loop:** when the coordinator approves a new peer or promotes an approved peer to member.
+4. **Leave:** when the user runs `pitopi leave` (removes the network entry).
 
 ---
 
@@ -1013,35 +1064,52 @@ When a user runs `sudo pitopi join ybnj-raqe-... --name gaming`:
 
 2. **Load identity and bind endpoint.** Same as create.
 
-3. **Connect to coordinator.** Use iroh to establish a QUIC connection.
+3. **Connect to coordinator (or any peer).** Use iroh to establish a QUIC connection. The first attempt goes to the coordinator. If the coordinator is offline, the joiner can connect to any peer that has the joiner's identity in its approved list.
 
-4. **Receive approval.** Wait for a `JoinApproved` message on the control stream. This contains the joiner's confirmed IP and the full member list.
+4. **Receive welcome.** Wait for a `Welcome` message on the control stream. This contains the full member list and the current approved list. The joiner also accepts the legacy `JoinApproved` format for backward compatibility.
 
-5. **Save config.** Write the network membership to disk.
+5. **Check for IP collision.** The joiner checks its own derived IP against the received member list. If a different identity already occupies the same IP, the joiner bails out with an error.
 
-6. **Create TUN.** Create a TUN device with the joiner's IP.
+6. **Save config.** Write the network membership and approved list to disk.
 
-7. **Connect to mesh.** For each member in the list (excluding self and the coordinator, who we're already connected to), open a QUIC connection and send `MeshHello`.
+7. **Create TUN.** Create a TUN device with the joiner's IP.
 
-8. **Start forwarding.** Spawn per-peer readers, the TUN writer, and the TUN read loop.
+8. **Connect to mesh.** For each member in the list (excluding self and the peer who sent the Welcome), open a QUIC connection and send `MeshHello`.
 
-9. **Start listeners.** Spawn a control listener (for MemberSync from the coordinator) and a mesh acceptor (for MeshHello from future peers).
+9. **Start forwarding.** Spawn per-peer readers, the TUN writer, and the TUN read loop.
+
+10. **Start listeners.** Spawn a control listener (for `MemberSync` and `MemberApproved` messages) and a mesh acceptor (for `MeshHello` from future peers, including approved peers).
 
 ### Coordinator's accept loop
 
-The coordinator runs continuously, accepting incoming connections:
+The coordinator runs continuously, accepting incoming connections. It now acts as a pure gatekeeper -- approving identities and broadcasting approvals, rather than being the sole welcome point:
 
 1. **Accept connection.** Wait for an incoming QUIC connection with the right ALPN.
 
 2. **Check identity.** Derive the peer's IP from their EndpointId.
 
-3. **Known member reconnecting?** If the peer is already in the member list, send them a `MemberSync` with the current member list, add them to the routing table, and spawn a reader.
+3. **Case 1 -- Known member reconnecting.** If the peer is already in the member list, send them a `MemberSync` with the current member list, add them to the routing table, and spawn a reader.
 
-4. **New member -- check policy.** Ask the `MembershipPolicy` whether this peer can accept new members. If not, send `JoinDenied`.
+4. **Case 2 -- Approved peer connecting.** If the peer is in the approved list (approved earlier but connecting now), send a `Welcome` with the member list and approved list, promote from approved to full member, broadcast `MemberSync` to all existing peers, and spawn a reader.
 
-5. **Check IP collision.** Verify no existing member with a different identity has the same derived IP.
+5. **Case 3 -- Unknown peer.** Check the `MembershipPolicy`. If not authorized, send `JoinDenied`. If authorized:
+   a. **Check IP collision** against both the member list and approved list. If collision, send `JoinDenied`.
+   b. **Broadcast `MemberApproved`** to all connected peers so they add the identity to their approved lists.
+   c. **Immediately promote** the peer to full member (since they're already connected).
+   d. **Send `Welcome`** with the member list and approved list.
+   e. **Broadcast `MemberSync`** to all existing peers and spawn a reader.
 
-6. **Accept.** Add the new member to the `MemberList`, send `JoinApproved`, broadcast `MemberSync` to all existing peers, and spawn a reader.
+### Any-peer welcome
+
+Every peer in the mesh can welcome approved peers, not just the coordinator. The mesh acceptor handles incoming connections:
+
+1. **Verify identity.** Check that the `MeshHello` identity matches `conn.remote_id()`.
+
+2. **Approved peer?** If the connecting peer is in the local approved list, send a `Welcome` with the member list and approved list, promote from approved to member, and broadcast `MemberSync`.
+
+3. **Known member?** If the peer is already a member, add them to the routing table (reconnection).
+
+4. **Unknown peer?** Reject the connection. Unknown peers must go through the coordinator (or any authorizing peer in Open mode) first.
 
 ### Reconnecting after disconnection
 
@@ -1090,14 +1158,22 @@ Peers authenticate at two levels:
 
 ### Membership authorization
 
-Who can join a network is controlled by the `MembershipPolicy`:
+Pitopi separates *authorization* (who can approve a new identity) from *welcome* (who can let an approved peer into the mesh):
 
-- **Restricted mode:** Only the coordinator can approve new members. Members cannot add peers on their own.
-- **Open mode:** Any member can approve new peers. This trades security for convenience.
+- **Restricted mode:** Only the coordinator can authorize new members. However, once a peer is approved and the `MemberApproved` message is broadcast, *any* peer can welcome that approved identity when it connects. This means the coordinator doesn't need to be online when the approved peer actually joins -- it just needs to have been online long enough to broadcast the approval.
+
+- **Open mode:** Any member can both authorize and welcome new peers. No coordinator involvement needed at all.
+
+Unknown peers (not in either the member list or the approved list) are always rejected by the mesh acceptor. A peer must be explicitly approved before any node will let it in.
 
 ### IP address integrity
 
-Virtual IPs are derived from cryptographic identities, not assigned by the coordinator. The coordinator verifies the derivation and checks for collisions, but cannot assign a different IP than what the identity hash produces. This means a peer's IP is a stable, verifiable identifier.
+Virtual IPs are derived from cryptographic identities, not assigned by the coordinator. Both the coordinator and the joiner verify the derivation:
+
+1. The coordinator checks for IP collisions against the member list and approved list before broadcasting `MemberApproved`.
+2. The joiner checks its own derived IP against the member list received in the `Welcome` message.
+
+No peer can assign a different IP than what the identity hash produces. This means a peer's IP is a stable, verifiable identifier.
 
 ### What is NOT protected
 

@@ -54,14 +54,15 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 ### Modules
 
-- `src/main.rs` — CLI (clap), coordinator/joiner orchestration, peer handshake
+- `src/main.rs` — CLI (clap), coordinator/joiner orchestration, NetworkState, accept loop (approve → broadcast → welcome), mesh acceptor (welcome approved peers)
 - `src/identity.rs` — persistent Ed25519 keypair at `~/.config/pitopi/secret_key`
+- `src/membership.rs` — IdentityProvider trait, FNV-1a IP derivation, MemberList, ApprovedList, GroupMode, MembershipPolicy
 - `src/transport.rs` — iroh endpoint setup, per-network ALPN, connect/accept
-- `src/tun.rs` — TUN device creation with per-subnet virtual IPs, async packet I/O
+- `src/tun.rs` — TUN device creation with /10 netmask, async packet I/O
 - `src/forward.rs` — multi-peer forwarding: TUN → routing table → correct peer connection
-- `src/control.rs` — control protocol: Welcome, PeerJoined, PeerLeft, MeshHello, MeshWelcome, AdvertiseServices
-- `src/peers.rs` — PeerTable (routing by dest IP) and IpAllocator (sequential assignment per subnet)
-- `src/config.rs` — persistent network config at `~/.config/pitopi/networks.toml`
+- `src/control.rs` — control protocol: Welcome, MemberApproved, JoinApproved, JoinDenied, MemberSync, MeshHello, MeshWelcome, ReconnectRequest, AdvertiseServices
+- `src/peers.rs` — PeerTable (routing by dest IP), PeerEntry with Connection + endpoint_id
+- `src/config.rs` — persistent network config at `~/.config/pitopi/networks.toml` (members + approved list)
 - `src/room_code.rs` — z-base-32 room codes with dashes for human-friendly sharing
 - `src/acl.rs` — ACL policy engine: default policies, per-rule src/dst/port matching, packet filtering
 - `src/audit.rs` — append-only audit log at `~/.config/pitopi/audit.log`
@@ -70,13 +71,15 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 ### Key flows
 
-**Create (coordinator):** creates endpoint → listens for connections → on new peer: assigns IP via IpAllocator, sends Welcome with peer list, broadcasts PeerJoined to existing peers, spawns datagram reader.
+**Create (coordinator):** creates endpoint → listens for connections → on new peer: checks policy, checks IP collision, broadcasts MemberApproved to mesh, sends Welcome with member+approved lists, promotes to member, broadcasts MemberSync.
 
-**Join:** connects to coordinator → receives Welcome (assigned IP + peer list) → creates TUN device → connects to each existing peer with MeshHello → spawns per-peer datagram readers → runs mesh forwarding loop.
+**Join:** connects to coordinator (or any peer with approved list) → receives Welcome (member list + approved list) → joiner checks own IP for collision → creates TUN device → connects to each existing peer with MeshHello → spawns per-peer datagram readers → runs mesh forwarding loop.
+
+**Gatekeeper model:** coordinator approves identities and broadcasts MemberApproved. Any peer can then welcome an approved identity when it connects. The coordinator doesn't need to be online when the approved peer actually joins.
 
 **Mesh forwarding:** TUN read loop extracts dest IP from IPv4 header bytes 16-19, looks up PeerTable, sends datagram on correct connection. Per-peer reader tasks write incoming datagrams to a shared TUN writer channel.
 
-**Network isolation:** each network gets its own ALPN (`pitopi/net/<name>`), TUN device, and /24 subnet. A single shared iroh Endpoint accepts connections for all networks, filtering by ALPN on accept.
+**Network isolation:** each network gets its own ALPN (`pitopi/net/<name>`). A single shared iroh Endpoint accepts connections for all networks, filtering by ALPN on accept. Single TUN device with /10 netmask shared across networks.
 
 ## Key Dependencies
 
@@ -92,7 +95,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - Use `cargo -q` for all cargo commands
 - Use `tracing` for logging (INFO level by default, no env filter)
 - ALPN per network: `pitopi/net/<name>` (e.g., `pitopi/net/gaming`)
-- Virtual IPs: 100.64.{subnet}.0/24 range — subnet index per network
+- Virtual IPs: 100.64.0.0/10 CGNAT range — FNV-1a hash of identity, 22-bit host space
 - TUN MTU: 1200 (fits within QUIC datagram limits)
 - Identity persists to `~/.config/pitopi/secret_key` — same EndpointId across restarts
 - Config persists to `~/.config/pitopi/networks.toml`

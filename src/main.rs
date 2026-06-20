@@ -1,3 +1,4 @@
+mod acl;
 mod daemon;
 mod dht;
 mod config;

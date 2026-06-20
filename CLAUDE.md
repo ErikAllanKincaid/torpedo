@@ -28,7 +28,7 @@ cargo -q run -- down                # shut down the daemon
 # ACL management (coordinator only, requires daemon running)
 cargo -q run -- acl gentle-amber-fox tag servers ab3f d92c
 cargo -q run -- acl gentle-amber-fox untag servers ab3f
-cargo -q run -- acl gentle-amber-fox allow servers -> servers
+cargo -q run -- acl gentle-amber-fox allow servers servers
 cargo -q run -- acl gentle-amber-fox remove 0
 cargo -q run -- acl gentle-amber-fox show
 cargo -q run -- acl gentle-amber-fox apply   # re-publish current ACL to peers

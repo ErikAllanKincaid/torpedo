@@ -97,8 +97,8 @@ pitopi acl gaming tag servers ab3f... d92c...
 pitopi acl gaming tag admins ee11...
 
 # Allow rules (no rules = open; any rules = deny-all except allowed)
-pitopi acl gaming allow admins -> all       # admins reach everyone
-pitopi acl gaming allow all -> servers      # everyone reaches servers
+pitopi acl gaming allow admins all           # admins reach everyone
+pitopi acl gaming allow all servers          # everyone reaches servers
 
 # Show current ACL
 pitopi acl gaming show
@@ -123,7 +123,7 @@ ACL rules are distributed to all peers via iroh-blobs and enforced at the packet
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show saved networks from config file | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
-| `pitopi acl NAME allow SRC -> DST` | Add an allow rule (coordinator) | Yes |
+| `pitopi acl NAME allow SRC DST` | Add an allow rule (coordinator) | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |
 | `pitopi acl NAME apply` | Push ACL changes to all peers | Yes |
 | `pitopi install-service` | Install systemd/launchd service | No |

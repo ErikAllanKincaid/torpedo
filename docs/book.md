@@ -320,7 +320,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi list` | Show saved networks from config file | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
 | `pitopi acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
-| `pitopi acl NAME allow SRC -> DST` | Add an allow rule | Yes |
+| `pitopi acl NAME allow SRC DST` | Add an allow rule | Yes |
 | `pitopi acl NAME remove INDEX` | Remove a rule by index | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |
 | `pitopi acl NAME apply` | Re-publish current ACL to all peers | Yes |
@@ -1099,7 +1099,7 @@ Tags are named labels that group peers. They enable group-based rules without li
 pitopi acl gentle-amber-fox tag servers ab3f... d92c...
 # assigns the "servers" tag to two peers
 
-pitopi acl gentle-amber-fox allow servers -> servers
+pitopi acl gentle-amber-fox allow servers servers
 # allow all tagged servers to reach each other
 ```
 
@@ -1119,9 +1119,9 @@ pitopi acl gentle-amber-fox tag servers ab3f... d92c...
 # Remove a tag from peers
 pitopi acl gentle-amber-fox untag servers ab3f...
 
-# Add an allow rule: src -> dst
-pitopi acl gentle-amber-fox allow servers -> servers
-pitopi acl gentle-amber-fox allow all -> servers
+# Add an allow rule: src dst
+pitopi acl gentle-amber-fox allow servers servers
+pitopi acl gentle-amber-fox allow all servers
 
 # Remove a rule by index (shown in 'show' output)
 pitopi acl gentle-amber-fox remove 0
@@ -1189,10 +1189,10 @@ pub enum AclTarget {
 pitopi acl gaming tag servers server1... server2... server3...
 
 # Allow all members to reach servers
-pitopi acl gaming allow all -> servers
+pitopi acl gaming allow all servers
 
 # Allow servers to reach each other (for replication)
-pitopi acl gaming allow servers -> servers
+pitopi acl gaming allow servers servers
 
 # Result: regular members cannot reach each other directly —
 # all traffic must go through a server

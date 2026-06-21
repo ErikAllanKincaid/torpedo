@@ -40,8 +40,312 @@ use crate::tun;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+struct CoordinatorAcceptState {
+    endpoint: Endpoint,
+    network_name: String,
+    identity: IrohIdentityProvider,
+    policy: Arc<dyn MembershipPolicy>,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    peers: PeerTable,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    blob_store: FsStore,
+    shared_acl: forward::SharedAcl,
+    firewall: SharedFirewall,
+    hostname_table: dns::HostnameTable,
+}
+
+impl CoordinatorAcceptState {
+    async fn handle_connection(&self, conn: Connection) {
+        let remote_id = conn.remote_id();
+        let peer_ip = self.identity.derive_ip(&remote_id);
+
+        // Known member reconnecting
+        let is_member = self.state.read().unwrap().members.is_member(&remote_id);
+        if is_member {
+            tracing::info!(ip = %peer_ip, "known member reconnecting");
+            let members: Vec<Member> = self.state.read().unwrap().members.all().into_iter().cloned().collect();
+            crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
+            let peer_ipv6 = derive_ipv6(&remote_id);
+            self.peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+            let token = self.token.clone();
+            let stats = self.stats.clone();
+            let tun_tx = self.tun_tx.clone();
+            let disconnect_tx = self.disconnect_tx.clone();
+            let local_id = self.endpoint.id();
+            let network = self.network_name.clone();
+            let shared_acl = self.shared_acl.clone();
+            let firewall = self.firewall.clone();
+            let state = self.state.clone();
+            let hostname_table = self.hostname_table.clone();
+            tokio::spawn(async move {
+                send_member_sync(&conn, &members).await;
+                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network, state, hostname_table).await;
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network, shared_acl, firewall, tun_tx, disconnect_tx, token, stats);
+            });
+            return;
+        }
+
+        // Approved but not yet connected
+        let is_approved = self.state.read().unwrap().approved.is_approved(&remote_id);
+        if is_approved {
+            tracing::info!(ip = %peer_ip, "approved peer connecting");
+            let snap_bytes = {
+                let mut s = self.state.write().unwrap();
+                s.approved.remove(&remote_id);
+                let new_member = Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None };
+                s.members.add(new_member).expect("was approved, no collision");
+                s.refresh_snapshot();
+                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+            };
+            if let Some(bytes) = snap_bytes {
+                let _ = self.blob_store.blobs().add_slice(&bytes).await;
+            }
+            if let Some(notify) = &self.dht_notify { notify.notify_one(); }
+            let (members, approved) = {
+                let s = self.state.read().unwrap();
+                (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
+                 s.approved.all().into_iter().cloned().collect::<Vec<_>>())
+            };
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
+                    members: members.clone(), approved,
+                }).await;
+            }
+            broadcast_member_sync(&self.peers, &members, Some(peer_ip)).await;
+            let peer_ipv6 = derive_ipv6(&remote_id);
+            self.peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+            let token = self.token.clone();
+            let stats = self.stats.clone();
+            let tun_tx = self.tun_tx.clone();
+            let disconnect_tx = self.disconnect_tx.clone();
+            let local_id = self.endpoint.id();
+            let network = self.network_name.clone();
+            let shared_acl = self.shared_acl.clone();
+            let firewall = self.firewall.clone();
+            let state = self.state.clone();
+            let hostname_table = self.hostname_table.clone();
+            let dht_notify = self.dht_notify.clone();
+            let blob_store = self.blob_store.clone();
+            tokio::spawn(async move {
+                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network, state.clone(), hostname_table).await;
+                update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network, shared_acl, firewall, tun_tx, disconnect_tx, token, stats);
+            });
+            return;
+        }
+
+        // Unknown peer — check policy
+        let self_member = {
+            let s = self.state.read().unwrap();
+            s.members.get(&self.identity.local_identity()).cloned().unwrap()
+        };
+        if !self.policy.can_authorize(&self_member) {
+            tracing::warn!(peer = %remote_id, "not authorized to accept new members");
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied {
+                    reason: "not authorized".to_string(),
+                }).await;
+            }
+            return;
+        }
+
+        // Check IP collision
+        let collision_reason: Option<String> = {
+            let s = self.state.read().unwrap();
+            if let Some(existing) = s.members.get_by_ip(peer_ip)
+                && existing.identity != remote_id
+            {
+                Some(format!("IP collision: {} already assigned", peer_ip))
+            } else if let Some(existing) = s.approved.get_by_ip(peer_ip)
+                && existing.identity != remote_id
+            {
+                Some(format!("IP collision: {} already assigned", peer_ip))
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = collision_reason {
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+            }
+            return;
+        }
+
+        // Broadcast MemberApproved (hostname will be updated after MeshHello)
+        broadcast_control_msg(&self.peers, &ControlMsg::MemberApproved { identity: remote_id, ip: peer_ip, hostname: None }).await;
+
+        // Promote to member
+        let (add_collision, snap_bytes): (Option<String>, Option<Vec<u8>>) = {
+            let mut s = self.state.write().unwrap();
+            let result = s.members.add(Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None })
+                .err().map(|e| format!("IP collision: {e}"));
+            if result.is_none() {
+                s.refresh_snapshot();
+            }
+            let bytes = s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone());
+            (result, bytes)
+        };
+        if add_collision.is_none()
+            && let Some(bytes) = snap_bytes
+        {
+            let _ = self.blob_store.blobs().add_slice(&bytes).await;
+        }
+        if let Some(reason) = add_collision {
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+            }
+            return;
+        }
+
+        let (members, approved) = {
+            let s = self.state.read().unwrap();
+            (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
+             s.approved.all().into_iter().cloned().collect::<Vec<_>>())
+        };
+
+        tracing::info!(ip = %peer_ip, "new member approved and joined");
+        if let Some(notify) = &self.dht_notify { notify.notify_one(); }
+
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
+                members: members.clone(), approved,
+            }).await;
+        }
+        broadcast_member_sync(&self.peers, &members, Some(peer_ip)).await;
+        let peer_ipv6 = derive_ipv6(&remote_id);
+        self.peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        let token = self.token.clone();
+        let stats = self.stats.clone();
+        let tun_tx = self.tun_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
+        let local_id = self.endpoint.id();
+        let network = self.network_name.clone();
+        let shared_acl = self.shared_acl.clone();
+        let firewall = self.firewall.clone();
+        let state = self.state.clone();
+        let hostname_table = self.hostname_table.clone();
+        let dht_notify = self.dht_notify.clone();
+        let blob_store = self.blob_store.clone();
+        tokio::spawn(async move {
+            spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network, state.clone(), hostname_table).await;
+            update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
+            forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network, shared_acl, firewall, tun_tx, disconnect_tx, token, stats);
+        });
+    }
+}
+
+struct MemberAcceptState {
+    endpoint: Endpoint,
+    network_name: String,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    peers: PeerTable,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    token: CancellationToken,
+    stats: Arc<ForwardMetrics>,
+    blob_store: FsStore,
+    shared_acl: forward::SharedAcl,
+    firewall: SharedFirewall,
+    hostname_table: dns::HostnameTable,
+}
+
+impl MemberAcceptState {
+    async fn handle_connection(&self, conn: Connection) {
+        let Ok((_send, mut recv)) = conn.accept_bi().await else { return };
+        let transport_id = conn.remote_id();
+        match control::recv_msg(&mut recv).await {
+            Ok(ControlMsg::MeshHello { identity: peer_identity, ip, hostname }) => {
+                if peer_identity != transport_id { return; }
+                let (is_member, is_approved) = {
+                    let s = self.state.read().unwrap();
+                    (s.members.is_member(&peer_identity), s.approved.is_approved(&peer_identity))
+                };
+                // Resolve hostname collisions
+                let final_hostname = if let Some(desired) = hostname {
+                    let taken: Vec<String> = {
+                        let s = self.state.read().unwrap();
+                        s.members.all().iter()
+                            .filter(|m| m.identity != peer_identity)
+                            .filter_map(|m| m.hostname.clone())
+                            .collect()
+                    };
+                    let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+                    Some(crate::hostname::resolve_collision(&desired, &taken_refs))
+                } else {
+                    None
+                };
+                // Update DNS table
+                if let Some(ref h) = final_hostname {
+                    let mut table = self.hostname_table.write().await;
+                    let network_hosts = table.entry(self.network_name.clone()).or_default();
+                    network_hosts.insert(h.clone(), (ip, derive_ipv6(&peer_identity)));
+                }
+                if is_approved {
+                    let snap_bytes = {
+                        let mut s = self.state.write().unwrap();
+                        s.approved.remove(&peer_identity);
+                        let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false, hostname: final_hostname.clone() });
+                        s.refresh_snapshot();
+                        s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+                    };
+                    if let Some(bytes) = snap_bytes {
+                        let _ = self.blob_store.blobs().add_slice(&bytes).await;
+                    }
+                    let (members, approved_list) = {
+                        let s = self.state.read().unwrap();
+                        (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
+                         s.approved.all().into_iter().cloned().collect::<Vec<_>>())
+                    };
+                    if let Ok((mut send, _)) = conn.open_bi().await {
+                        let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
+                            members: members.clone(), approved: approved_list,
+                        }).await;
+                    }
+                    let peer_ipv6 = derive_ipv6(&peer_identity);
+                    self.peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &self.network_name);
+                    forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, self.endpoint.id(), self.network_name.clone(), self.shared_acl.clone(), self.firewall.clone(), self.tun_tx.clone(), self.disconnect_tx.clone(), self.token.clone(), self.stats.clone());
+                    broadcast_member_sync(&self.peers, &members, Some(ip)).await;
+                } else if is_member {
+                    if final_hostname.is_some() {
+                        let mut s = self.state.write().unwrap();
+                        if let Some(m) = s.members.get_mut(&peer_identity) {
+                            m.hostname = final_hostname;
+                        }
+                    }
+                    let peer_ipv6 = derive_ipv6(&peer_identity);
+                    self.peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &self.network_name);
+                    forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, self.endpoint.id(), self.network_name.clone(), self.shared_acl.clone(), self.firewall.clone(), self.tun_tx.clone(), self.disconnect_tx.clone(), self.token.clone(), self.stats.clone());
+                }
+            }
+            Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
+                if peer_identity != transport_id { return; }
+                let is_known = self.state.read().unwrap().members.is_member(&peer_identity);
+                if is_known {
+                    let peer_ipv6 = derive_ipv6(&peer_identity);
+                    self.peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &self.network_name);
+                    let current_members: Vec<Member> = self.state.read().unwrap().members.all().into_iter().cloned().collect();
+                    if let Ok((mut send, _)) = conn.open_bi().await {
+                        let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
+                    }
+                    forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, self.endpoint.id(), self.network_name.clone(), self.shared_acl.clone(), self.firewall.clone(), self.tun_tx.clone(), self.disconnect_tx.clone(), self.token.clone(), self.stats.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+enum AcceptHandler {
+    Coordinator(Arc<CoordinatorAcceptState>),
+    Member(Arc<MemberAcceptState>),
+}
+
 struct MeshProtocol {
-    tx: mpsc::Sender<Connection>,
+    handler: AcceptHandler,
 }
 
 impl std::fmt::Debug for MeshProtocol {
@@ -52,9 +356,11 @@ impl std::fmt::Debug for MeshProtocol {
 
 impl ProtocolHandler for MeshProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        self.tx.send(conn).await.map_err(|_| {
-            AcceptError::from_err(std::io::Error::other("network handler closed"))
-        })
+        match &self.handler {
+            AcceptHandler::Coordinator(state) => state.handle_connection(conn).await,
+            AcceptHandler::Member(state) => state.handle_connection(conn).await,
+        }
+        Ok(())
     }
 }
 
@@ -71,10 +377,8 @@ impl ProtocolRouter {
         }
     }
 
-    fn register(&self, alpn: Vec<u8>) -> mpsc::Receiver<Connection> {
-        let (tx, rx) = mpsc::channel(32);
-        self.handlers.insert(alpn, Arc::new(MeshProtocol { tx }));
-        rx
+    fn register(&self, alpn: Vec<u8>, handler: AcceptHandler) {
+        self.handlers.insert(alpn, Arc::new(MeshProtocol { handler }));
     }
 
     fn unregister(&self, alpn: &[u8]) {
@@ -368,27 +672,27 @@ impl DaemonState {
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
 
-        // Accept loop for this network
-        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key));
-        let accept_handle = spawn_coordinator_accept(
-            self.endpoint.clone(),
-            name.clone(),
-            conn_rx,
-            self.identity.clone(),
-            policy,
-            state.clone(),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx,
-            cancel.clone(),
-            self.stats.clone(),
-            Some(dht_notify),
-            self.blob_store.clone(),
-            self.shared_acl.clone(),
-            self.firewall.clone(),
-            self.hostname_table.clone(),
+        // Register protocol handler for this network
+        self.protocol_router.register(
+            transport::network_alpn(&net_public_key),
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                endpoint: self.endpoint.clone(),
+                network_name: name.clone(),
+                identity: self.identity.clone(),
+                policy: policy.into(),
+                state: state.clone(),
+                peers: self.peers.clone(),
+                tun_tx: self.tun_tx.clone(),
+                disconnect_tx,
+                token: cancel.clone(),
+                stats: self.stats.clone(),
+                dht_notify: Some(dht_notify),
+                blob_store: self.blob_store.clone(),
+                shared_acl: self.shared_acl.clone(),
+                firewall: self.firewall.clone(),
+                hostname_table: self.hostname_table.clone(),
+            })),
         );
-        tasks.push(accept_handle);
 
         // Update ALPNs
         let handle = NetworkHandle {
@@ -543,7 +847,6 @@ impl DaemonState {
         // Apply ACL from group blob
         self.shared_acl.set(display_name, data.acl.clone());
 
-        let conn_rx = self.protocol_router.register(alpn.clone());
         let state = join_mesh_shared(
             conn,
             &self.endpoint,
@@ -553,16 +856,32 @@ impl DaemonState {
             Some(my_hostname.clone()),
             self.peers.clone(),
             self.tun_tx.clone(),
-            disconnect_tx,
+            disconnect_tx.clone(),
             cancel.clone(),
             self.stats.clone(),
             self.blob_store.clone(),
             self.shared_acl.clone(),
             self.firewall.clone(),
             net_pubkey,
-            conn_rx,
-            self.hostname_table.clone(),
         ).await?;
+
+        self.protocol_router.register(
+            alpn.clone(),
+            AcceptHandler::Member(Arc::new(MemberAcceptState {
+                endpoint: self.endpoint.clone(),
+                network_name: display_name.to_string(),
+                state: state.clone(),
+                peers: self.peers.clone(),
+                tun_tx: self.tun_tx.clone(),
+                disconnect_tx,
+                token: cancel.clone(),
+                stats: self.stats.clone(),
+                blob_store: self.blob_store.clone(),
+                shared_acl: self.shared_acl.clone(),
+                firewall: self.firewall.clone(),
+                hostname_table: self.hostname_table.clone(),
+            })),
+        );
 
         // Set the network public key and ACL on the state
         {
@@ -910,26 +1229,26 @@ impl DaemonState {
             self.shared_acl.set(name, s.acl.clone());
         }
 
-        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key));
-        let accept_handle = spawn_coordinator_accept(
-            self.endpoint.clone(),
-            name.to_string(),
-            conn_rx,
-            self.identity.clone(),
-            policy,
-            state.clone(),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx,
-            cancel.clone(),
-            self.stats.clone(),
-            Some(dht_notify),
-            self.blob_store.clone(),
-            self.shared_acl.clone(),
-            self.firewall.clone(),
-            self.hostname_table.clone(),
+        self.protocol_router.register(
+            transport::network_alpn(&net_public_key),
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                endpoint: self.endpoint.clone(),
+                network_name: name.to_string(),
+                identity: self.identity.clone(),
+                policy: policy.into(),
+                state: state.clone(),
+                peers: self.peers.clone(),
+                tun_tx: self.tun_tx.clone(),
+                disconnect_tx,
+                token: cancel.clone(),
+                stats: self.stats.clone(),
+                dht_notify: Some(dht_notify),
+                blob_store: self.blob_store.clone(),
+                shared_acl: self.shared_acl.clone(),
+                firewall: self.firewall.clone(),
+                hostname_table: self.hostname_table.clone(),
+            })),
         );
-        tasks.push(accept_handle);
 
         // Register hostnames in DNS table
         {
@@ -1946,262 +2265,6 @@ fn spawn_peer_cleanup(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_coordinator_accept(
-    ep: Endpoint,
-    network_name: String,
-    conn_rx: mpsc::Receiver<Connection>,
-    identity: IrohIdentityProvider,
-    policy: Box<dyn MembershipPolicy>,
-    state: Arc<std::sync::RwLock<NetworkState>>,
-    peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
-    blob_store: FsStore,
-    shared_acl: forward::SharedAcl,
-    firewall: SharedFirewall,
-    hostname_table: dns::HostnameTable,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = run_accept_loop(
-            &ep,
-            &network_name,
-            conn_rx,
-            &identity,
-            &*policy,
-            state,
-            peers,
-            tun_tx,
-            disconnect_tx,
-            token,
-            stats,
-            dht_notify,
-            blob_store,
-            shared_acl,
-            firewall,
-            hostname_table,
-        ).await {
-            tracing::warn!(network = %network_name, error = %e, "accept loop stopped");
-        }
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_accept_loop(
-    ep: &Endpoint,
-    network_name: &str,
-    mut conn_rx: mpsc::Receiver<Connection>,
-    identity: &IrohIdentityProvider,
-    policy: &dyn MembershipPolicy,
-    state: Arc<std::sync::RwLock<NetworkState>>,
-    peers: PeerTable,
-    tun_tx: mpsc::Sender<Vec<u8>>,
-    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
-    token: CancellationToken,
-    stats: Arc<ForwardMetrics>,
-    dht_notify: Option<Arc<tokio::sync::Notify>>,
-    blob_store: FsStore,
-    shared_acl: forward::SharedAcl,
-    firewall: SharedFirewall,
-    hostname_table: dns::HostnameTable,
-) -> Result<()> {
-    let self_member = {
-        let s = state.read().unwrap();
-        s.members.get(&identity.local_identity()).cloned().unwrap()
-    };
-
-    loop {
-        tracing::info!(network = %network_name, "waiting for peers...");
-
-        let conn = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            msg = conn_rx.recv() => {
-                match msg {
-                    Some(conn) => conn,
-                    None => return Ok(()),
-                }
-            }
-        };
-
-        let remote_id = conn.remote_id();
-        let peer_ip = identity.derive_ip(&remote_id);
-
-        // Known member reconnecting
-        let is_member = state.read().unwrap().members.is_member(&remote_id);
-        if is_member {
-            tracing::info!(ip = %peer_ip, "known member reconnecting");
-            let members: Vec<Member> = state.read().unwrap().members.all().into_iter().cloned().collect();
-            crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-            let peer_ipv6 = derive_ipv6(&remote_id);
-            peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
-            let token_c = token.clone();
-            let stats_c = stats.clone();
-            let tun_tx_c = tun_tx.clone();
-            let disconnect_tx_c = disconnect_tx.clone();
-            let local_id = ep.id();
-            let network_c = network_name.to_string();
-            let shared_acl_c = shared_acl.clone();
-            let firewall_c = firewall.clone();
-            let state_c = state.clone();
-            let hostname_table_c = hostname_table.clone();
-            let network_name_c = network_name.to_string();
-            tokio::spawn(async move {
-                send_member_sync(&conn, &members).await;
-                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c, hostname_table_c).await;
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
-            });
-            continue;
-        }
-
-        // Approved but not yet connected
-        let is_approved = state.read().unwrap().approved.is_approved(&remote_id);
-        if is_approved {
-            tracing::info!(ip = %peer_ip, "approved peer connecting");
-            let snap_bytes = {
-                let mut s = state.write().unwrap();
-                s.approved.remove(&remote_id);
-                let new_member = Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None };
-                s.members.add(new_member).expect("was approved, no collision");
-                s.refresh_snapshot();
-                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
-            };
-            if let Some(bytes) = snap_bytes {
-                let _ = blob_store.blobs().add_slice(&bytes).await;
-            }
-            if let Some(notify) = &dht_notify { notify.notify_one(); }
-            let (members, approved) = {
-                let s = state.read().unwrap();
-                (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-                 s.approved.all().into_iter().cloned().collect::<Vec<_>>())
-            };
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                    members: members.clone(), approved,
-                }).await;
-            }
-            broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
-            let peer_ipv6 = derive_ipv6(&remote_id);
-            peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
-            let token_c = token.clone();
-            let stats_c = stats.clone();
-            let tun_tx_c = tun_tx.clone();
-            let disconnect_tx_c = disconnect_tx.clone();
-            let local_id = ep.id();
-            let network_c = network_name.to_string();
-            let shared_acl_c = shared_acl.clone();
-            let firewall_c = firewall.clone();
-            let state_c = state.clone();
-            let hostname_table_c = hostname_table.clone();
-            let dht_notify_c = dht_notify.clone();
-            let blob_store_c = blob_store.clone();
-            let network_name_c = network_name.to_string();
-            tokio::spawn(async move {
-                spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
-                update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
-            });
-            continue;
-        }
-
-        // Unknown peer — check policy
-        if !policy.can_authorize(&self_member) {
-            tracing::warn!(peer = %remote_id, "not authorized to accept new members");
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied {
-                    reason: "not authorized".to_string(),
-                }).await;
-            }
-            continue;
-        }
-
-        // Check IP collision
-        let collision_reason: Option<String> = {
-            let s = state.read().unwrap();
-            if let Some(existing) = s.members.get_by_ip(peer_ip)
-                && existing.identity != remote_id
-            {
-                Some(format!("IP collision: {} already assigned", peer_ip))
-            } else if let Some(existing) = s.approved.get_by_ip(peer_ip)
-                && existing.identity != remote_id
-            {
-                Some(format!("IP collision: {} already assigned", peer_ip))
-            } else {
-                None
-            }
-        };
-        if let Some(reason) = collision_reason {
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
-            }
-            continue;
-        }
-
-        // Broadcast MemberApproved (hostname will be updated after MeshHello)
-        broadcast_control_msg(&peers, &ControlMsg::MemberApproved { identity: remote_id, ip: peer_ip, hostname: None }).await;
-
-        // Promote to member
-        let (add_collision, snap_bytes): (Option<String>, Option<Vec<u8>>) = {
-            let mut s = state.write().unwrap();
-            let result = s.members.add(Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None })
-                .err().map(|e| format!("IP collision: {e}"));
-            if result.is_none() {
-                s.refresh_snapshot();
-            }
-            let bytes = s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone());
-            (result, bytes)
-        };
-        if add_collision.is_none()
-            && let Some(bytes) = snap_bytes
-        {
-            let _ = blob_store.blobs().add_slice(&bytes).await;
-        }
-        if let Some(reason) = add_collision {
-            if let Ok((mut send, _)) = conn.open_bi().await {
-                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
-            }
-            continue;
-        }
-
-        let (members, approved) = {
-            let s = state.read().unwrap();
-            (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-             s.approved.all().into_iter().cloned().collect::<Vec<_>>())
-        };
-
-        tracing::info!(ip = %peer_ip, "new member approved and joined");
-        if let Some(notify) = &dht_notify { notify.notify_one(); }
-
-        if let Ok((mut send, _)) = conn.open_bi().await {
-            let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                members: members.clone(), approved,
-            }).await;
-        }
-        broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
-        let peer_ipv6 = derive_ipv6(&remote_id);
-        peers.add(peer_ip, peer_ipv6, conn.clone(), remote_id, network_name);
-        let token_c = token.clone();
-        let stats_c = stats.clone();
-        let tun_tx_c = tun_tx.clone();
-        let disconnect_tx_c = disconnect_tx.clone();
-        let local_id = ep.id();
-        let network_c = network_name.to_string();
-        let shared_acl_c = shared_acl.clone();
-        let firewall_c = firewall.clone();
-        let state_c = state.clone();
-        let hostname_table_c = hostname_table.clone();
-        let dht_notify_c = dht_notify.clone();
-        let blob_store_c = blob_store.clone();
-        let network_name_c = network_name.to_string();
-        tokio::spawn(async move {
-            spawn_coordinator_hello_reader(conn.clone(), remote_id, peer_ip, &network_name_c, state_c.clone(), hostname_table_c).await;
-            update_snapshot_and_publish(&state_c, &blob_store_c, &dht_notify_c).await;
-            forward::spawn_peer_reader(conn, remote_id, peer_ip, peer_ipv6, local_id, network_c, shared_acl_c, firewall_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
-        });
-    }
-}
-
 async fn spawn_coordinator_hello_reader(
     conn: Connection,
     remote_id: EndpointId,
@@ -2280,8 +2343,6 @@ async fn join_mesh_shared(
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
     net_pubkey: EndpointId,
-    conn_rx: mpsc::Receiver<Connection>,
-    hostname_table: dns::HostnameTable,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -2468,118 +2529,6 @@ async fn join_mesh_shared(
                             }
                             Err(_) => return,
                         }
-                    }
-                }
-            }
-        }
-    });
-
-    // Mesh acceptor
-    tokio::spawn({
-        let ep = ep.clone();
-        let peers = peers.clone();
-        let token = token.clone();
-        let stats = stats.clone();
-        let tun_tx = tun_tx.clone();
-        let disconnect_tx = disconnect_tx.clone();
-        let live_state = live_state.clone();
-        let network_name = network_name.to_string();
-        let blob_store = blob_store.clone();
-        let shared_acl = shared_acl.clone();
-        let hostname_table = hostname_table.clone();
-        let mut conn_rx = conn_rx;
-        async move {
-            loop {
-                let conn = tokio::select! {
-                    _ = token.cancelled() => return,
-                    msg = conn_rx.recv() => {
-                        match msg {
-                            Some(c) => c,
-                            None => return,
-                        }
-                    }
-                };
-                if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                    let transport_id = conn.remote_id();
-                    match control::recv_msg(&mut recv).await {
-                        Ok(ControlMsg::MeshHello { identity: peer_identity, ip, hostname }) => {
-                            if peer_identity != transport_id { continue; }
-                            let (is_member, is_approved) = {
-                                let s = live_state.read().unwrap();
-                                (s.members.is_member(&peer_identity), s.approved.is_approved(&peer_identity))
-                            };
-                            // Resolve hostname collisions
-                            let final_hostname = if let Some(desired) = hostname {
-                                let taken: Vec<String> = {
-                                    let s = live_state.read().unwrap();
-                                    s.members.all().iter()
-                                        .filter(|m| m.identity != peer_identity)
-                                        .filter_map(|m| m.hostname.clone())
-                                        .collect()
-                                };
-                                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-                                Some(crate::hostname::resolve_collision(&desired, &taken_refs))
-                            } else {
-                                None
-                            };
-                            // Update DNS table
-                            if let Some(ref h) = final_hostname {
-                                let mut table = hostname_table.write().await;
-                                let network_hosts = table.entry(network_name.clone()).or_default();
-                                network_hosts.insert(h.clone(), (ip, derive_ipv6(&peer_identity)));
-                            }
-                            if is_approved {
-                                let snap_bytes = {
-                                    let mut s = live_state.write().unwrap();
-                                    s.approved.remove(&peer_identity);
-                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false, hostname: final_hostname.clone() });
-                                    s.refresh_snapshot();
-                                    s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
-                                };
-                                if let Some(bytes) = snap_bytes {
-                                    let _ = blob_store.blobs().add_slice(&bytes).await;
-                                }
-                                let (members, approved_list) = {
-                                    let s = live_state.read().unwrap();
-                                    (s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-                                     s.approved.all().into_iter().cloned().collect::<Vec<_>>())
-                                };
-                                if let Ok((mut send, _)) = conn.open_bi().await {
-                                    let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                                        members: members.clone(), approved: approved_list,
-                                    }).await;
-                                }
-                                let peer_ipv6 = derive_ipv6(&peer_identity);
-                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
-                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                                broadcast_member_sync(&peers, &members, Some(ip)).await;
-                            } else if is_member {
-                                // Update hostname for existing member
-                                if final_hostname.is_some() {
-                                    let mut s = live_state.write().unwrap();
-                                    if let Some(m) = s.members.get_mut(&peer_identity) {
-                                        m.hostname = final_hostname;
-                                    }
-                                }
-                                let peer_ipv6 = derive_ipv6(&peer_identity);
-                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
-                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                            }
-                        }
-                        Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
-                            if peer_identity != transport_id { continue; }
-                            let is_known = live_state.read().unwrap().members.is_member(&peer_identity);
-                            if is_known {
-                                let peer_ipv6 = derive_ipv6(&peer_identity);
-                                peers.add(ip, peer_ipv6, conn.clone(), peer_identity, &network_name);
-                                let current_members: Vec<Member> = live_state.read().unwrap().members.all().into_iter().cloned().collect();
-                                if let Ok((mut send, _)) = conn.open_bi().await {
-                                    let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
-                                }
-                                forward::spawn_peer_reader(conn, peer_identity, ip, peer_ipv6, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }

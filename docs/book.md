@@ -43,13 +43,14 @@ The core idea is simple: every peer gets a virtual IP address derived from their
 Application (e.g., Minecraft)
     |
     v
-TUN device (100.64.x.x)
+TUN device (100.64.x.x / 200::x)
     |
     v
 pitopi forwarding loop
-    |  reads IPv4 packets from TUN
-    |  extracts destination IP from header bytes 16-19
-    |  looks up the peer connection in the routing table
+    |  reads IPv4/IPv6 packets from TUN
+    |  checks version nibble (4 or 6)
+    |  extracts destination IP from header
+    |  looks up the peer connection in the routing table (v4 or v6 DashMap)
     v
 iroh QUIC datagram
     |  encrypted, NAT-traversed
@@ -65,7 +66,11 @@ Pitopi uses QUIC datagrams (not streams) for data packets. Datagrams are unrelia
 
 ### Address space
 
-All peers live in the `100.64.0.0/10` range, which is the IANA-assigned Carrier-Grade NAT (CGNAT) block. This range is reserved for internal use by ISPs and is extremely unlikely to collide with any real network your machine participates in. The /10 prefix gives 22 bits of host address space, allowing roughly 4 million unique addresses.
+Pitopi is dual-stack: every peer gets both an IPv4 and an IPv6 address, each derived deterministically from their cryptographic identity.
+
+**IPv4 — `100.64.0.0/10`:** The IANA-assigned Carrier-Grade NAT (CGNAT) block. This range is reserved for internal use by ISPs and is extremely unlikely to collide with any real network your machine participates in. The /10 prefix gives 22 bits of host address space (roughly 4 million unique addresses), derived via FNV-1a hash of the peer's identity.
+
+**IPv6 — `200::/7`:** A 120-bit address space derived via blake3 hash. The large address space makes collisions practically impossible. IPv6 addresses are stable and never rotate -- the same identity always produces the same address. Applications can use either address family to reach a peer.
 
 ### Why not WireGuard?
 
@@ -163,12 +168,12 @@ Inside each peer, the stack looks like this:
 │                  Applications                    │
 │            (Minecraft, SSH, curl, ...)            │
 └──────────────────────┬──────────────────────────┘
-                       │ regular TCP/UDP to 100.64.x.x
+                       │ regular TCP/UDP to 100.64.x.x or 200::x
                        ▼
 ┌─────────────────────────────────────────────────┐
 │               TUN device (kernel)                │
-│         100.64.0.0/10 — captures all traffic     │
-│         to the virtual network range             │
+│  100.64.0.0/10 (IPv4) + 200::/7 (IPv6)          │
+│  captures all traffic to the virtual ranges      │
 └──────┬──────────────────────────────┬────────────┘
        │ read                         │ write
        ▼                              ▼
@@ -177,8 +182,8 @@ Inside each peer, the stack looks like this:
 │  (run_mesh) │               │  (tun_rx)   │
 └──────┬──────┘               └──────▲──────┘
        │                              │
-       │ dest_ip → PeerTable          │ tun_tx channel
-       │ lookup → Connection          │
+       │ dst_ip → PeerTable            │ tun_tx channel
+       │ lookup_v4/v6 → Connection    │
        ▼                              │
 ┌─────────────────────┐    ┌──────────┴──────────┐
 │    PeerTable        │    │  spawn_peer_reader   │
@@ -386,7 +391,9 @@ The membership module is the heart of pitopi's identity and authorization system
 
 ### Identity-derived IP addresses
 
-Rather than assigning IPs sequentially (first joiner gets .2, second gets .3), pitopi derives each peer's IP deterministically from their identity string using FNV-1a hashing:
+Rather than assigning IPs sequentially (first joiner gets .2, second gets .3), pitopi derives each peer's addresses deterministically from their cryptographic identity.
+
+#### IPv4 derivation (FNV-1a)
 
 ```
 identity string  ->  FNV-1a hash  ->  lower 22 bits  ->  100.64.0.0/10 address
@@ -400,7 +407,17 @@ Two host addresses are reserved:
 
 If the hash lands on either of these, the address is shifted to host bits 2 or 3.
 
-The key property: **a peer always gets the same IP, in every network, on every run.** This makes the address a stable identifier that other peers and applications can rely on.
+The `derive_ip_with_index(identity, index)` variant supports collision rotation by mixing an index into the hash, enabling future automatic collision resolution without changing identities.
+
+#### IPv6 derivation (blake3)
+
+```
+identity string  ->  blake3 hash  ->  15 bytes  ->  prepend 0x02  ->  200::/7 address
+```
+
+The blake3 hash provides 120 bits of address space within the `200::/7` range, making collisions practically impossible. IPv6 addresses are derived on-demand via `derive_ipv6()` rather than stored in the `Member` struct -- any peer can compute another peer's IPv6 address from their identity alone.
+
+The key property: **a peer always gets the same IPv4 and IPv6 addresses, in every network, on every run.** This makes both addresses stable identifiers that other peers and applications can rely on.
 
 #### Collision handling
 
@@ -419,16 +436,20 @@ All identity operations are abstracted behind a trait to allow swapping the iden
 ```rust
 pub trait IdentityProvider: Send + Sync {
     fn local_ip(&self) -> Ipv4Addr;
+    fn local_ipv6(&self) -> Ipv6Addr;
     fn local_identity(&self) -> EndpointId;
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
+    fn derive_ipv6(&self, peer_identity: &EndpointId) -> Ipv6Addr;
 }
 ```
 
 The current implementation, `IrohIdentityProvider`, wraps an iroh `EndpointId`:
 
-- `local_ip()` returns the FNV-1a-derived IP for this node's EndpointId.
+- `local_ip()` returns the FNV-1a-derived IPv4 for this node's EndpointId.
+- `local_ipv6()` returns the blake3-derived IPv6 for this node's EndpointId.
 - `local_identity()` returns the EndpointId (iroh `PublicKey`).
-- `derive_ip(peer)` converts the EndpointId to a string internally and hashes it to an IP.
+- `derive_ip(peer)` converts the EndpointId to a string internally and hashes it to an IPv4.
+- `derive_ipv6(peer)` computes the blake3-derived IPv6 for any peer's EndpointId.
 
 Identity verification happens at the transport level — the QUIC handshake already authenticates the EndpointId, so `conn.remote_id()` is trusted without additional application-level checks.
 
@@ -599,12 +620,12 @@ This means pitopi works without any port forwarding, dynamic DNS, or firewall co
 
 **Module:** `src/control.rs`
 
-The control protocol handles all coordination between peers: join requests, membership updates, and mesh formation. Messages are sent as length-prefixed JSON over QUIC bidirectional streams.
+The control protocol handles all coordination between peers: join requests, membership updates, and mesh formation. Messages are sent as length-prefixed msgpack over QUIC bidirectional streams.
 
 ### Wire format
 
 ```
-[4 bytes: big-endian u32 length] [N bytes: JSON body]
+[4 bytes: big-endian u32 length] [N bytes: msgpack body]
 ```
 
 The 4-byte length prefix allows the receiver to know exactly how many bytes to read for each message. Maximum message size is 64 KB.
@@ -771,14 +792,24 @@ A TUN (network TUNnel) device is a virtual network interface that operates at th
 
 ### Creation
 
-Pitopi creates a TUN device with:
+The `create(v4, v6)` function takes both the peer's IPv4 and IPv6 addresses and returns `(TunReader, TunWriter, tun_name)`. Pitopi creates a TUN device with:
 
-- **Address:** the peer's identity-derived IP (e.g., `100.64.23.142`)
+- **IPv4 address:** the peer's identity-derived IP (e.g., `100.64.23.142`)
 - **Gateway/destination:** `100.64.0.1` (fixed for point-to-point interface on macOS)
-- **Netmask:** `255.192.0.0` (/10, covering the entire CGNAT range)
+- **IPv4 netmask:** `255.192.0.0` (/10, covering the entire CGNAT range)
+- **IPv6 address:** the peer's blake3-derived address (e.g., `0200:abcd:...`) with /128 host mask
 - **MTU:** 1200 bytes
 
-The /10 netmask means the operating system routes all traffic destined for `100.64.0.0` through `100.127.255.255` to this TUN device. Any application sending to a peer's virtual IP will have its packets captured by pitopi.
+The /10 netmask routes all IPv4 traffic destined for `100.64.0.0` through `100.127.255.255` to this TUN device. The IPv6 /128 address is added after device creation via platform-specific commands.
+
+### IPv6 address assignment
+
+The `add_ipv6_address(tun_name, addr)` function configures IPv6 on the TUN device using platform-specific commands:
+
+- **macOS:** `ifconfig <tun> inet6 <addr> prefixlen 128`
+- **Linux:** `ip -6 addr add <addr>/128 dev <tun>`
+
+This runs after the TUN device is created and the interface name is known.
 
 ### MTU
 
@@ -840,8 +871,8 @@ run_mesh()                    spawn_peer_reader() [one per peer]
 This is the main forwarding loop. It reads packets from the TUN device in a tight loop:
 
 1. Read a packet from TUN into a 1500-byte buffer.
-2. Parse the IPv4 header with `parse_packet_info()` — extracts source/destination IP, protocol, and TCP/UDP ports.
-3. Look up the destination IP in the `PeerTable`.
+2. Parse the packet header with `parse_packet_info()` — checks the version nibble to determine IPv4 or IPv6, then extracts source/destination IP, protocol, and TCP/UDP ports.
+3. Dispatch on the destination address: `IpAddr::V4` calls `peers.lookup_v4()`, `IpAddr::V6` calls `peers.lookup_v6()`.
 4. Check network ACL (`SharedAcl`): is this local identity allowed to send to the peer?
 5. Check local firewall (`SharedFirewall`): is this outbound packet allowed by direction/protocol/port/peer rules?
 6. If allowed, send the packet as a QUIC datagram on that peer's connection.
@@ -876,16 +907,30 @@ A single task reads from the `tun_rx` channel and writes packets to the TUN devi
 
 ### Packet parsing
 
-The `parse_packet_info()` function (in `src/firewall.rs`) parses the IPv4 header to extract routing and firewall-relevant fields:
+The `parse_packet_info()` function (in `src/firewall.rs`) handles both IPv4 and IPv6 packets by checking the version nibble (high nibble of byte 0) and dispatching to `parse_ipv4()` or `parse_ipv6()`:
 
-- **Version check**: byte 0, high nibble must be 4 (IPv4)
+**IPv4 parsing:**
 - **IHL**: byte 0, low nibble gives header length in 32-bit words
 - **Protocol**: byte 9 (6=TCP, 17=UDP, 1=ICMP)
 - **Source IP**: bytes 12-15
 - **Destination IP**: bytes 16-19
 - **TCP/UDP ports**: at offset `IHL*4` (source port) and `IHL*4+2` (destination port)
 
-Returns a `PacketInfo` struct with all fields, or `None` for non-IPv4 or too-short packets. The forwarding loop uses `dst_ip` for routing and `protocol`/`dst_port` for firewall evaluation.
+**IPv6 parsing:**
+- **Next Header (protocol)**: byte 6 (6=TCP, 17=UDP, 58=ICMPv6)
+- **Source IP**: bytes 8-23 (16 bytes)
+- **Destination IP**: bytes 24-39 (16 bytes)
+- **TCP/UDP ports**: at offset 40 (fixed header length)
+
+Returns a unified `PacketInfo` struct with `src_ip: IpAddr`, `dst_ip: IpAddr`, `protocol`, and port fields, or `None` for unrecognized or too-short packets. The forwarding loop uses `dst_ip` for routing (dispatching to the v4 or v6 DashMap) and `protocol`/`dst_port` for firewall evaluation.
+
+### Hot-path optimizations
+
+The forwarding path is performance-critical -- every packet traverses it. Several optimizations minimize allocations on the hot path:
+
+- **`SmolStr` for network names**: `PeerEntry` stores the network name as a `SmolStr` (from the `smol_str` crate), which inlines strings of 23 bytes or fewer on the stack. Since network names are short, this avoids a heap allocation on every `PeerEntry` clone during lookup.
+- **`Arc<AclData>` in `SharedAcl`**: The shared ACL uses `Arc` so that reading the current ACL on every packet is a refcount bump, not a deep clone of tags and rules.
+- **`ArcSwap` for `SharedFirewall`**: The firewall config uses `ArcSwap` (from the `arc-swap` crate) for lock-free reads. The hot path loads the current config with a single atomic pointer swap -- no `RwLock` contention. Config updates (rare IPC operations) swap in a new `Arc<FirewallConfig>`.
 
 ---
 
@@ -899,32 +944,32 @@ The `PeerTable` is the routing table that maps virtual IP addresses to QUIC conn
 
 ```rust
 pub struct PeerTable {
-    inner: Arc<RwLock<HashMap<Ipv4Addr, PeerEntry>>>,
+    v4: Arc<DashMap<Ipv4Addr, PeerEntry>>,
+    v6: Arc<DashMap<Ipv6Addr, PeerEntry>>,
 }
 
 pub struct PeerEntry {
     pub conn: Connection,
     pub endpoint_id: EndpointId,
+    pub network: SmolStr,
 }
 ```
 
-Each entry maps an IP address to:
+The table uses dual `DashMap`s -- one keyed by IPv4, one by IPv6 -- so that the forwarding loop can look up a peer by whichever address family the packet uses. Each entry maps an IP address to:
 - The QUIC `Connection` object used to send datagrams to that peer.
 - The peer's `EndpointId` for identification.
+- The `network` name as a `SmolStr` (inlines strings up to 23 bytes, avoiding heap allocation on clone).
 
 ### Thread safety
 
-The table is wrapped in `Arc<RwLock<...>>` using the standard library's `RwLock`. This allows:
-- Multiple concurrent readers (the forwarding loop and any task checking membership)
-- Exclusive writes (adding or removing peers)
-
-The `PeerTable` implements `Clone` by cloning the `Arc`, so all clones share the same underlying data. This is how it's shared between the forwarding loop, accept loop, and mesh acceptor.
+`DashMap` provides lock-free concurrent reads and fine-grained sharded writes without an outer `RwLock`. The `PeerTable` implements `Clone` by cloning the `Arc`s, so all clones share the same underlying data. This is how it's shared between the forwarding loop, accept loop, and mesh acceptor.
 
 ### Operations
 
-- `add(ip, conn, endpoint_id)` -- insert or replace a peer entry.
-- `remove(ip)` -- remove a peer and return their connection.
-- `lookup(ip)` -- find the connection for a given IP (used by the forwarding loop on every packet).
+- `add(ip, ipv6, conn, endpoint_id, network)` -- insert into both v4 and v6 maps simultaneously.
+- `remove(ip)` -- remove a peer from the v4 map and return their connection.
+- `lookup_v4(ip)` -- find the connection for a given IPv4 (used by the forwarding loop for IPv4 packets).
+- `lookup_v6(ip)` -- find the connection for a given IPv6 (used by the forwarding loop for IPv6 packets).
 - `all_connections()` -- list all peers (used for broadcasting MemberSync messages).
 - `all_peer_ids()` -- list all peers with their identity strings.
 
@@ -1240,12 +1285,12 @@ Each rule specifies:
 
 ### Packet parsing
 
-The firewall parses IPv4 packet headers to extract the protocol number and TCP/UDP port numbers. This happens via `parse_packet_info()` which reads:
+The firewall parses both IPv4 and IPv6 packet headers to extract the protocol number and TCP/UDP port numbers. `parse_packet_info()` checks the version nibble and delegates to `parse_ipv4()` or `parse_ipv6()`. The resulting `PacketInfo` uses `IpAddr` (the Rust standard library enum) for source and destination, so firewall rules work uniformly across address families.
 
-- Protocol field (byte 9 of IPv4 header)
-- Source and destination ports (first 4 bytes after the IP header, for TCP/UDP only)
+- **IPv4:** protocol from byte 9, ports after variable-length IP header
+- **IPv6:** protocol from byte 6 (Next Header), ports after fixed 40-byte header
 
-ICMP packets have no ports, so port-based rules don't match ICMP traffic (use protocol-only rules for ICMP).
+ICMP (protocol 1) and ICMPv6 (protocol 58) are both matched by the `icmp` protocol filter. ICMP packets have no ports, so port-based rules don't match ICMP traffic (use protocol-only rules for ICMP).
 
 ### Enforcement
 
@@ -1254,7 +1299,7 @@ The firewall is checked **after** the network ACL, in both directions:
 - **Inbound** (`spawn_peer_reader`): after the network ACL allows the packet, the firewall checks direction=in, the destination port, and the sending peer's identity.
 - **Outbound** (`run_mesh`): after the network ACL allows the packet, the firewall checks direction=out, the destination port, and the target peer's identity.
 
-The `SharedFirewall` is an `Arc<RwLock<FirewallConfig>>` — read locks on the hot path are uncontended and sub-nanosecond. Rule changes via IPC are rare.
+The `SharedFirewall` wraps an `Arc<ArcSwap<FirewallConfig>>` for lock-free reads on the hot path. Every packet checks the firewall via a single atomic load -- no lock acquisition at all. Rule changes (rare IPC operations) swap in a new `Arc<FirewallConfig>` atomically.
 
 ### CLI commands
 
@@ -1333,16 +1378,18 @@ System resolver (macOS /etc/resolver/pi, Linux systemd-resolved, etc.)
     |  routes only .pi queries to pitopi
     v
 pitopi DNS server (UDP, 127.0.0.1:53)
-    |  looks up HostnameTable (network → hostname → IP)
+    |  looks up HostnameTable (network → hostname → HostnameEntry)
     v
-A record response (100.64.x.x)
+A record (100.64.x.x) and/or AAAA record (200::x)
 ```
 
-The daemon runs a minimal UDP DNS responder bound to `127.0.0.1:53`. It only handles A queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected.
+The daemon runs a minimal UDP DNS responder bound to `127.0.0.1:53`. It handles both A (IPv4) and AAAA (IPv6) queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected. A queries return the peer's IPv4 address; AAAA queries return their IPv6 address.
 
 ### Hostname assignment
 
 Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs) and via MeshHello messages when peers connect. This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
+
+The `HostnameTable` stores a `HostnameEntry` tuple `(Ipv4Addr, Ipv6Addr)` per hostname, keyed as `network -> hostname -> (v4, v6)`. When a peer is registered, both addresses are stored so that A and AAAA queries can be answered from the same table.
 
 Hostnames are persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
 
@@ -1448,7 +1495,7 @@ Pitopi uses `iroh-metrics` for Prometheus-compatible metrics collection and expo
 | `pitopi_bytes_tx_total` | Total bytes sent |
 | `pitopi_drops_total{reason="..."}` | Dropped packets, labeled by reason |
 
-Drop reasons: `acl` (network ACL denied), `firewall` (local firewall denied), `send_failure` (QUIC send error), `no_peer` (no route to destination), `malformed` (oversized or non-IPv4 packet).
+Drop reasons: `acl` (network ACL denied), `firewall` (local firewall denied), `send_failure` (QUIC send error), `no_peer` (no route to destination), `malformed` (oversized or non-IPv4/IPv6 packet).
 
 ### Per-peer metrics
 
@@ -1910,11 +1957,13 @@ join_network_inner("<public-key>", Some("gaming"))
 ```
 Outgoing packet (app → peer):
 
-  App writes to 100.64.x.x
-    → kernel routes to TUN (/10 netmask captures all 100.64-100.127)
+  App writes to 100.64.x.x or 200::x
+    → kernel routes to TUN (IPv4 /10 or IPv6 /128)
     → TunReader.read_packet()              [run_mesh]
-    → dest_ip(packet)                      extract IPv4 header bytes 16-19
-    → PeerTable.lookup(dst_ip)             → Connection
+    → parse_packet_info(packet)            check version nibble (4 or 6)
+    → match dst_ip:
+        IpAddr::V4(v4) → peers.lookup_v4(&v4)  → Connection
+        IpAddr::V6(v6) → peers.lookup_v6(&v6)  → Connection
     → conn.send_datagram(packet)           QUIC unreliable datagram
 
 Incoming packet (peer → app):
@@ -2034,6 +2083,8 @@ Virtual IPs are derived from cryptographic identities, not assigned by the coord
 2. The joiner checks its own derived IP against the member list received in the `Welcome` message.
 
 No peer can assign a different IP than what the identity hash produces. This means a peer's IP is a stable, verifiable identifier.
+
+**IPv6 stability:** The IPv6 address is derived via blake3 into a 120-bit space (`200::/7`), making collisions practically impossible. Unlike IPv4 (which could theoretically require collision rotation via `derive_ip_with_index`), the IPv6 address is unconditionally stable -- the same identity always produces the same IPv6 address, with no rotation or suffix needed. This makes IPv6 addresses suitable as permanent, long-lived identifiers for peers.
 
 ### DHT record integrity
 

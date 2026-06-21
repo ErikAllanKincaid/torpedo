@@ -1,6 +1,6 @@
-//! Length-prefixed JSON control protocol over QUIC bidirectional streams.
+//! Length-prefixed msgpack control protocol over QUIC bidirectional streams.
 //!
-//! Each message is encoded as a 4-byte big-endian length prefix followed by a JSON body.
+//! Each message is encoded as a 4-byte big-endian length prefix followed by a msgpack body.
 //! Control messages manage membership (join, approve, sync) and mesh topology (hello, reconnect).
 
 use std::net::Ipv4Addr;
@@ -67,9 +67,9 @@ pub struct ServiceTag {
 }
 
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
-    let json = serde_json::to_vec(msg).expect("serialize control message");
-    let len = (json.len() as u32).to_be_bytes();
-    [len.as_slice(), &json].concat()
+    let body = rmp_serde::to_vec_named(msg).expect("serialize control message");
+    let len = (body.len() as u32).to_be_bytes();
+    [len.as_slice(), &body].concat()
 }
 
 #[cfg(test)]
@@ -77,7 +77,7 @@ fn decode_msg(data: &[u8]) -> Result<ControlMsg> {
     anyhow::ensure!(data.len() >= 4, "message too short");
     let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
     anyhow::ensure!(data.len() >= 4 + len, "incomplete message");
-    serde_json::from_slice(&data[4..4 + len]).context("invalid control message")
+    rmp_serde::from_slice(&data[4..4 + len]).context("invalid control message")
 }
 
 pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
@@ -102,7 +102,7 @@ pub async fn recv_msg(stream: &mut RecvStream) -> Result<ControlMsg> {
         .read_exact(&mut body)
         .await
         .context("read message body")?;
-    serde_json::from_slice(&body).context("decode control message")
+    rmp_serde::from_slice(&body).context("decode control message")
 }
 
 #[cfg(test)]

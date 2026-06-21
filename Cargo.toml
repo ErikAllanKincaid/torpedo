@@ -15,16 +15,16 @@ futures = "0.3"
 iroh = "1"
 iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
-rand = "0.9"
+rand = "0.10"
 rmp-serde = "1"
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tun = { version = "0.8.12", features = ["async"] }
+tun = { version = "0.8.13", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 url = "2"
 hex = "0.4.3"

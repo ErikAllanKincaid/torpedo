@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use rand::Rng;
+use rand::RngExt;
 
 pub const ADJECTIVES: &[&str] = &[
     "able", "aged", "airy", "amber", "arctic", "ashen", "azure", "bare",

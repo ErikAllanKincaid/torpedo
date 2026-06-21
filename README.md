@@ -191,7 +191,7 @@ ping alice.gentle-amber-fox.pi    # fully qualified
 ping alice.pi                     # flat lookup (searches all networks)
 ```
 
-Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. Both A (IPv4) and AAAA (IPv6) records are served, so `ping6 alice.gaming.pi` works out of the box. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
+Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. A (IPv4), AAAA (IPv6), and PTR (reverse DNS) records are served, so `ping6 alice.gaming.pi` and `dig -x 100.64.x.x` both work. EDNS/OPT and DNS-over-TCP are supported. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver (macOS: SCDynamicStore, Linux: systemd-resolved/NetworkManager D-Bus, resolvconf, or direct); all other DNS is untouched.
 
 ### Local peer discovery (mDNS)
 

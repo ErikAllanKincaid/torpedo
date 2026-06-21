@@ -1,19 +1,21 @@
 //! Minimal DNS responder for Magic DNS (.pi TLD).
 //!
-//! Binds to 100.64.0.1:53 (UDP) and answers A queries for `*.pi` names.
-//! All other queries receive REFUSED.
+//! Binds to 127.0.0.1:53 (UDP + TCP) and answers A, AAAA, PTR, and SOA
+//! queries for `*.pi` names. All other queries receive REFUSED.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
+use dashmap::DashMap;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use simple_dns::{
-    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::A, rdata::AAAA,
-    rdata::RData,
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord,
+    rdata::A, rdata::AAAA, rdata::RData, rdata::SOA, rdata::OPT,
 };
 
 use crate::DNS_DOMAIN;
@@ -22,23 +24,113 @@ use crate::DNS_DOMAIN;
 pub type HostnameEntry = (Ipv4Addr, Ipv6Addr);
 pub type HostnameTable = Arc<RwLock<HashMap<String, HashMap<String, HostnameEntry>>>>;
 
+/// Reverse lookup: IP → (hostname, network).
+pub type ReverseLookupTable = Arc<DashMap<IpAddr, (String, String)>>;
+
 pub fn new_hostname_table() -> HostnameTable {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+pub fn new_reverse_table() -> ReverseLookupTable {
+    Arc::new(DashMap::new())
+}
+
+/// Update both the hostname table and reverse lookup table atomically.
+pub async fn update_hostname(
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+    network: &str,
+    hostname: &str,
+    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
+) {
+    {
+        let mut t = table.write().await;
+        let hosts = t.entry(network.to_string()).or_default();
+        hosts.insert(hostname.to_string(), (ipv4, ipv6));
+    }
+    reverse.insert(IpAddr::V4(ipv4), (hostname.to_string(), network.to_string()));
+    reverse.insert(IpAddr::V6(ipv6), (hostname.to_string(), network.to_string()));
+}
+
+/// Remove a hostname from both tables.
+#[allow(dead_code)]
+pub async fn remove_hostname(
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+    network: &str,
+    hostname: &str,
+) {
+    let mut t = table.write().await;
+    if let Some(hosts) = t.get_mut(network)
+        && let Some((ipv4, ipv6)) = hosts.remove(hostname)
+    {
+        reverse.remove(&IpAddr::V4(ipv4));
+        reverse.remove(&IpAddr::V6(ipv6));
+    }
+}
+
+/// Remove a hostname by IP address from both tables.
+pub async fn remove_hostname_by_ip(
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+    network: &str,
+    ipv4: Ipv4Addr,
+) {
+    let mut t = table.write().await;
+    if let Some(hosts) = t.get_mut(network) {
+        hosts.retain(|_, (v4, v6)| {
+            if *v4 == ipv4 {
+                reverse.remove(&IpAddr::V4(*v4));
+                reverse.remove(&IpAddr::V6(*v6));
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// Remove all hostnames for a network from both tables.
+pub async fn remove_network(
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+    network: &str,
+) {
+    let mut t = table.write().await;
+    if let Some(hosts) = t.remove(network) {
+        for (_, (ipv4, ipv6)) in hosts {
+            reverse.remove(&IpAddr::V4(ipv4));
+            reverse.remove(&IpAddr::V6(ipv6));
+        }
+    }
+}
+
 pub async fn spawn_dns_server(
     table: HostnameTable,
+    reverse: ReverseLookupTable,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = "127.0.0.1:53".parse().unwrap();
-    let socket = UdpSocket::bind(addr).await?;
-    tracing::info!("DNS resolver listening on {addr}");
 
-    let mut buf = vec![0u8; 512];
+    let udp = Arc::new(UdpSocket::bind(addr).await?);
+    tracing::info!("DNS resolver listening on {addr} (UDP)");
+
+    let tcp = TcpListener::bind(addr).await?;
+    tracing::info!("DNS resolver listening on {addr} (TCP)");
+
+    let tcp_table = table.clone();
+    let tcp_reverse = reverse.clone();
+    let tcp_cancel = cancel.clone();
+    tokio::spawn(async move {
+        run_tcp_listener(tcp, tcp_table, tcp_reverse, tcp_cancel).await;
+    });
+
+    let mut buf = vec![0u8; 1232];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            result = socket.recv_from(&mut buf) => {
+            result = udp.recv_from(&mut buf) => {
                 let (len, src) = match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -46,17 +138,78 @@ pub async fn spawn_dns_server(
                         continue;
                     }
                 };
-                let response = handle_query(&buf[..len], &table).await;
-                if let Some(resp_bytes) = response {
-                    let _ = socket.send_to(&resp_bytes, src).await;
-                }
+                let data = buf[..len].to_vec();
+                let sock = udp.clone();
+                let t = table.clone();
+                let r = reverse.clone();
+                tokio::spawn(async move {
+                    if let Some(resp) = handle_query(&data, &t, &r).await {
+                        let _ = sock.send_to(&resp, src).await;
+                    }
+                });
             }
         }
     }
     Ok(())
 }
 
-async fn handle_query(data: &[u8], table: &HostnameTable) -> Option<Vec<u8>> {
+async fn run_tcp_listener(
+    listener: TcpListener,
+    table: HostnameTable,
+    reverse: ReverseLookupTable,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = listener.accept() => {
+                let (stream, _) = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "DNS TCP accept error");
+                        continue;
+                    }
+                };
+                let t = table.clone();
+                let r = reverse.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        handle_tcp_connection(stream, &t, &r),
+                    ).await;
+                });
+            }
+        }
+    }
+}
+
+async fn handle_tcp_connection(
+    mut stream: tokio::net::TcpStream,
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+) -> anyhow::Result<()> {
+    loop {
+        let len = match stream.read_u16().await {
+            Ok(l) => l as usize,
+            Err(_) => return Ok(()),
+        };
+        if len == 0 || len > 65535 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        if let Some(resp) = handle_query(&buf, table, reverse).await {
+            stream.write_u16(resp.len() as u16).await?;
+            stream.write_all(&resp).await?;
+        }
+    }
+}
+
+async fn handle_query(
+    data: &[u8],
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+) -> Option<Vec<u8>> {
     let packet = Packet::parse(data).ok()?;
 
     if packet.questions.is_empty() {
@@ -64,38 +217,118 @@ async fn handle_query(data: &[u8], table: &HostnameTable) -> Option<Vec<u8>> {
     }
 
     let question = &packet.questions[0];
-    let is_a = question.qtype == QTYPE::TYPE(simple_dns::TYPE::A);
-    let is_aaaa = question.qtype == QTYPE::TYPE(simple_dns::TYPE::AAAA);
-    if !is_a && !is_aaaa {
-        return Some(make_refused(&packet));
-    }
-
     let name_str = question.qname.to_string();
     let name_lower = name_str.trim_end_matches('.').to_lowercase();
 
+    let is_a = question.qtype == QTYPE::TYPE(simple_dns::TYPE::A);
+    let is_aaaa = question.qtype == QTYPE::TYPE(simple_dns::TYPE::AAAA);
+    let is_ptr = question.qtype == QTYPE::TYPE(simple_dns::TYPE::PTR);
+    let is_soa = question.qtype == QTYPE::TYPE(simple_dns::TYPE::SOA);
+
+    // PTR queries for in-addr.arpa / ip6.arpa
+    if is_ptr {
+        return handle_ptr_query(&packet, &name_lower, reverse).await;
+    }
+
     let suffix = format!(".{DNS_DOMAIN}");
+
+    // SOA query for the zone apex
+    if is_soa && (name_lower == DNS_DOMAIN || name_lower.ends_with(&suffix)) {
+        return Some(make_soa_response(&packet, &question.qname));
+    }
+
     if !name_lower.ends_with(&suffix) {
         tracing::debug!(name = %name_lower, "DNS query for non-.{} domain, refusing", DNS_DOMAIN);
         return Some(make_refused(&packet));
     }
 
-    let entry = resolve_name(&name_lower, &suffix, table).await;
-
-    match entry {
-        Some((v4, v6)) => {
-            if is_a {
-                tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
-                Some(make_a_response(&packet, &question.qname, v4))
-            } else {
-                tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
-                Some(make_aaaa_response(&packet, &question.qname, v6))
+    // A or AAAA query for .pi names
+    if is_a || is_aaaa {
+        let entry = resolve_name(&name_lower, &suffix, table).await;
+        match entry {
+            Some((v4, v6)) => {
+                if is_a {
+                    tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
+                    Some(make_a_response(&packet, &question.qname, v4))
+                } else {
+                    tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
+                    Some(make_aaaa_response(&packet, &question.qname, v6))
+                }
+            }
+            None => {
+                tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
+                Some(make_nxdomain(&packet))
             }
         }
-        None => {
-            tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
-            Some(make_nxdomain(&packet))
+    } else {
+        // Other query types for .pi names: NOERROR with empty answer
+        Some(make_nodata(&packet))
+    }
+}
+
+async fn handle_ptr_query(
+    packet: &Packet<'_>,
+    name: &str,
+    reverse: &ReverseLookupTable,
+) -> Option<Vec<u8>> {
+    let ip = parse_ptr_name(name)?;
+
+    if let Some(entry) = reverse.get(&ip) {
+        let (hostname, network) = entry.value();
+        let fqdn = format!("{hostname}.{network}.{DNS_DOMAIN}.");
+        tracing::info!(ip = %ip, name = %fqdn, "DNS resolved PTR");
+        return Some(make_ptr_response(packet, &packet.questions[0].qname, &fqdn));
+    }
+
+    // If IP is in our range but not found, NXDOMAIN
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 100.64.0.0/10
+            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
+                return Some(make_nxdomain(packet));
+            }
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            // 200::/7
+            if (segments[0] & 0xFE00) == 0x0200 {
+                tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
+                return Some(make_nxdomain(packet));
+            }
         }
     }
+
+    Some(make_refused(packet))
+}
+
+fn parse_ptr_name(name: &str) -> Option<IpAddr> {
+    if let Some(stripped) = name.strip_suffix(".in-addr.arpa") {
+        let parts: Vec<&str> = stripped.split('.').collect();
+        if parts.len() == 4 {
+            let a: u8 = parts[3].parse().ok()?;
+            let b: u8 = parts[2].parse().ok()?;
+            let c: u8 = parts[1].parse().ok()?;
+            let d: u8 = parts[0].parse().ok()?;
+            return Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
+        }
+    }
+
+    if let Some(stripped) = name.strip_suffix(".ip6.arpa") {
+        let nibbles: Vec<&str> = stripped.split('.').collect();
+        if nibbles.len() == 32 {
+            let mut octets = [0u8; 16];
+            for i in 0..16 {
+                let hi = u8::from_str_radix(nibbles[31 - i * 2], 16).ok()?;
+                let lo = u8::from_str_radix(nibbles[31 - i * 2 - 1], 16).ok()?;
+                octets[i] = (hi << 4) | lo;
+            }
+            return Some(IpAddr::V6(Ipv6Addr::from(octets)));
+        }
+    }
+
+    None
 }
 
 pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option<HostnameEntry> {
@@ -119,6 +352,28 @@ pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Op
     None
 }
 
+fn pi_soa<'a>() -> SOA<'a> {
+    SOA {
+        mname: Name::new_unchecked("ns.pi"),
+        rname: Name::new_unchecked("admin.pi"),
+        serial: 1,
+        refresh: 3600,
+        retry: 600,
+        expire: 86400,
+        minimum: 60,
+    }
+}
+
+fn finalize_response(response: &mut Packet, query: &Packet) {
+    if query.opt().is_some() {
+        *response.opt_mut() = Some(OPT {
+            opt_codes: vec![],
+            udp_packet_size: 1232,
+            version: 0,
+        });
+    }
+}
+
 fn make_a_response(query: &Packet, qname: &Name, ip: Ipv4Addr) -> Vec<u8> {
     let mut response = Packet::new_reply(query.id());
     response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
@@ -131,6 +386,7 @@ fn make_a_response(query: &Packet, qname: &Name, ip: Ipv4Addr) -> Vec<u8> {
             address: u32::from(ip),
         }),
     ));
+    finalize_response(&mut response, query);
     response.build_bytes_vec().unwrap_or_default()
 }
 
@@ -146,6 +402,35 @@ fn make_aaaa_response(query: &Packet, qname: &Name, ip: Ipv6Addr) -> Vec<u8> {
             address: u128::from(ip),
         }),
     ));
+    finalize_response(&mut response, query);
+    response.build_bytes_vec().unwrap_or_default()
+}
+
+fn make_ptr_response(query: &Packet, qname: &Name, hostname: &str) -> Vec<u8> {
+    let mut response = Packet::new_reply(query.id());
+    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
+    response.questions = query.questions.clone();
+    response.answers.push(ResourceRecord::new(
+        qname.clone(),
+        CLASS::IN,
+        60,
+        RData::PTR(simple_dns::rdata::PTR(Name::new_unchecked(hostname))),
+    ));
+    finalize_response(&mut response, query);
+    response.build_bytes_vec().unwrap_or_default()
+}
+
+fn make_soa_response(query: &Packet, qname: &Name) -> Vec<u8> {
+    let mut response = Packet::new_reply(query.id());
+    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
+    response.questions = query.questions.clone();
+    response.answers.push(ResourceRecord::new(
+        qname.clone(),
+        CLASS::IN,
+        60,
+        RData::SOA(pi_soa()),
+    ));
+    finalize_response(&mut response, query);
     response.build_bytes_vec().unwrap_or_default()
 }
 
@@ -154,6 +439,27 @@ fn make_nxdomain(query: &Packet) -> Vec<u8> {
     response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
     response.questions = query.questions.clone();
     *response.rcode_mut() = RCODE::NameError;
+    response.name_servers.push(ResourceRecord::new(
+        Name::new_unchecked(DNS_DOMAIN),
+        CLASS::IN,
+        60,
+        RData::SOA(pi_soa()),
+    ));
+    finalize_response(&mut response, query);
+    response.build_bytes_vec().unwrap_or_default()
+}
+
+fn make_nodata(query: &Packet) -> Vec<u8> {
+    let mut response = Packet::new_reply(query.id());
+    response.set_flags(PacketFlag::RESPONSE | PacketFlag::AUTHORITATIVE_ANSWER);
+    response.questions = query.questions.clone();
+    response.name_servers.push(ResourceRecord::new(
+        Name::new_unchecked(DNS_DOMAIN),
+        CLASS::IN,
+        60,
+        RData::SOA(pi_soa()),
+    ));
+    finalize_response(&mut response, query);
     response.build_bytes_vec().unwrap_or_default()
 }
 
@@ -162,6 +468,7 @@ fn make_refused(query: &Packet) -> Vec<u8> {
     response.set_flags(PacketFlag::RESPONSE);
     response.questions = query.questions.clone();
     *response.rcode_mut() = RCODE::Refused;
+    finalize_response(&mut response, query);
     response.build_bytes_vec().unwrap_or_default()
 }
 
@@ -213,5 +520,63 @@ mod tests {
         let table = new_hostname_table();
         let result = resolve_name("nobody.pi", SUFFIX, &table).await;
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_ptr_ipv4() {
+        let ip = parse_ptr_name("5.10.64.100.in-addr.arpa");
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(100, 64, 10, 5))));
+    }
+
+    #[test]
+    fn test_parse_ptr_ipv6() {
+        // 0200::1 in nibble format
+        let name = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.ip6.arpa";
+        let ip = parse_ptr_name(name);
+        assert_eq!(
+            ip,
+            Some(IpAddr::V6(Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn test_parse_ptr_invalid() {
+        assert_eq!(parse_ptr_name("example.com"), None);
+        assert_eq!(parse_ptr_name("1.2.3.in-addr.arpa"), None);
+    }
+
+    #[tokio::test]
+    async fn test_update_and_reverse_lookup() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v4 = Ipv4Addr::new(100, 64, 10, 5);
+        let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
+
+        update_hostname(&table, &reverse, "gaming", "alice", v4, v6).await;
+
+        // Forward lookup works
+        let result = resolve_name("alice.gaming.pi", SUFFIX, &table).await;
+        assert_eq!(result, Some((v4, v6)));
+
+        // Reverse lookup works
+        let rev4 = reverse.get(&IpAddr::V4(v4)).map(|e| e.value().clone());
+        assert_eq!(rev4, Some(("alice".to_string(), "gaming".to_string())));
+        let rev6 = reverse.get(&IpAddr::V6(v6)).map(|e| e.value().clone());
+        assert_eq!(rev6, Some(("alice".to_string(), "gaming".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_remove_hostname() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v4 = Ipv4Addr::new(100, 64, 10, 5);
+        let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
+
+        update_hostname(&table, &reverse, "gaming", "alice", v4, v6).await;
+        remove_hostname(&table, &reverse, "gaming", "alice").await;
+
+        assert_eq!(resolve_name("alice.gaming.pi", SUFFIX, &table).await, None);
+        assert!(reverse.get(&IpAddr::V4(v4)).is_none());
+        assert!(reverse.get(&IpAddr::V6(v6)).is_none());
     }
 }

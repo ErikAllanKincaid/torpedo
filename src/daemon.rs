@@ -58,6 +58,7 @@ struct CoordinatorAcceptState {
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
     hostname_table: dns::HostnameTable,
+    reverse_table: dns::ReverseLookupTable,
 }
 
 impl CoordinatorAcceptState {
@@ -97,6 +98,7 @@ impl CoordinatorAcceptState {
             let firewall = self.firewall.clone();
             let state = self.state.clone();
             let hostname_table = self.hostname_table.clone();
+            let reverse_table = self.reverse_table.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members).await;
                 spawn_coordinator_hello_reader(
@@ -106,6 +108,7 @@ impl CoordinatorAcceptState {
                     &network,
                     state,
                     hostname_table,
+                    reverse_table,
                 )
                 .await;
                 forward::spawn_peer_reader(
@@ -187,6 +190,7 @@ impl CoordinatorAcceptState {
             let firewall = self.firewall.clone();
             let state = self.state.clone();
             let hostname_table = self.hostname_table.clone();
+            let reverse_table = self.reverse_table.clone();
             let dht_notify = self.dht_notify.clone();
             let blob_store = self.blob_store.clone();
             tokio::spawn(async move {
@@ -197,6 +201,7 @@ impl CoordinatorAcceptState {
                     &network,
                     state.clone(),
                     hostname_table,
+                    reverse_table,
                 )
                 .await;
                 update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
@@ -346,6 +351,7 @@ impl CoordinatorAcceptState {
         let firewall = self.firewall.clone();
         let state = self.state.clone();
         let hostname_table = self.hostname_table.clone();
+        let reverse_table = self.reverse_table.clone();
         let dht_notify = self.dht_notify.clone();
         let blob_store = self.blob_store.clone();
         tokio::spawn(async move {
@@ -356,6 +362,7 @@ impl CoordinatorAcceptState {
                 &network,
                 state.clone(),
                 hostname_table,
+                reverse_table,
             )
             .await;
             update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
@@ -390,6 +397,7 @@ struct MemberAcceptState {
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
     hostname_table: dns::HostnameTable,
+    reverse_table: dns::ReverseLookupTable,
 }
 
 impl MemberAcceptState {
@@ -432,9 +440,8 @@ impl MemberAcceptState {
                 };
                 // Update DNS table
                 if let Some(ref h) = final_hostname {
-                    let mut table = self.hostname_table.write().await;
-                    let network_hosts = table.entry(self.network_name.clone()).or_default();
-                    network_hosts.insert(h.clone(), (ip, derive_ipv6(&peer_identity)));
+                    let ipv6 = derive_ipv6(&peer_identity);
+                    dns::update_hostname(&self.hostname_table, &self.reverse_table, &self.network_name, h, ip, ipv6).await;
                 }
                 if is_approved {
                     let snap_bytes = {
@@ -776,6 +783,7 @@ pub struct DaemonState {
     firewall: SharedFirewall,
     protocol_router: Arc<ProtocolRouter>,
     hostname_table: dns::HostnameTable,
+    reverse_table: dns::ReverseLookupTable,
     mdns_enabled: bool,
     tun_name: String,
 }
@@ -930,14 +938,7 @@ impl DaemonState {
             .expect("self-add cannot collide");
 
         // Register in DNS hostname table
-        {
-            let mut table = self.hostname_table.write().await;
-            let network_hosts = table.entry(name.clone()).or_default();
-            network_hosts.insert(
-                my_hostname.clone(),
-                (my_ip, derive_ipv6(&self.identity.local_identity())),
-            );
-        }
+        dns::update_hostname(&self.hostname_table, &self.reverse_table, &name, &my_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
 
         let mut net_state = NetworkState {
             members: member_list,
@@ -1077,6 +1078,7 @@ impl DaemonState {
                 shared_acl: self.shared_acl.clone(),
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
+                reverse_table: self.reverse_table.clone(),
             })),
         );
 
@@ -1288,6 +1290,7 @@ impl DaemonState {
                 shared_acl: self.shared_acl.clone(),
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
+                reverse_table: self.reverse_table.clone(),
             })),
         );
 
@@ -1349,18 +1352,10 @@ impl DaemonState {
         self.refresh_alpns();
 
         // Register hostnames in DNS table
-        {
-            let mut table = self.hostname_table.write().await;
-            let network_hosts = table.entry(display_name.to_string()).or_default();
-            network_hosts.insert(
-                my_hostname.clone(),
-                (my_ip, derive_ipv6(&self.identity.local_identity())),
-            );
-            // Add any members with known hostnames
-            for member in &data.members {
-                if let Some(ref h) = member.hostname {
-                    network_hosts.insert(h.clone(), (member.ip, derive_ipv6(&member.identity)));
-                }
+        dns::update_hostname(&self.hostname_table, &self.reverse_table, display_name, &my_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
+        for member in &data.members {
+            if let Some(ref h) = member.hostname {
+                dns::update_hostname(&self.hostname_table, &self.reverse_table, display_name, h, member.ip, derive_ipv6(&member.identity)).await;
             }
         }
 
@@ -1760,6 +1755,7 @@ impl DaemonState {
                 shared_acl: self.shared_acl.clone(),
                 firewall: self.firewall.clone(),
                 hostname_table: self.hostname_table.clone(),
+                reverse_table: self.reverse_table.clone(),
             })),
         );
 
@@ -1777,10 +1773,8 @@ impl DaemonState {
                     })
                     .collect()
             };
-            let mut table = self.hostname_table.write().await;
-            let network_hosts = table.entry(name.to_string()).or_default();
             for (hostname, ip, ipv6) in members_snapshot {
-                network_hosts.insert(hostname, (ip, ipv6));
+                dns::update_hostname(&self.hostname_table, &self.reverse_table, name, &hostname, ip, ipv6).await;
             }
         }
 
@@ -1880,6 +1874,7 @@ impl DaemonState {
 
             self.peers.remove_by_network(name);
             self.shared_acl.remove(name);
+            dns::remove_network(&self.hostname_table, &self.reverse_table, name).await;
             self.protocol_router
                 .unregister(&transport::network_alpn(&handle.network_key));
             self.refresh_alpns();
@@ -2036,14 +2031,8 @@ impl DaemonState {
         }
 
         // Update DNS table: remove old entry for our IP, insert new one
-        if let Ok(mut table) = self.hostname_table.try_write() {
-            let hosts = table.entry(network.to_string()).or_default();
-            hosts.retain(|_, addr| addr.0 != my_ip);
-            hosts.insert(
-                new_hostname.clone(),
-                (my_ip, derive_ipv6(&self.identity.local_identity())),
-            );
-        }
+        dns::remove_hostname_by_ip(&self.hostname_table, &self.reverse_table, network, my_ip).await;
+        dns::update_hostname(&self.hostname_table, &self.reverse_table, network, &new_hostname, my_ip, derive_ipv6(&self.identity.local_identity())).await;
 
         // Persist to config
         if let Ok(mut app_config) = config::load() {
@@ -2810,12 +2799,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     ));
 
     let hostname_table = dns::new_hostname_table();
+    let reverse_table = dns::new_reverse_table();
 
     // Start DNS resolver on 127.0.0.1:53
     let dns_table = hostname_table.clone();
+    let dns_reverse = reverse_table.clone();
     let dns_token = token.clone();
     tokio::spawn(async move {
-        if let Err(e) = dns::spawn_dns_server(dns_table, dns_token).await {
+        if let Err(e) = dns::spawn_dns_server(dns_table, dns_reverse, dns_token).await {
             tracing::warn!(error = %e, "DNS server failed to start (Magic DNS disabled)");
         }
     });
@@ -2897,6 +2888,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         firewall: shared_firewall,
         protocol_router: protocol_router.clone(),
         hostname_table,
+        reverse_table,
         mdns_enabled,
         tun_name: tun_name.clone(),
     });
@@ -3261,6 +3253,7 @@ async fn spawn_coordinator_hello_reader(
     network_name: &str,
     state: Arc<std::sync::RwLock<NetworkState>>,
     hostname_table: dns::HostnameTable,
+    reverse_table: dns::ReverseLookupTable,
 ) {
     let result: Result<()> = async {
         let (_send, mut recv) = tokio::time::timeout(
@@ -3286,11 +3279,8 @@ async fn spawn_coordinator_hello_reader(
                     m.hostname = Some(final_hostname.clone());
                 }
             }
-            {
-                let mut table = hostname_table.write().await;
-                let network_hosts = table.entry(network_name.to_string()).or_default();
-                network_hosts.insert(final_hostname, (peer_ip, derive_ipv6(&remote_id)));
-            }
+            let ipv6 = derive_ipv6(&remote_id);
+            dns::update_hostname(&hostname_table, &reverse_table, network_name, &final_hostname, peer_ip, ipv6).await;
         }
         Ok(())
     }.await;

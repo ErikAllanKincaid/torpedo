@@ -1432,22 +1432,22 @@ Names resolve under the `.pi` TLD:
 App DNS query (e.g., "alice.gaming.pi")
     |
     v
-System resolver (macOS /etc/resolver/pi, Linux systemd-resolved, etc.)
+System resolver (macOS SCDynamicStore, Linux systemd-resolved D-Bus, etc.)
     |  routes only .pi queries to pitopi
     v
-pitopi DNS server (UDP, 127.0.0.1:53)
-    |  looks up HostnameTable (network → hostname → HostnameEntry)
+pitopi DNS server (UDP+TCP, 127.0.0.1:53)
+    |  looks up HostnameTable + ReverseLookupTable
     v
-A record (100.64.x.x) and/or AAAA record (200::x)
+A record (100.64.x.x) / AAAA record (200::x) / PTR record (hostname.network.pi)
 ```
 
-The daemon runs a minimal UDP DNS responder bound to `127.0.0.1:53`. It handles both A (IPv4) and AAAA (IPv6) queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected. A queries return the peer's IPv4 address; AAAA queries return their IPv6 address.
+The daemon runs a UDP+TCP DNS responder bound to `127.0.0.1:53`. It handles A (IPv4), AAAA (IPv6), PTR (reverse DNS), and SOA queries for `.pi` names. EDNS/OPT is supported (advertises 1232-byte UDP payload size). Unsupported query types on `.pi` names return NODATA (NOERROR with empty answer); queries for non-`.pi` domains return REFUSED. Queries are handled concurrently via `tokio::spawn`. A reverse lookup table (`DashMap<IpAddr, (hostname, network)>`) enables PTR resolution — `dig -x 100.64.x.x` returns `hostname.network.pi`.
 
 ### Hostname assignment
 
 Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs) and via MeshHello messages when peers connect. This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
 
-The `HostnameTable` stores a `HostnameEntry` tuple `(Ipv4Addr, Ipv6Addr)` per hostname, keyed as `network -> hostname -> (v4, v6)`. When a peer is registered, both addresses are stored so that A and AAAA queries can be answered from the same table.
+The `HostnameTable` stores a `HostnameEntry` tuple `(Ipv4Addr, Ipv6Addr)` per hostname, keyed as `network -> hostname -> (v4, v6)`. A companion `ReverseLookupTable` (`DashMap<IpAddr, (hostname, network)>`) is maintained in parallel for PTR queries. Both tables are updated atomically via `dns::update_hostname()`.
 
 Hostnames are persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
 
@@ -1465,14 +1465,16 @@ Pitopi configures the OS to split-route `.pi` queries to its local resolver. The
 
 | Platform | Method | How |
 |----------|--------|-----|
-| macOS | Scoped resolver | Writes `/etc/resolver/pi` pointing to `127.0.0.1` — macOS natively routes queries for that TLD |
-| Linux | systemd-resolved | `resolvectl dns <tun> 127.0.0.1` + `resolvectl domain <tun> ~pi` |
-| Linux | resolvconf | Pipes config to `resolvconf -a tun-pitopi.inet` |
-| Linux | Direct | Prepends `nameserver 127.0.0.1` to `/etc/resolv.conf` (fallback) |
+| macOS | SCDynamicStore | Writes `State:/Network/Service/pitopi/DNS` via SystemConfiguration framework with `SupplementalMatchDomains` and `SearchDomains` — session keys auto-clean on process exit |
+| Linux | systemd-resolved (D-Bus) | `SetLinkDNS` + `SetLinkDomains` via `org.freedesktop.resolve1` (zbus, pure Rust) |
+| Linux | NetworkManager (D-Bus) | Detects NM DNS mode, configures when NM manages DNS directly (dnsmasq/default mode) |
+| Linux | systemd-resolved (CLI) | `resolvectl dns/domain` — fallback when D-Bus is unavailable |
+| Linux | resolvconf | Pipes config to `resolvconf -a` — detects openresolv vs Debian variant via `resolvconf --version` |
+| Linux | Direct | Prepends `nameserver 127.0.0.1` to `/etc/resolv.conf` (last resort) |
 
 ### Backup and crash recovery
 
-Before modifying any DNS configuration file, pitopi saves a backup at `<path>.before-pitopi`. On daemon shutdown (clean or SIGTERM), the backup is restored. If the daemon crashes, the next startup detects stale `.before-pitopi` files and restores them before proceeding.
+On macOS, SCDynamicStore session keys are automatically removed when the process exits (clean or crash) — no backup files needed. On Linux, before modifying any DNS configuration file, pitopi saves a backup at `<path>.before-pitopi`. On daemon shutdown (clean or SIGTERM), the backup is restored. If the daemon crashes, the next startup detects stale `.before-pitopi` files and restores them before proceeding.
 
 ### Status display
 

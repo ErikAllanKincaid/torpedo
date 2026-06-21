@@ -35,7 +35,7 @@ use crate::network_name;
 use crate::peers::PeerTable;
 use crate::stats::ForwardMetrics;
 use crate::transport;
-use crate::tun;
+use crate::tun::{self, check_cgnat_conflict};
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -1839,6 +1839,9 @@ impl DaemonState {
 }
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
+    // Check for CGNAT conflicts (e.g. Tailscale) before any setup
+    check_cgnat_conflict()?;
+
     let key = identity::load_or_create()?;
     let public_key = key.public();
     let identity = IrohIdentityProvider::new(public_key);
@@ -1864,9 +1867,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     let blob_store = FsStore::load(&blobs_dir).await
         .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
-
-    // Check for CGNAT conflicts (e.g. Tailscale) before creating our TUN
-    tun::check_cgnat_conflict()?;
 
     // Single TUN for all networks
     let my_ipv6 = derive_ipv6(&identity.local_identity());

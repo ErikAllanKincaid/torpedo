@@ -5,12 +5,12 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
+use dashmap::DashMap;
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use tokio::sync::mpsc;
@@ -21,36 +21,30 @@ use crate::peers::PeerTable;
 use crate::stats::Stats;
 use crate::tun::{TunReader, TunWriter};
 
-/// Per-network ACL state shared across all forwarding tasks.
-///
-/// Uses `std::sync::RwLock` (not tokio) because reads happen on every packet
-/// and writes are rare. The inner map is keyed by network name.
 #[derive(Clone)]
 pub struct SharedAcl {
-    inner: Arc<std::sync::RwLock<HashMap<String, AclData>>>,
+    inner: Arc<DashMap<String, AclData>>,
 }
 
 impl SharedAcl {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            inner: Arc::new(DashMap::new()),
         }
     }
 
     pub fn set(&self, network: &str, acl: AclData) {
-        self.inner.write().unwrap().insert(network.to_string(), acl);
+        self.inner.insert(network.to_string(), acl);
     }
 
     pub fn remove(&self, network: &str) {
-        self.inner.write().unwrap().remove(network);
+        self.inner.remove(network);
     }
 
     pub fn get(&self, network: &str) -> AclData {
         self.inner
-            .read()
-            .unwrap()
             .get(network)
-            .cloned()
+            .map(|e| e.value().clone())
             .unwrap_or_else(AclData::empty)
     }
 }

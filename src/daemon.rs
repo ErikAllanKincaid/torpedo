@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,7 +154,7 @@ impl NetworkState {
 #[allow(dead_code)]
 pub struct NetworkHandle {
     name: String,
-    network_key: String,
+    network_key: EndpointId,
     role: NetworkRole,
     my_ip: Ipv4Addr,
     state: Arc<std::sync::RwLock<NetworkState>>,
@@ -169,7 +168,7 @@ pub struct DaemonState {
     peers: PeerTable,
     stats: Arc<Stats>,
     tun_tx: mpsc::Sender<Vec<u8>>,
-    networks: Arc<std::sync::RwLock<HashMap<String, NetworkHandle>>>,
+    networks: Arc<DashMap<String, NetworkHandle>>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
@@ -218,13 +217,10 @@ impl DaemonState {
         let net_secret_key = SecretKey::generate();
         let net_public_key = net_secret_key.public();
 
-        {
-            let networks = self.networks.read().unwrap();
-            if networks.contains_key(&name) {
-                return Ok(IpcResponse::Error {
-                    message: format!("network '{name}' already active"),
-                });
-            }
+        if self.networks.contains_key(&name) {
+            return Ok(IpcResponse::Error {
+                message: format!("network '{name}' already active"),
+            });
         }
 
         let my_ip = self.identity.local_ip();
@@ -328,8 +324,7 @@ impl DaemonState {
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
 
         // Accept loop for this network
-        let network_key = net_public_key.to_string();
-        let conn_rx = self.protocol_router.register(transport::network_alpn(&network_key));
+        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.clone(),
@@ -351,14 +346,14 @@ impl DaemonState {
         // Update ALPNs
         let handle = NetworkHandle {
             name: name.clone(),
-            network_key: network_key.clone(),
+            network_key: net_public_key,
             role: NetworkRole::Coordinator,
             my_ip,
             state,
             cancel,
             tasks,
         };
-        self.networks.write().unwrap().insert(name.clone(), handle);
+        self.networks.insert(name.clone(), handle);
         self.refresh_alpns();
 
         let network_key = net_public_key.to_string();
@@ -382,13 +377,12 @@ impl DaemonState {
         let net_pubkey: EndpointId = network_key.parse()
             .context("invalid network key")?;
 
-        if let Some(a) = alias {
-            let networks = self.networks.read().unwrap();
-            if networks.contains_key(a) {
-                return Ok(IpcResponse::Error {
-                    message: format!("already in network '{a}'"),
-                });
-            }
+        if let Some(a) = alias
+            && self.networks.contains_key(a)
+        {
+            return Ok(IpcResponse::Error {
+                message: format!("already in network '{a}'"),
+            });
         }
 
         // Resolve single pkarr record → (blob_hash, seed_peers)
@@ -425,20 +419,16 @@ impl DaemonState {
 
         let data = group_blob.context("could not fetch group blob from any peer")?;
 
-        let alpn = transport::network_alpn(network_key);
+        let alpn = transport::network_alpn(&net_pubkey);
         let my_ip = self.identity.local_ip();
         // Local alias for display/config (defaults to truncated key)
         let default_name = &network_key[..network_key.len().min(8)];
         let display_name = alias.unwrap_or(default_name);
 
-        // Check for duplicate after resolving the display name
-        {
-            let networks = self.networks.read().unwrap();
-            if networks.contains_key(display_name) {
-                return Ok(IpcResponse::Error {
-                    message: format!("already in network '{display_name}'"),
-                });
-            }
+        if self.networks.contains_key(display_name) {
+            return Ok(IpcResponse::Error {
+                message: format!("already in network '{display_name}'"),
+            });
         }
 
         // Connect to the first reachable peer
@@ -553,14 +543,14 @@ impl DaemonState {
 
         let handle = NetworkHandle {
             name: display_name.to_string(),
-            network_key: network_key.to_string(),
+            network_key: net_pubkey,
             role: NetworkRole::Member,
             my_ip,
             state,
             cancel,
             tasks,
         };
-        self.networks.write().unwrap().insert(display_name.to_string(), handle);
+        self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns();
 
         tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
@@ -674,14 +664,14 @@ impl DaemonState {
 
             let handle = NetworkHandle {
                 name: network_name.to_string(),
-                network_key: net_pubkey.to_string(),
+                network_key: net_pubkey,
                 role: NetworkRole::Member,
                 my_ip,
                 state: live_state,
                 cancel,
                 tasks,
             };
-            self.networks.write().unwrap().insert(network_name.to_string(), handle);
+            self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns();
 
             return Ok(IpcResponse::Joined {
@@ -696,8 +686,8 @@ impl DaemonState {
     /// Restores a coordinator network from saved config (uses the existing name).
     async fn restore_coordinator_network(&self, name: &str, mode: GroupMode) -> Result<IpcResponse> {
         {
-            let networks = self.networks.read().unwrap();
-            if networks.contains_key(name) {
+            
+            if self.networks.contains_key(name) {
                 return Ok(IpcResponse::Error {
                     message: format!("network '{name}' already active"),
                 });
@@ -843,7 +833,7 @@ impl DaemonState {
             self.shared_acl.set(name, s.acl.clone());
         }
 
-        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key.to_string()));
+        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.to_string(),
@@ -864,14 +854,14 @@ impl DaemonState {
 
         let handle = NetworkHandle {
             name: name.to_string(),
-            network_key: net_public_key.to_string(),
+            network_key: net_public_key,
             role: NetworkRole::Coordinator,
             my_ip,
             state,
             cancel,
             tasks,
         };
-        self.networks.write().unwrap().insert(name.to_string(), handle);
+        self.networks.insert(name.to_string(), handle);
         self.refresh_alpns();
 
         let network_key = net_public_key.to_string();
@@ -887,8 +877,8 @@ impl DaemonState {
     async fn nuke_network(&self, name: &str, force: bool) -> IpcResponse {
         // Check we're the coordinator and whether other members exist
         let (is_coordinator, has_other_members) = {
-            let networks = self.networks.read().unwrap();
-            let handle = match networks.get(name) {
+            
+            let handle = match self.networks.get(name) {
                 Some(h) => h,
                 None => return IpcResponse::Error {
                     message: format!("not in network '{name}'"),
@@ -917,8 +907,8 @@ impl DaemonState {
 
         // Publish empty pkarr record
         let net_secret_key = {
-            let networks = self.networks.read().unwrap();
-            let handle = networks.get(name).unwrap();
+            
+            let handle = self.networks.get(name).unwrap();
             let state = handle.state.read().unwrap();
             state.network_secret_key.clone()
         };
@@ -940,9 +930,7 @@ impl DaemonState {
     }
 
     async fn leave_network(&self, name: &str) -> IpcResponse {
-        let handle = {
-            self.networks.write().unwrap().remove(name)
-        };
+        let handle = self.networks.remove(name).map(|(_, v)| v);
         let Some(handle) = handle else {
             return IpcResponse::Error {
                 message: format!("network '{}' not active", name),
@@ -971,8 +959,7 @@ impl DaemonState {
     }
 
     fn status(&self) -> IpcResponse {
-        let networks = self.networks.read().unwrap();
-        let statuses: Vec<NetworkStatus> = networks.values().map(|h| {
+        let statuses: Vec<NetworkStatus> = self.networks.iter().map(|h| {
             let peer_entries = self.peers.peers_for_network(&h.name);
             let peers = peer_entries.into_iter().map(|(eid, ip)| PeerStatus {
                 endpoint_id: eid.to_string(),
@@ -997,8 +984,7 @@ impl DaemonState {
     // -----------------------------------------------------------------------
 
     fn resolve_short_id(&self, network: &str, short: &str) -> Option<EndpointId> {
-        let networks = self.networks.read().unwrap();
-        let handle = networks.get(network)?;
+        let handle = self.networks.get(network)?;
         let state = handle.state.read().unwrap();
         state.members.all().iter()
             .find(|m| m.identity.to_string().starts_with(short))
@@ -1030,8 +1016,8 @@ impl DaemonState {
 
         // Refresh the group blob snapshot and publish to DHT
         let (hash, net_key) = {
-            let networks = self.networks.read().unwrap();
-            if let Some(handle) = networks.get(network) {
+            
+            if let Some(handle) = self.networks.get(network) {
                 let mut state = handle.state.write().unwrap();
                 state.acl = data.clone();
                 state.refresh_snapshot();
@@ -1044,8 +1030,8 @@ impl DaemonState {
 
         // Store updated blob
         let snap_bytes = {
-            let networks = self.networks.read().unwrap();
-            networks.get(network).and_then(|h| {
+            
+            self.networks.get(network).and_then(|h| {
                 h.state.read().unwrap().snapshot.as_ref().map(|s| s.msgpack_bytes.clone())
             })
         };
@@ -1086,8 +1072,8 @@ impl DaemonState {
         }
 
         {
-            let networks = self.networks.read().unwrap();
-            let Some(handle) = networks.get(network) else {
+            
+            let Some(handle) = self.networks.get(network) else {
                 return IpcResponse::Error { message: format!("network '{network}' not active") };
             };
             let mut state = handle.state.write().unwrap();
@@ -1105,7 +1091,7 @@ impl DaemonState {
             }
         }
 
-        let acl = self.networks.read().unwrap().get(network).unwrap()
+        let acl = self.networks.get(network).unwrap()
             .state.read().unwrap().acl.clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
@@ -1118,8 +1104,8 @@ impl DaemonState {
         };
 
         {
-            let networks = self.networks.read().unwrap();
-            let Some(handle) = networks.get(network) else {
+            
+            let Some(handle) = self.networks.get(network) else {
                 return IpcResponse::Error { message: format!("network '{network}' not active") };
             };
             let mut state = handle.state.write().unwrap();
@@ -1129,7 +1115,7 @@ impl DaemonState {
             state.acl.tags.retain(|a| !a.members.is_empty());
         }
 
-        let acl = self.networks.read().unwrap().get(network).unwrap()
+        let acl = self.networks.get(network).unwrap()
             .state.read().unwrap().acl.clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
@@ -1153,15 +1139,15 @@ impl DaemonState {
         };
 
         {
-            let networks = self.networks.read().unwrap();
-            let Some(handle) = networks.get(network) else {
+            
+            let Some(handle) = self.networks.get(network) else {
                 return IpcResponse::Error { message: format!("network '{network}' not active") };
             };
             let mut state = handle.state.write().unwrap();
             state.acl.rules.push(acl::AclRule { src: src_target, dst: dst_target });
         }
 
-        let acl = self.networks.read().unwrap().get(network).unwrap()
+        let acl = self.networks.get(network).unwrap()
             .state.read().unwrap().acl.clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
@@ -1170,8 +1156,8 @@ impl DaemonState {
 
     async fn acl_remove(&self, network: &str, index: usize) -> IpcResponse {
         {
-            let networks = self.networks.read().unwrap();
-            let Some(handle) = networks.get(network) else {
+            
+            let Some(handle) = self.networks.get(network) else {
                 return IpcResponse::Error { message: format!("network '{network}' not active") };
             };
             let mut state = handle.state.write().unwrap();
@@ -1181,7 +1167,7 @@ impl DaemonState {
             state.acl.rules.remove(index);
         }
 
-        let acl = self.networks.read().unwrap().get(network).unwrap()
+        let acl = self.networks.get(network).unwrap()
             .state.read().unwrap().acl.clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
@@ -1189,8 +1175,7 @@ impl DaemonState {
     }
 
     fn acl_show(&self, network: &str) -> IpcResponse {
-        let networks = self.networks.read().unwrap();
-        let Some(handle) = networks.get(network) else {
+        let Some(handle) = self.networks.get(network) else {
             return IpcResponse::Error { message: format!("network '{network}' not active") };
         };
         let state = handle.state.read().unwrap();
@@ -1217,8 +1202,8 @@ impl DaemonState {
         };
 
         {
-            let networks = self.networks.read().unwrap();
-            let Some(handle) = networks.get(network) else {
+            
+            let Some(handle) = self.networks.get(network) else {
                 return IpcResponse::Error { message: format!("network '{network}' not active") };
             };
             let mut state = handle.state.write().unwrap();
@@ -1241,7 +1226,9 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     let mut alpns: Vec<Vec<u8>> = app_config
         .networks
         .iter()
-        .filter_map(|net| net.network_public_key.as_ref().map(|k| transport::network_alpn(k)))
+        .filter_map(|net| net.network_public_key.as_ref()
+            .and_then(|k| k.parse::<EndpointId>().ok())
+            .map(|id| transport::network_alpn(&id)))
         .collect();
 
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
@@ -1281,7 +1268,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         peers,
         stats: stats.clone(),
         tun_tx,
-        networks: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        networks: Arc::new(DashMap::new()),
         shutdown_token: token.clone(),
         blob_store,
         shared_acl,

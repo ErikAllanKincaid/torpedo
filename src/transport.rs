@@ -8,10 +8,9 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection, endpoint::presets,
 };
 
-/// Returns the ALPN protocol identifier for a network: `pitopi/net/<pubkey-prefix>`.
-/// Uses the first 16 hex chars of the network public key.
-pub fn network_alpn(network_pubkey: &str) -> Vec<u8> {
-    let prefix = &network_pubkey[..network_pubkey.len().min(16)];
+pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
+    let full = network_pubkey.to_string();
+    let prefix = &full[..full.len().min(16)];
     format!("pitopi/net/{prefix}").into_bytes()
 }
 
@@ -71,13 +70,14 @@ pub async fn connect_to_peer_with_alpn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
 
     #[test]
     fn test_network_alpn() {
-        assert_eq!(network_alpn("aa8bc368fec8c227"), b"pitopi/net/aa8bc368fec8c227");
-        assert_eq!(
-            network_alpn("aa8bc368fec8c2272cbcd07688d3442bac20bc7f60e19a09604a4f9447af5b1d"),
-            b"pitopi/net/aa8bc368fec8c227"
-        );
+        let key = SecretKey::generate().public();
+        let alpn = network_alpn(&key);
+        let key_str = key.to_string();
+        let expected = format!("pitopi/net/{}", &key_str[..16]);
+        assert_eq!(alpn, expected.as_bytes());
     }
 }

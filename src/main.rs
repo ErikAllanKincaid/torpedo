@@ -105,8 +105,6 @@ enum Command {
         #[arg(long)]
         tor: bool,
     },
-    /// List networks (queries daemon if running, falls back to saved config)
-    List,
     /// Leave a network (remove from saved config)
     Leave {
         /// Three-word network name
@@ -120,7 +118,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Show status of active networks
+    /// Show status of all networks (active + saved)
     Status,
     /// Start the daemon (manages all networks, listens for IPC commands)
     Daemon,
@@ -271,7 +269,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
         Command::Create {
             mode,
@@ -330,69 +327,6 @@ fn cmd_mdns(state: &str) -> Result<()> {
         "mDNS discovery {}. Restart the daemon for changes to take effect.",
         if enabled { "enabled" } else { "disabled" }
     );
-    Ok(())
-}
-
-async fn cmd_list() -> Result<()> {
-    if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
-        let resp = ipc::recv(&mut stream).await?;
-        match resp {
-            ipc::IpcMessage::StatusResponse { networks, .. } => {
-                if networks.is_empty() {
-                    println!("No active networks.");
-                } else {
-                    for net in &networks {
-                        let role = match &net.role {
-                            ipc::NetworkRole::Coordinator => "coordinator",
-                            ipc::NetworkRole::Member => "member",
-                        };
-                        if let Some(ref h) = net.my_hostname {
-                            println!(
-                                "{} (role: {}, dns: {}.{}.{}, peers: {})",
-                                net.name,
-                                role,
-                                h,
-                                net.name,
-                                DNS_DOMAIN,
-                                net.peers.len(),
-                            );
-                        } else {
-                            println!(
-                                "{} (role: {}, ip: {}, peers: {})",
-                                net.name,
-                                role,
-                                net.my_ip,
-                                net.peers.len(),
-                            );
-                        }
-                    }
-                }
-            }
-            ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
-            other => eprintln!("Unexpected response: {:?}", other),
-        }
-        return Ok(());
-    }
-
-    let app_config = config::load()?;
-    if app_config.networks.is_empty() {
-        println!("No saved networks.");
-        return Ok(());
-    }
-    for net in &app_config.networks {
-        let ip_str = net
-            .my_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "{} (ip: {}, members: {}, mode: {:?})",
-            net.name,
-            ip_str,
-            net.members.len(),
-            net.group_mode,
-        );
-    }
     Ok(())
 }
 
@@ -527,8 +461,25 @@ async fn ipc_leave(name: &str) -> Result<()> {
 }
 
 async fn ipc_status() -> Result<()> {
-    let mut stream = ipc::connect().await?;
-    ipc::send(&mut stream,ipc::IpcMessage::Status).await?;
+    let Ok(mut stream) = ipc::connect().await else {
+        // Daemon not running — show saved config
+        let app_config = config::load()?;
+        if app_config.networks.is_empty() {
+            println!("Daemon not running. No saved networks.");
+            return Ok(());
+        }
+        println!("Daemon not running. Saved networks:");
+        for net in &app_config.networks {
+            let ip_str = net
+                .my_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!("  {} (ip: {}, members: {})", net.name, ip_str, net.members.len());
+        }
+        return Ok(());
+    };
+
+    ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
     let resp = ipc::recv(&mut stream).await?;
     match resp {
         ipc::IpcMessage::StatusResponse {
@@ -602,6 +553,21 @@ async fn ipc_status() -> Result<()> {
                     }
                 }
             }
+
+            // Show inactive networks from config that the daemon didn't restore
+            let active_names: std::collections::HashSet<&str> =
+                networks.iter().map(|n| n.name.as_str()).collect();
+            if let Ok(app_config) = config::load() {
+                let inactive: Vec<_> = app_config
+                    .networks
+                    .iter()
+                    .filter(|n| !active_names.contains(n.name.as_str()))
+                    .collect();
+                for net in &inactive {
+                    println!("  {} [inactive]", net.name);
+                }
+            }
+
             fn format_bytes(b: u64) -> String {
                 if b >= 1_073_741_824 {
                     format!("{:.1} GB", b as f64 / 1_073_741_824.0)

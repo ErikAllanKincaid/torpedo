@@ -30,7 +30,7 @@ cargo -q run -- join <public-key> --tor     # join with Tor transport
 cargo -q run -- leave my-net
 cargo -q run -- nuke my-net                 # publish empty record + leave
 cargo -q run -- hostname my-net alice        # change hostname on existing network
-cargo -q run -- status              # live peer info from daemon (shows hostnames)
+cargo -q run -- status              # all networks: active + inactive from config (works without daemon too)
 cargo -q run -- down                # shut down the daemon
 
 # ACL management (coordinator only, requires daemon running)
@@ -48,9 +48,6 @@ cargo -q run -- firewall add in allow --proto tcp --port 443  # allow inbound HT
 cargo -q run -- firewall add in allow --peer ab3f          # allow all from peer ab3f
 cargo -q run -- firewall add out deny --peer e71a          # block outbound to peer
 cargo -q run -- firewall remove 0                          # remove rule by index
-
-# Standalone (no daemon needed)
-cargo -q run -- list                # show saved networks from config
 
 # System service
 sudo cargo -q run -- install-service

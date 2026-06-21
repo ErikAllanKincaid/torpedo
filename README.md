@@ -215,9 +215,8 @@ pitopi mdns on      # re-enable (restart daemon for changes to take effect)
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi hostname NET NAME` | Change your hostname on a network | Yes |
-| `pitopi status` | Show active networks, peers (DNS names when available) | Yes |
+| `pitopi status` | Show all networks (active + inactive), peers, traffic | No* |
 | `pitopi down` | Shut down the daemon | Yes |
-| `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
 | `pitopi acl NAME allow SRC DST` | Add an allow rule (coordinator) | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |

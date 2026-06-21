@@ -330,9 +330,8 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi join KEY [--name ALIAS]` | Join a network by public key | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty record to DHT then leave | Yes |
-| `pitopi status` | Show active networks, peers (DNS names when available) | Yes |
+| `pitopi status` | Show all networks (active + inactive), peers, traffic | No* |
 | `pitopi down` | Shut down the daemon | Yes |
-| `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
 | `pitopi acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
 | `pitopi acl NAME allow SRC DST` | Add an allow rule | Yes |

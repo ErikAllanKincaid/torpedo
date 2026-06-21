@@ -17,6 +17,8 @@ pub struct Member {
     pub identity: EndpointId,
     pub ip: Ipv4Addr,
     pub is_coordinator: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Controls who can approve new members joining the network.
@@ -134,6 +136,8 @@ impl MemberList {
 pub struct ApprovedEntry {
     pub identity: EndpointId,
     pub ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Pre-approved peers that the coordinator has broadcast but that haven't
@@ -413,6 +417,7 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         };
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
@@ -431,6 +436,7 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         };
         list.add(member).unwrap();
         let found = list.get_by_ip(Ipv4Addr::new(100, 64, 10, 5)).unwrap();
@@ -445,12 +451,14 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         })
         .unwrap();
         let result = list.add(Member {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         });
         assert!(result.is_err());
     }
@@ -463,12 +471,14 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         })
         .unwrap();
         list.add(Member {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: true,
+            hostname: None,
         })
         .unwrap();
         assert!(list.get(&id).unwrap().is_coordinator);
@@ -482,6 +492,7 @@ mod tests {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 10, 5),
             is_coordinator: false,
+            hostname: None,
         })
         .unwrap();
         let removed = list.remove(&id);
@@ -497,12 +508,14 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator: true,
+            hostname: None,
         })
         .unwrap();
         list.add(Member {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 0, 3),
             is_coordinator: false,
+            hostname: None,
         })
         .unwrap();
         assert_eq!(list.all().len(), 2);
@@ -515,6 +528,7 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 5),
             is_coordinator: false,
+            hostname: None,
         };
         assert!(policy.can_authorize(&member));
     }
@@ -526,11 +540,13 @@ mod tests {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 2),
             is_coordinator: true,
+            hostname: None,
         };
         let regular = Member {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 0, 3),
             is_coordinator: false,
+            hostname: None,
         };
         assert!(policy.can_authorize(&coordinator));
         assert!(!policy.can_authorize(&regular));
@@ -543,6 +559,7 @@ mod tests {
         let entry = ApprovedEntry {
             identity: id,
             ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
         };
         let members = MemberList::new();
         list.approve(entry, &members).unwrap();
@@ -559,11 +576,13 @@ mod tests {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 5, 10),
                 is_coordinator: false,
+            hostname: None,
             })
             .unwrap();
         let entry = ApprovedEntry {
             identity: test_id(2),
             ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
         };
         assert!(approved.approve(entry, &members).is_err());
     }
@@ -577,6 +596,7 @@ mod tests {
                 ApprovedEntry {
                     identity: test_id(1),
                     ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
                 },
                 &members,
             )
@@ -585,6 +605,7 @@ mod tests {
             ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
             },
             &members,
         );
@@ -601,6 +622,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
                 },
                 &members,
             )
@@ -610,6 +632,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
                 },
                 &members,
             )
@@ -627,6 +650,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
+            hostname: None,
                 },
                 &members,
             )
@@ -642,10 +666,12 @@ mod tests {
             ApprovedEntry {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
+            hostname: None,
             },
             ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 3),
+            hostname: None,
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -664,6 +690,7 @@ mod tests {
                 identity: id,
                 ip: derive_ip(&id),
                 is_coordinator: false,
+            hostname: None,
             });
         }
         list
@@ -707,7 +734,7 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let mut approved = ApprovedList::new();
         let id3 = test_id(3);
-        approved.approve(ApprovedEntry { identity: id3, ip: derive_ip(&id3) }, &members).unwrap();
+        approved.approve(ApprovedEntry { identity: id3, ip: derive_ip(&id3), hostname: None }, &members).unwrap();
         let acl = crate::acl::AclData::empty();
 
         let bytes = canonical_group_bytes(&members, &approved, &acl);

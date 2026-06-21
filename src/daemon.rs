@@ -20,6 +20,8 @@ use crate::acl;
 use crate::config;
 use crate::control::{self, ControlMsg};
 use crate::dht;
+use crate::dns;
+use crate::dns_config;
 use crate::forward;
 use crate::identity;
 use crate::ipc::{self, IpcRequest, IpcResponse, NetworkRole, NetworkStatus, PeerStatus};
@@ -173,6 +175,7 @@ pub struct DaemonState {
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
     protocol_router: Arc<ProtocolRouter>,
+    hostname_table: dns::HostnameTable,
 }
 
 impl DaemonState {
@@ -185,8 +188,8 @@ impl DaemonState {
 
     async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
         match req {
-            IpcRequest::Create { mode } => self.create_network(mode).await,
-            IpcRequest::Join { network_key, name } => self.join_network(&network_key, name.as_deref()).await,
+            IpcRequest::Create { mode, hostname } => self.create_network(mode, hostname).await,
+            IpcRequest::Join { network_key, name, hostname } => self.join_network(&network_key, name.as_deref(), hostname).await,
             IpcRequest::Leave { name } => self.leave_network(&name).await,
             IpcRequest::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcRequest::Status => self.status(),
@@ -203,14 +206,14 @@ impl DaemonState {
         }
     }
 
-    async fn create_network(&self, mode: GroupMode) -> IpcResponse {
-        match self.create_network_inner(mode).await {
+    async fn create_network(&self, mode: GroupMode, hostname: Option<String>) -> IpcResponse {
+        match self.create_network_inner(mode, hostname).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn create_network_inner(&self, mode: GroupMode) -> Result<IpcResponse> {
+    async fn create_network_inner(&self, mode: GroupMode, hostname: Option<String>) -> Result<IpcResponse> {
         let name = network_name::generate_name();
 
         // Generate per-network keypair
@@ -226,14 +229,24 @@ impl DaemonState {
         let my_ip = self.identity.local_ip();
         let policy = policy_for_mode(mode);
 
+        let my_hostname = hostname.unwrap_or_else(crate::hostname::generate_hostname);
+
         let mut member_list = MemberList::new();
         member_list
             .add(Member {
                 identity: self.identity.local_identity(),
                 ip: my_ip,
                 is_coordinator: true,
+                hostname: Some(my_hostname.clone()),
             })
             .expect("self-add cannot collide");
+
+        // Register in DNS hostname table
+        {
+            let mut table = self.hostname_table.write().await;
+            let network_hosts = table.entry(name.clone()).or_default();
+            network_hosts.insert(my_hostname.clone(), my_ip);
+        }
 
         let mut net_state = NetworkState {
             members: member_list,
@@ -283,10 +296,12 @@ impl DaemonState {
             identity: m.identity,
             ip: m.ip,
             is_coordinator: m.is_coordinator,
+            hostname: m.hostname.clone(),
         }).collect();
         let approved_entries = net_state.approved.all().into_iter().map(|a| config::ApprovedConfigEntry {
             identity: a.identity,
             ip: a.ip,
+            hostname: a.hostname.clone(),
         }).collect();
         let mut app_config = config::load()?;
         config::upsert_network(&mut app_config, config::NetworkConfig {
@@ -365,14 +380,14 @@ impl DaemonState {
         })
     }
 
-    async fn join_network(&self, network_key: &str, name: Option<&str>) -> IpcResponse {
-        match self.join_network_inner(network_key, name).await {
+    async fn join_network(&self, network_key: &str, name: Option<&str>, hostname: Option<String>) -> IpcResponse {
+        match self.join_network_inner(network_key, name, hostname).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn join_network_inner(&self, network_key: &str, alias: Option<&str>) -> Result<IpcResponse> {
+    async fn join_network_inner(&self, network_key: &str, alias: Option<&str>, hostname: Option<String>) -> Result<IpcResponse> {
         let net_pubkey: EndpointId = network_key.parse()
             .context("invalid network key")?;
 
@@ -547,6 +562,20 @@ impl DaemonState {
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns();
 
+        // Register hostnames in DNS table
+        let my_hostname = hostname.unwrap_or_else(crate::hostname::generate_hostname);
+        {
+            let mut table = self.hostname_table.write().await;
+            let network_hosts = table.entry(display_name.to_string()).or_default();
+            network_hosts.insert(my_hostname, my_ip);
+            // Add any members with known hostnames
+            for member in &data.members {
+                if let Some(ref h) = member.hostname {
+                    network_hosts.insert(h.clone(), member.ip);
+                }
+            }
+        }
+
         tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
 
         Ok(IpcResponse::Joined {
@@ -633,7 +662,7 @@ impl DaemonState {
                 if m.identity == my_identity { continue; }
                 if let Ok(peer_conn) = transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
                     if let Ok((mut s, _)) = peer_conn.open_bi().await {
-                        let _ = control::send_msg(&mut s, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip }).await;
+                        let _ = control::send_msg(&mut s, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await;
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                     self.peers.add(m.ip, peer_conn.clone(), m.identity, network_name);
@@ -703,6 +732,7 @@ impl DaemonState {
                     identity: entry.identity,
                     ip: entry.ip,
                     is_coordinator: entry.is_coordinator,
+                    hostname: entry.hostname.clone(),
                 });
             }
         }
@@ -712,6 +742,7 @@ impl DaemonState {
                     identity: self.identity.local_identity(),
                     ip: my_ip,
                     is_coordinator: true,
+                    hostname: None,
                 })
                 .expect("self-add cannot collide");
         }
@@ -719,7 +750,7 @@ impl DaemonState {
         let mut approved_list = ApprovedList::new();
         if let Some(nc) = net_config {
             for entry in &nc.approved {
-                let ae = ApprovedEntry { identity: entry.identity, ip: entry.ip };
+                let ae = ApprovedEntry { identity: entry.identity, ip: entry.ip, hostname: entry.hostname.clone() };
                 let _ = approved_list.approve(ae, &member_list);
             }
         }
@@ -775,10 +806,12 @@ impl DaemonState {
             identity: m.identity,
             ip: m.ip,
             is_coordinator: m.is_coordinator,
+            hostname: m.hostname.clone(),
         }).collect();
         let approved_entries = net_state.approved.all().into_iter().map(|a| config::ApprovedConfigEntry {
             identity: a.identity,
             ip: a.ip,
+            hostname: a.hostname.clone(),
         }).collect();
         let mut app_config = config::load()?;
         config::upsert_network(&mut app_config, config::NetworkConfig {
@@ -944,16 +977,27 @@ impl DaemonState {
     }
 
     fn status(&self) -> IpcResponse {
+        let hostname_snapshot = self.hostname_table.try_read().ok();
         let statuses: Vec<NetworkStatus> = self.networks.iter().map(|h| {
             let peer_entries = self.peers.peers_for_network(&h.name);
-            let peers = peer_entries.into_iter().map(|(eid, ip)| PeerStatus {
-                endpoint_id: eid,
-                ip,
+            let peers = peer_entries.into_iter().map(|(eid, ip)| {
+                let hostname = hostname_snapshot.as_ref().and_then(|table| {
+                    table.get(&h.name).and_then(|hosts| {
+                        hosts.iter().find(|(_, v)| **v == ip).map(|(k, _)| k.clone())
+                    })
+                });
+                PeerStatus { endpoint_id: eid, ip, hostname }
             }).collect();
+            let my_hostname = hostname_snapshot.as_ref().and_then(|table| {
+                table.get(&h.name).and_then(|hosts| {
+                    hosts.iter().find(|(_, v)| **v == h.my_ip).map(|(k, _)| k.clone())
+                })
+            });
             NetworkStatus {
                 name: h.name.clone(),
                 role: h.role.clone(),
                 my_ip: h.my_ip,
+                my_hostname,
                 peers,
             }
         }).collect();
@@ -1245,6 +1289,30 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         stats.clone(),
     ));
 
+    let hostname_table = dns::new_hostname_table();
+
+    // Start DNS resolver
+    let dns_table = hostname_table.clone();
+    let dns_token = token.clone();
+    tokio::spawn(async move {
+        if let Err(e) = dns::spawn_dns_server(dns_table, dns_token).await {
+            tracing::warn!(error = %e, "DNS server failed to start (Magic DNS disabled)");
+        }
+    });
+
+    // Configure system DNS to route .pitopi queries to us
+    dns_config::restore_stale_backups();
+    let dns_configurator = match dns_config::detect_and_configure() {
+        Ok(c) => {
+            tracing::info!(backend = c.name(), "system DNS configured for .pitopi");
+            Some(c)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to configure system DNS (Magic DNS requires manual setup)");
+            None
+        }
+    };
+
     let protocol_router = Arc::new(ProtocolRouter::new(blobs_proto));
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
@@ -1257,6 +1325,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         blob_store,
         shared_acl,
         protocol_router: protocol_router.clone(),
+        hostname_table,
     });
 
     // Accept loop — dispatches connections via ProtocolHandler by ALPN
@@ -1297,7 +1366,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
             };
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
-                match daemon_c.join_network_inner(&net_pubkey, Some(&name)).await {
+                match daemon_c.join_network_inner(&net_pubkey, Some(&name), None).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
@@ -1330,6 +1399,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("daemon shutting down");
+                if let Some(ref configurator) = dns_configurator {
+                    if let Err(e) = configurator.revert() {
+                        tracing::warn!(error = %e, "failed to revert DNS configuration");
+                    }
+                }
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }
@@ -1672,7 +1746,7 @@ async fn run_accept_loop(
             let snap_bytes = {
                 let mut s = state.write().unwrap();
                 s.approved.remove(&remote_id);
-                let new_member = Member { identity: remote_id, ip: peer_ip, is_coordinator: false };
+                let new_member = Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None };
                 s.members.add(new_member).expect("was approved, no collision");
                 s.refresh_snapshot();
                 s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -1740,12 +1814,12 @@ async fn run_accept_loop(
         }
 
         // Broadcast MemberApproved
-        broadcast_control_msg(&peers, &ControlMsg::MemberApproved { identity: remote_id, ip: peer_ip }).await;
+        broadcast_control_msg(&peers, &ControlMsg::MemberApproved { identity: remote_id, ip: peer_ip, hostname: None }).await;
 
         // Promote to member
         let (add_collision, snap_bytes): (Option<String>, Option<Vec<u8>>) = {
             let mut s = state.write().unwrap();
-            let result = s.members.add(Member { identity: remote_id, ip: peer_ip, is_coordinator: false })
+            let result = s.members.add(Member { identity: remote_id, ip: peer_ip, is_coordinator: false, hostname: None })
                 .err().map(|e| format!("IP collision: {e}"));
             if result.is_none() {
                 s.refresh_snapshot();
@@ -1842,10 +1916,10 @@ async fn join_mesh_shared(
 
     // Save membership to config
     let member_entries: Vec<config::MemberEntry> = members.iter().map(|m| config::MemberEntry {
-        identity: m.identity, ip: m.ip, is_coordinator: m.is_coordinator,
+        identity: m.identity, ip: m.ip, is_coordinator: m.is_coordinator, hostname: m.hostname.clone(),
     }).collect();
     let approved_config: Vec<config::ApprovedConfigEntry> = approved.iter().map(|a| config::ApprovedConfigEntry {
-        identity: a.identity, ip: a.ip,
+        identity: a.identity, ip: a.ip, hostname: a.hostname.clone(),
     }).collect();
     let mut app_config = config::load()?;
     config::upsert_network(&mut app_config, config::NetworkConfig {
@@ -1878,7 +1952,7 @@ async fn join_mesh_shared(
         match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
             Ok(conn) => {
                 let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip }).await?;
+                control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await?;
                 peers.add(member.ip, conn.clone(), member.identity, network_name);
                 forward::spawn_peer_reader(conn, member.identity, member.ip, ep.id(), network_name.to_string(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
@@ -1923,8 +1997,8 @@ async fn join_mesh_shared(
                         match result {
                             Ok((_send, mut recv)) => {
                                 match control::recv_msg(&mut recv).await {
-                                    Ok(ControlMsg::MemberApproved { identity, ip }) => {
-                                        let entry = ApprovedEntry { identity, ip };
+                                    Ok(ControlMsg::MemberApproved { identity, ip, hostname }) => {
+                                        let entry = ApprovedEntry { identity, ip, hostname };
                                         let mut s = live_state.write().unwrap();
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
@@ -2015,7 +2089,7 @@ async fn join_mesh_shared(
                 if let Ok((_send, mut recv)) = conn.accept_bi().await {
                     let transport_id = conn.remote_id();
                     match control::recv_msg(&mut recv).await {
-                        Ok(ControlMsg::MeshHello { identity: peer_identity, ip }) => {
+                        Ok(ControlMsg::MeshHello { identity: peer_identity, ip, hostname }) => {
                             if peer_identity != transport_id { continue; }
                             let (is_member, is_approved) = {
                                 let s = live_state.read().unwrap();
@@ -2025,7 +2099,7 @@ async fn join_mesh_shared(
                                 let snap_bytes = {
                                     let mut s = live_state.write().unwrap();
                                     s.approved.remove(&peer_identity);
-                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false });
+                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false, hostname: hostname.clone() });
                                     s.refresh_snapshot();
                                     s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
                                 };
@@ -2128,7 +2202,7 @@ fn spawn_reconnect_loop(
                                 Ok(bi) => bi,
                                 Err(e) => { tracing::warn!(error = %e, "reconnect handshake failed"); continue; }
                             };
-                            if let Err(e) = control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip }).await {
+                            if let Err(e) = control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await {
                                 tracing::warn!(error = %e, "reconnect MeshHello failed");
                                 continue;
                             }

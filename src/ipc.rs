@@ -13,10 +13,14 @@ use crate::membership::GroupMode;
 pub enum IpcRequest {
     Create {
         mode: GroupMode,
+        #[serde(default)]
+        hostname: Option<String>,
     },
     Join {
         network_key: String,
         name: Option<String>,
+        #[serde(default)]
+        hostname: Option<String>,
     },
     Leave {
         name: String,
@@ -85,6 +89,8 @@ pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
     pub my_ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_hostname: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -98,6 +104,8 @@ pub enum NetworkRole {
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 pub fn socket_path() -> PathBuf {
@@ -148,11 +156,12 @@ mod tests {
     fn test_request_roundtrip() {
         let req = IpcRequest::Create {
             mode: GroupMode::Open,
+            hostname: None,
         };
         let json = serde_json::to_vec(&req).unwrap();
         let decoded: IpcRequest = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcRequest::Create { mode } => {
+            IpcRequest::Create { mode, .. } => {
                 assert_eq!(mode, GroupMode::Open);
             }
             _ => panic!("wrong variant"),
@@ -223,9 +232,11 @@ mod tests {
                 name: "gaming".to_string(),
                 role: NetworkRole::Coordinator,
                 my_ip: Ipv4Addr::new(100, 64, 10, 5),
+                my_hostname: Some("alice".to_string()),
                 peers: vec![PeerStatus {
                     endpoint_id: peer_id,
                     ip: Ipv4Addr::new(100, 64, 10, 6),
+                    hostname: None,
                 }],
             }],
         };

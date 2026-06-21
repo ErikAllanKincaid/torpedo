@@ -1,9 +1,12 @@
 mod acl;
 mod daemon;
 mod dht;
+mod dns;
+mod dns_config;
 mod config;
 mod control;
 mod forward;
+mod hostname;
 mod identity;
 mod ipc;
 mod membership;
@@ -14,6 +17,9 @@ mod shutdown;
 mod stats;
 mod transport;
 mod tun;
+
+pub const APP_NAME: &str = "pitopi";
+pub const DNS_DOMAIN: &str = "pi";
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -72,6 +78,9 @@ enum Command {
         /// Membership mode: open or restricted
         #[arg(long, default_value = "restricted")]
         mode: GroupMode,
+        /// Hostname for this peer (random if not specified)
+        #[arg(long)]
+        hostname: Option<String>,
     },
     /// Join an existing network using its public key
     Join {
@@ -80,6 +89,9 @@ enum Command {
         /// Optional local alias for the network
         #[arg(long)]
         name: Option<String>,
+        /// Hostname for this peer (random if not specified)
+        #[arg(long)]
+        hostname: Option<String>,
     },
     /// List networks (queries daemon if running, falls back to saved config)
     List,
@@ -176,8 +188,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
-        Command::Create { mode } => ipc_create(mode).await,
-        Command::Join { network_key, name } => ipc_join(&network_key, name.as_deref()).await,
+        Command::Create { mode, hostname } => ipc_create(mode, hostname).await,
+        Command::Join { network_key, name, hostname } => ipc_join(&network_key, name.as_deref(), hostname).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Daemon | Command::Up => {
@@ -251,9 +263,9 @@ async fn cmd_list() -> Result<()> {
 // IPC client commands (require daemon running)
 // ---------------------------------------------------------------------------
 
-async fn ipc_create(mode: GroupMode) -> Result<()> {
+async fn ipc_create(mode: GroupMode, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode }).await?;
+    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode, hostname }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Created { name, network_key, my_ip } => {
@@ -270,11 +282,12 @@ async fn ipc_create(mode: GroupMode) -> Result<()> {
     Ok(())
 }
 
-async fn ipc_join(network_key: &str, name: Option<&str>) -> Result<()> {
+async fn ipc_join(network_key: &str, name: Option<&str>, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Join {
         network_key: network_key.to_string(),
         name: name.map(|s| s.to_string()),
+        hostname,
     }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
@@ -335,11 +348,18 @@ async fn ipc_status() -> Result<()> {
                         ipc::NetworkRole::Member => "member",
                     };
                     println!("  {} [{}]", net.name, role);
+                    if let Some(ref h) = net.my_hostname {
+                        println!("    Hostname: {}.{}.{}", h, net.name, DNS_DOMAIN);
+                    }
                     println!("    IP: {}", net.my_ip);
                     if !net.peers.is_empty() {
                         println!("    Peers:");
                         for peer in &net.peers {
-                            println!("      {} ({})", peer.ip, peer.endpoint_id);
+                            if let Some(ref h) = peer.hostname {
+                                println!("      {} ({}) [{}]", peer.ip, peer.endpoint_id, h);
+                            } else {
+                                println!("      {} ({})", peer.ip, peer.endpoint_id);
+                            }
                         }
                     }
                 }

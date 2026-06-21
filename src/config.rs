@@ -71,6 +71,8 @@ pub struct MemberEntry {
     pub ip: Ipv4Addr,
     #[serde(default)]
     pub is_coordinator: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// A pre-approved peer that hasn't connected yet.
@@ -78,6 +80,8 @@ pub struct MemberEntry {
 pub struct ApprovedConfigEntry {
     pub identity: EndpointId,
     pub ip: Ipv4Addr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// A single saved network membership.
@@ -176,11 +180,13 @@ mod tests {
                             identity: test_id(2),
                             ip: Ipv4Addr::new(100, 64, 5, 3),
                             is_coordinator: true,
+                            hostname: None,
                         },
                         MemberEntry {
                             identity: test_id(3),
                             ip: Ipv4Addr::new(100, 64, 10, 5),
                             is_coordinator: false,
+                            hostname: None,
                         },
                     ],
                     approved: vec![],
@@ -307,10 +313,12 @@ mod tests {
                     identity: id1,
                     ip: Ipv4Addr::new(100, 64, 5, 3),
                     is_coordinator: true,
+                            hostname: None,
                 }],
                 approved: vec![ApprovedConfigEntry {
                     identity: id2,
                     ip: Ipv4Addr::new(100, 64, 12, 34),
+                    hostname: None,
                 }],
                 network_secret_key: None,
                 network_public_key: None,

@@ -19,11 +19,13 @@ sudo cargo -q run -- daemon
 
 # In another terminal: create/join/manage networks (talks to daemon via IPC)
 cargo -q run -- create                      # generates network + prints join code (public key)
+cargo -q run -- create --hostname alice     # create with a chosen DNS hostname
 cargo -q run -- join <public-key>           # join by public key (the join code)
 cargo -q run -- join <public-key> --name my-net  # join with a local alias
+cargo -q run -- join <public-key> --hostname bob # join with a chosen DNS hostname
 cargo -q run -- leave my-net
 cargo -q run -- nuke my-net                 # publish empty record + leave
-cargo -q run -- status              # live peer info from daemon
+cargo -q run -- status              # live peer info from daemon (shows hostnames)
 cargo -q run -- down                # shut down the daemon
 
 # ACL management (coordinator only, requires daemon running)
@@ -77,6 +79,9 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - `src/peers.rs` — PeerTable (routing by dest IP), PeerEntry with Connection + endpoint_id + network name, remove_by_network for teardown; `SharedAcl` type, `PeerTable::lookup_full()` for ACL-aware routing
 - `src/config.rs` — persistent network config at `~/.config/pitopi/networks.toml` (members + approved list); `NetworkConfig` has `network_secret_key: Option<SecretKey>` (hex-serialized via custom serde adapter, coordinators only) and `network_public_key: Option<EndpointId>` (the join code)
 - `src/acl.rs` — identity/tag-based ACL policy engine: AclData (tags + allow-only rules), rule evaluation by EndpointId with tag support, `.acl` file parser/formatter; distributed as part of GroupBlob via iroh blobs; no rules = allow-all, any rules = deny-all except explicit allows
+- `src/dns.rs` — Magic DNS resolver: UDP DNS server on 100.64.0.1:53, answers A queries for `*.pi` names from in-memory HostnameTable (network → hostname → IP), returns REFUSED for non-.pi queries; `spawn_dns_server()`, `HostnameTable` type, `new_hostname_table()`
+- `src/dns_config.rs` — OS-level DNS configuration: `DnsConfigurator` trait with `apply()`/`revert()`, platform detection chain (macOS scoped resolver `/etc/resolver/pi`, Linux systemd-resolved/resolvconf/direct), backup/restore of modified files (`.before-pitopi` suffix), crash recovery on daemon start
+- `src/hostname.rs` — hostname generation (`generate_hostname()` from NOUNS_B word list), validation (`is_valid_hostname()`), collision resolution (`resolve_collision()`)
 - `src/audit.rs` — append-only audit log at `~/.config/pitopi/audit.log` (not yet wired in)
 - `src/stats.rs` — packet/byte counters with periodic logging
 - `src/shutdown.rs` — SIGINT/SIGTERM handling via CancellationToken
@@ -105,6 +110,8 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 
 **Daemon/IPC:** `pitopi daemon` starts a long-lived root process that owns the iroh Endpoint, TUN device, PeerTable, and ProtocolRouter. CLI commands (`create`, `join`, `leave`, `nuke`, `status`, `down`) connect via Unix socket IPC (`/var/run/pitopi/pitopi.sock`) using the same length-prefixed JSON wire format as `control.rs`. The daemon uses `Endpoint::set_alpns()` to dynamically add/remove network ALPNs at runtime. Each active network registers a `MeshProtocol` handler with the ProtocolRouter and gets a `NetworkHandle` with a child `CancellationToken` for clean teardown on leave. `create` generates a per-network keypair and local alias; `join` accepts a public key string and resolves it via pkarr; `nuke` publishes empty record before leaving.
 
+**Magic DNS:** The daemon runs a UDP DNS responder on 100.64.0.1:53 that answers A queries for `*.pi` names. Resolution scheme: `<hostname>.<network>.pi` for fully-qualified lookups, `<hostname>.pi` for flat single-network lookups. Each peer gets a hostname (random noun from word list, or user-chosen via `--hostname`). Hostnames are stored in the `Member` struct and propagated via GroupBlob. The daemon maintains an in-memory `HostnameTable` (network → hostname → IP). System DNS is configured on daemon start via platform detection: macOS uses `/etc/resolver/pi` (scoped resolver), Linux tries systemd-resolved (`resolvectl domain ~pi`), resolvconf, or direct `/etc/resolv.conf` modification. All file modifications are backed up to `<path>.before-pitopi` and restored on daemon shutdown or crash recovery.
+
 ## Key Dependencies
 
 - `iroh` — P2P QUIC transport with NAT traversal and relay fallback
@@ -118,6 +125,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `clap` + `clap_complete` — CLI parsing and shell completions
 - `rmp-serde` — msgpack serialization for canonical membership and ACL data (compact, deterministic)
 - `serde` + `serde_json` + `toml` — serialization for control messages and config
+- `simple-dns` — DNS packet parsing/building for Magic DNS resolver (A queries and responses)
 - `dashmap` — lock-free concurrent hash map for ProtocolRouter handler dispatch
 - `dirs` — platform config directory resolution
 

@@ -32,10 +32,14 @@ pub enum ControlMsg {
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     MeshWelcome {
         identity: EndpointId,
         ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     AdvertiseServices {
         ip: Ipv4Addr,
@@ -44,6 +48,8 @@ pub enum ControlMsg {
     MemberApproved {
         identity: EndpointId,
         ip: Ipv4Addr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     Welcome {
         members: Vec<Member>,
@@ -117,6 +123,7 @@ mod tests {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
+                hostname: None,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -129,6 +136,7 @@ mod tests {
         let msg = ControlMsg::MeshHello {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 4),
+            hostname: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -153,11 +161,13 @@ mod tests {
                     identity: test_id(1),
                     ip: Ipv4Addr::new(100, 64, 0, 2),
                     is_coordinator: true,
+                    hostname: None,
                 },
                 Member {
                     identity: test_id(2),
                     ip: Ipv4Addr::new(100, 64, 0, 3),
                     is_coordinator: false,
+                    hostname: None,
                 },
             ],
         };
@@ -182,6 +192,7 @@ mod tests {
         let msg = ControlMsg::MemberApproved {
             identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 12, 34),
+            hostname: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -196,10 +207,12 @@ mod tests {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
+                hostname: None,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 5),
+                hostname: None,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -216,5 +229,4 @@ mod tests {
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
     }
-
 }

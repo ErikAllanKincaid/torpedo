@@ -20,10 +20,10 @@ an item serves that socket/DNS surface.
 
 ## Tier 0 — The spine (these ARE the public interface, do first)
 
-- [ ] **Refactor to iroh ProtocolHandler for ALPN dispatch**
-  - Implement `ProtocolHandler` trait for mesh protocol, register per-network with iroh's Router
-  - Replaces manual ConnRouter; iroh handles ALPN dispatch internally
-  - Cleaner integration with BlobsProtocol (already uses this pattern)
+- [x] **Refactor to iroh ProtocolHandler for ALPN dispatch**
+  - MeshProtocol implements `ProtocolHandler`, one instance per network
+  - ProtocolRouter dispatches by ALPN to MeshProtocol + BlobsProtocol handlers
+  - Dynamic registration/unregistration as networks are created/joined/left
 - [ ] **Per-network TUN devices for IP isolation**
   - Each network gets its own TUN; PeerTable and forwarding loop become per-network
   - Eliminates cross-network IP collisions; true OS-level isolation

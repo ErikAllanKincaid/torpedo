@@ -64,7 +64,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 ### Modules
 
 - `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create` (generates network, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands
-- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ConnRouter), NetworkHandle per active network, IPC server over Unix socket, single global accept dispatcher (ConnRouter routes by ALPN to per-network channels), coordinator accept loop, joiner mesh logic, reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke
+- `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ProtocolRouter), NetworkHandle per active network, IPC server over Unix socket, ProtocolRouter dispatches connections via iroh ProtocolHandler by ALPN (MeshProtocol per network + BlobsProtocol for blob transfers), coordinator accept loop, joiner mesh logic, reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke
 - `src/network_name.rs` — local alias generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
 - `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join { network_key, name: Option }`, `IpcRequest::Nuke { name, force }`, `IpcRequest::AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`; `IpcResponse::Created { name, network_key, my_ip }`, `IpcResponse::AclState`
 - `src/identity.rs` — persistent Ed25519 keypair at `~/.config/pitopi/secret_key`
@@ -101,9 +101,9 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 
 **Mesh forwarding:** TUN read loop extracts dest IP from IPv4 header bytes 16-19, looks up PeerTable, sends datagram on correct connection. Per-peer reader tasks write incoming datagrams to a shared TUN writer channel.
 
-**Network isolation:** each network gets its own ALPN (`pitopi/net/<pubkey-prefix>`, first 16 hex chars of the network public key). A single shared iroh Endpoint accepts all connections via one global dispatcher loop (ConnRouter). The dispatcher completes the TLS handshake, inspects the negotiated ALPN, and routes the connection to the correct network's channel. Blob connections (`/iroh-bytes/4`) are handled inline. Single TUN device with /10 netmask shared across networks.
+**Network isolation:** each network gets its own ALPN (`pitopi/net/<pubkey-prefix>`, first 16 hex chars of the network public key). A single shared iroh Endpoint accepts all connections via `ProtocolRouter`, which dispatches by ALPN to per-network `MeshProtocol` handlers (each implementing iroh's `ProtocolHandler` trait). BlobsProtocol handles blob transfer connections (`/iroh-bytes/4`) through the same dispatch path. Single TUN device with /10 netmask shared across networks.
 
-**Daemon/IPC:** `pitopi daemon` starts a long-lived root process that owns the iroh Endpoint, TUN device, PeerTable, and ConnRouter. CLI commands (`create`, `join`, `leave`, `nuke`, `status`, `down`) connect via Unix socket IPC (`/var/run/pitopi/pitopi.sock`) using the same length-prefixed JSON wire format as `control.rs`. The daemon uses `Endpoint::set_alpns()` to dynamically add/remove network ALPNs at runtime. Each active network registers its ALPN with the ConnRouter and gets a `NetworkHandle` with a child `CancellationToken` for clean teardown on leave. `create` generates a per-network keypair and local alias; `join` accepts a public key string and resolves it via pkarr; `nuke` publishes empty record before leaving.
+**Daemon/IPC:** `pitopi daemon` starts a long-lived root process that owns the iroh Endpoint, TUN device, PeerTable, and ProtocolRouter. CLI commands (`create`, `join`, `leave`, `nuke`, `status`, `down`) connect via Unix socket IPC (`/var/run/pitopi/pitopi.sock`) using the same length-prefixed JSON wire format as `control.rs`. The daemon uses `Endpoint::set_alpns()` to dynamically add/remove network ALPNs at runtime. Each active network registers a `MeshProtocol` handler with the ProtocolRouter and gets a `NetworkHandle` with a child `CancellationToken` for clean teardown on leave. `create` generates a per-network keypair and local alias; `join` accepts a public key string and resolves it via pkarr; `nuke` publishes empty record before leaving.
 
 ## Key Dependencies
 
@@ -118,6 +118,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `clap` + `clap_complete` — CLI parsing and shell completions
 - `rmp-serde` — msgpack serialization for canonical membership and ACL data (compact, deterministic)
 - `serde` + `serde_json` + `toml` — serialization for control messages and config
+- `dashmap` — lock-free concurrent hash map for ProtocolRouter handler dispatch
 - `dirs` — platform config directory resolution
 
 ## Conventions

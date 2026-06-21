@@ -3,9 +3,11 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
+
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, Endpoint};
-use iroh::protocol::ProtocolHandler;
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{EndpointId, SecretKey};
 use iroh::address_lookup::PkarrRelayClient;
 use iroh_blobs::store::fs::FsStore;
@@ -36,28 +38,94 @@ use crate::tun;
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-struct ConnRouter {
-    routes: std::sync::RwLock<HashMap<Vec<u8>, mpsc::Sender<Connection>>>,
+struct MeshProtocol {
+    tx: mpsc::Sender<Connection>,
 }
 
-impl ConnRouter {
-    fn new() -> Self {
-        Self { routes: std::sync::RwLock::new(HashMap::new()) }
+impl std::fmt::Debug for MeshProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshProtocol").finish()
+    }
+}
+
+impl ProtocolHandler for MeshProtocol {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.tx.send(conn).await.map_err(|_| {
+            AcceptError::from_err(std::io::Error::other("network handler closed"))
+        })
+    }
+}
+
+struct ProtocolRouter {
+    blobs: BlobsProtocol,
+    handlers: DashMap<Vec<u8>, Arc<MeshProtocol>>,
+}
+
+impl ProtocolRouter {
+    fn new(blobs: BlobsProtocol) -> Self {
+        Self {
+            blobs,
+            handlers: DashMap::new(),
+        }
     }
 
     fn register(&self, alpn: Vec<u8>) -> mpsc::Receiver<Connection> {
         let (tx, rx) = mpsc::channel(32);
-        self.routes.write().unwrap().insert(alpn, tx);
+        self.handlers.insert(alpn, Arc::new(MeshProtocol { tx }));
         rx
     }
 
-    #[allow(dead_code)]
     fn unregister(&self, alpn: &[u8]) {
-        self.routes.write().unwrap().remove(alpn);
+        self.handlers.remove(alpn);
     }
 
-    fn route(&self, alpn: &[u8]) -> Option<mpsc::Sender<Connection>> {
-        self.routes.read().unwrap().get(alpn).cloned()
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        let mut alpns: Vec<Vec<u8>> = self.handlers.iter().map(|r| r.key().clone()).collect();
+        alpns.push(iroh_blobs::protocol::ALPN.to_vec());
+        alpns
+    }
+
+    fn spawn_accept_loop(
+        self: &Arc<Self>,
+        endpoint: Endpoint,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let router = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    incoming = endpoint.accept() => {
+                        let Some(incoming) = incoming else { return };
+                        let router = router.clone();
+                        tokio::spawn(async move {
+                            let conn = match incoming.await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::debug!(error = ?e, "incoming handshake failed");
+                                    return;
+                                }
+                            };
+                            let alpn = conn.alpn().to_vec();
+                            if alpn == iroh_blobs::protocol::ALPN {
+                                let blobs = router.blobs.clone();
+                                let _ = blobs.accept(conn).await;
+                            } else {
+                                let handler = router.handlers.get(&alpn).map(|r| r.clone());
+                                if let Some(handler) = handler {
+                                    let _ = handler.accept(conn).await;
+                                } else {
+                                    tracing::warn!(
+                                        alpn = %String::from_utf8_lossy(&alpn),
+                                        "no handler for ALPN"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -104,19 +172,13 @@ pub struct DaemonState {
     networks: Arc<std::sync::RwLock<HashMap<String, NetworkHandle>>>,
     shutdown_token: CancellationToken,
     blob_store: FsStore,
-    blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
-    conn_router: Arc<ConnRouter>,
+    protocol_router: Arc<ProtocolRouter>,
 }
 
 impl DaemonState {
     fn refresh_alpns(&self) {
-        let networks = self.networks.read().unwrap();
-        let mut alpns: Vec<Vec<u8>> = networks
-            .values()
-            .map(|h| transport::network_alpn(&h.network_key))
-            .collect();
-        alpns.push(iroh_blobs::protocol::ALPN.to_vec());
+        let alpns = self.protocol_router.alpns();
         let alpn_strs: Vec<String> = alpns.iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
         tracing::info!(alpns = ?alpn_strs, "refreshing ALPNs");
         self.endpoint.set_alpns(alpns);
@@ -267,7 +329,7 @@ impl DaemonState {
 
         // Accept loop for this network
         let network_key = net_public_key.to_string();
-        let conn_rx = self.conn_router.register(transport::network_alpn(&network_key));
+        let conn_rx = self.protocol_router.register(transport::network_alpn(&network_key));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.clone(),
@@ -435,7 +497,7 @@ impl DaemonState {
         // Apply ACL from group blob
         self.shared_acl.set(display_name, data.acl.clone());
 
-        let conn_rx = self.conn_router.register(alpn.clone());
+        let conn_rx = self.protocol_router.register(alpn.clone());
         let state = join_mesh_shared(
             conn,
             &self.endpoint,
@@ -781,7 +843,7 @@ impl DaemonState {
             self.shared_acl.set(name, s.acl.clone());
         }
 
-        let conn_rx = self.conn_router.register(transport::network_alpn(&net_public_key.to_string()));
+        let conn_rx = self.protocol_router.register(transport::network_alpn(&net_public_key.to_string()));
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.to_string(),
@@ -894,6 +956,7 @@ impl DaemonState {
 
         self.peers.remove_by_network(name);
         self.shared_acl.remove(name);
+        self.protocol_router.unregister(&transport::network_alpn(&handle.network_key));
         self.refresh_alpns();
 
         // Remove from config
@@ -1211,7 +1274,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         stats.clone(),
     ));
 
-    let conn_router = Arc::new(ConnRouter::new());
+    let protocol_router = Arc::new(ProtocolRouter::new(blobs_proto));
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
         identity,
@@ -1221,52 +1284,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         networks: Arc::new(std::sync::RwLock::new(HashMap::new())),
         shutdown_token: token.clone(),
         blob_store,
-        blobs_proto,
         shared_acl,
-        conn_router: conn_router.clone(),
+        protocol_router: protocol_router.clone(),
     });
 
-    // Single global accept loop — routes connections by ALPN to per-network handlers
-    {
-        let ep = daemon.endpoint.clone();
-        let blobs_proto = daemon.blobs_proto.clone();
-        let router = conn_router.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    incoming = ep.accept() => {
-                        let Some(incoming) = incoming else { return };
-                        let router = router.clone();
-                        let blobs_proto = blobs_proto.clone();
-                        tokio::spawn(async move {
-                            let conn = match incoming.await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::debug!(error = ?e, "incoming handshake failed");
-                                    return;
-                                }
-                            };
-                            let alpn = conn.alpn().to_vec();
-                            if alpn == iroh_blobs::protocol::ALPN {
-                                let _ = blobs_proto.accept(conn).await;
-                                return;
-                            }
-                            if let Some(tx) = router.route(&alpn) {
-                                let _ = tx.send(conn).await;
-                            } else {
-                                tracing::warn!(
-                                    alpn = %String::from_utf8_lossy(&alpn),
-                                    "no handler for ALPN"
-                                );
-                            }
-                        });
-                    }
-                }
-            }
-        });
-    }
+    // Accept loop — dispatches connections via ProtocolHandler by ALPN
+    protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
 

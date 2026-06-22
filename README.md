@@ -74,9 +74,12 @@ ray down                 # standby: TUN + DNS torn down, daemon keeps running
 ray up                   # reactivate (no root needed)
 sudo ray restart         # restart the service (e.g. after upgrading the binary)
 sudo ray install         # install/refresh the service and start it
+sudo ray set-operator bob # let user 'bob' run ray without sudo
 ```
 
-> `ray restart` and `ray install` need root because they manage the system service directly. `ray install` rewrites the unit file (or launchd plist) and restarts; `ray restart` only bounces the running service via `systemctl`/`launchctl` without touching the unit.
+> `ray restart`, `ray install`, and `ray set-operator` need root because they manage the system service or grant access to it. `ray install` rewrites the unit file (or launchd plist) and restarts; `ray restart` only bounces the running service via `systemctl`/`launchctl` without touching the unit.
+>
+> **Who can run `ray`?** Like Tailscale, the daemon authorizes each command by the caller's UID, not by file permissions: `status` and other read-only commands are open to any local user, while mutating commands need root or the **operator**. The user who installs the service (`sudo ray up` / `ray install`) is granted operator access automatically, so they keep working without sudo. To authorize someone else, run `sudo ray set-operator <user>`.
 
 That's the whole loop. Run `ray --help` to discover the rest (`acl`, `firewall`, `send`, `pair`, `mdns`, …).
 

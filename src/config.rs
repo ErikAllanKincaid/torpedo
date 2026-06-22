@@ -124,6 +124,10 @@ fn default_true() -> bool {
 pub struct AppConfig {
     #[serde(default = "default_true")]
     pub mdns_enabled: bool,
+    /// Local UID authorized to control the daemon without root (Tailscale's
+    /// `--operator` model). `None` means root-only for mutating commands.
+    #[serde(default)]
+    pub operator_uid: Option<u32>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -132,6 +136,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             mdns_enabled: true,
+            operator_uid: None,
             networks: Vec::new(),
         }
     }

@@ -100,6 +100,11 @@ pub enum IpcMessage {
         endpoint_id: EndpointId,
         secret: Vec<u8>,
     },
+    /// Authorize a local user (by UID) to control the daemon without root, the
+    /// way `tailscale up --operator` does. Root-only.
+    SetOperator {
+        uid: u32,
+    },
 
     // Responses
     Ok {

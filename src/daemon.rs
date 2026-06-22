@@ -990,11 +990,85 @@ impl DaemonState {
         dns_config::update_search_domains(&network_names, &self.tun_name);
     }
 
+    /// Tailscale-style access control. Read-only queries are open to any local
+    /// user; mutating commands require the caller to be root or the configured
+    /// operator UID; setting the operator itself is root-only. Returns `None`
+    /// when the request is permitted, or `Some(error)` to short-circuit it.
+    ///
+    /// Identity is taken from the connecting socket's `SO_PEERCRED` (the kernel
+    /// vouches for it — it can't be forged by the client), so the socket file
+    /// mode only has to permit the connection, not gate authority.
+    fn check_authorized(req: &IpcMessage, peer_cred: Option<(u32, u32)>) -> Option<IpcMessage> {
+        // Reads are available to everyone.
+        if matches!(
+            req,
+            IpcMessage::Status
+                | IpcMessage::AclShow { .. }
+                | IpcMessage::FirewallShow
+                | IpcMessage::ListFiles
+        ) {
+            return None;
+        }
+
+        let uid = peer_cred.map(|(uid, _)| uid);
+
+        // Root may do anything.
+        if uid == Some(0) {
+            return None;
+        }
+
+        // Granting operator access is reserved for root.
+        if matches!(req, IpcMessage::SetOperator { .. }) {
+            return Some(IpcMessage::Error {
+                message: "permission denied: granting operator access requires root \
+                          (re-run with sudo)"
+                    .to_string(),
+            });
+        }
+
+        // Otherwise the caller must be the configured operator.
+        let operator = config::load().ok().and_then(|c| c.operator_uid);
+        if uid.is_some() && uid == operator {
+            return None;
+        }
+
+        Some(IpcMessage::Error {
+            message: "permission denied: this user is not authorized to control rayfish.\n\
+                      Grant access with: sudo ray set-operator <user>"
+                .to_string(),
+        })
+    }
+
+    /// Persist the operator UID so that user can run mutating `ray` commands
+    /// without root. Authorization (root-only) is enforced in `check_authorized`.
+    fn set_operator(&self, uid: u32) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        app_config.operator_uid = Some(uid);
+        if let Err(e) = config::save(&app_config) {
+            return IpcMessage::Error {
+                message: format!("failed to save config: {e}"),
+            };
+        }
+        IpcMessage::Ok {
+            message: format!("operator set to uid {uid}; that user can now run ray without sudo"),
+        }
+    }
+
     async fn handle_request(
         self: &Arc<Self>,
         req: IpcMessage,
         peer_cred: Option<(u32, u32)>,
     ) -> IpcMessage {
+        if let Some(denied) = Self::check_authorized(&req, peer_cred) {
+            return denied;
+        }
         match req {
             IpcMessage::Create {
                 mode,
@@ -1065,6 +1139,7 @@ impl DaemonState {
                 endpoint_id,
                 secret,
             } => self.pair_with_device(endpoint_id, secret).await,
+            IpcMessage::SetOperator { uid } => self.set_operator(uid),
             other => IpcMessage::Error {
                 message: format!("unexpected message: {:?}", other),
             },
@@ -3516,7 +3591,7 @@ async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Resul
         std::fs::remove_file(&socket_path)?;
     }
     let listener = UnixListener::bind(&socket_path).context("failed to bind IPC socket")?;
-    set_socket_group_permissions(&socket_path);
+    set_socket_permissions(&socket_path);
     tracing::info!(path = %socket_path.display(), "IPC socket listening");
 
     loop {
@@ -3542,31 +3617,18 @@ async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Resul
     }
 }
 
-fn set_socket_group_permissions(path: &std::path::Path) {
+/// Make the IPC socket connectable by any local user. Authority is not granted
+/// by reaching the socket — every mutating request is authorized per-connection
+/// in `check_authorized` via `SO_PEERCRED` (root or the configured operator
+/// UID), Tailscale's model — so the file mode only has to permit the connect().
+fn set_socket_permissions(path: &std::path::Path) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_path = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    if cfg!(target_os = "macos") {
+    if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
         unsafe { libc::chmod(c_path.as_ptr(), 0o666) };
-        tracing::info!("socket mode 0666 (macOS — any user)");
-        return;
+        tracing::info!("IPC socket mode 0666 (per-request authorization via peer creds)");
     }
-
-    let group_name = CString::new("rayfish").unwrap();
-    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
-    if grp.is_null() {
-        tracing::warn!("group 'rayfish' not found — socket only accessible by root");
-        return;
-    }
-    let gid = unsafe { (*grp).gr_gid };
-    unsafe { libc::chown(c_path.as_ptr(), 0, gid) };
-    unsafe { libc::chmod(c_path.as_ptr(), 0o660) };
-    tracing::info!("socket owned by root:rayfish (0660)");
 }
 
 async fn handle_ipc_client(stream: UnixStream, daemon: &Arc<DaemonState>) -> Result<()> {

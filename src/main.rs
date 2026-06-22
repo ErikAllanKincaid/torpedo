@@ -163,6 +163,11 @@ enum Command {
         /// "on" or "off"
         state: String,
     },
+    /// Authorize a user to run ray without sudo (requires root)
+    SetOperator {
+        /// Username or numeric UID to grant operator access
+        user: String,
+    },
     /// Send a file to a peer
     Send {
         /// File path to send
@@ -331,6 +336,7 @@ async fn main() -> Result<()> {
         Command::Firewall { action } => ipc_firewall(action).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Mdns { state } => cmd_mdns(&state),
+        Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
         Command::Pair { action, ticket } => cmd_pair(action, ticket).await,
@@ -357,6 +363,38 @@ fn cmd_mdns(state: &str) -> Result<()> {
         "mDNS discovery {}. Restart the daemon for changes to take effect.",
         if enabled { "enabled" } else { "disabled" }
     );
+    Ok(())
+}
+
+/// Resolve a username to its UID, falling back to parsing a numeric UID.
+fn uid_for_user(user: &str) -> Option<u32> {
+    use std::ffi::CString;
+    let cname = CString::new(user).ok()?;
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if !pw.is_null() {
+        return Some(unsafe { (*pw).pw_uid });
+    }
+    user.parse::<u32>().ok()
+}
+
+/// `ray set-operator <user>`: authorize a local user to run mutating ray
+/// commands without sudo (Tailscale's `--operator` model). The daemon enforces
+/// that this call itself comes from root.
+async fn cmd_set_operator(user: &str) -> Result<()> {
+    let uid = uid_for_user(user)
+        .ok_or_else(|| anyhow::anyhow!("unknown user '{user}' (pass a valid username or UID)"))?;
+    let mut stream = ipc::connect()
+        .await
+        .context("rayfish daemon is not running; start it with: sudo ray up")?;
+    ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => {
+            eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+        other => eprintln!("Unexpected response: {other:?}"),
+    }
     Ok(())
 }
 
@@ -1170,6 +1208,10 @@ async fn install_and_start_service() -> Result<()> {
                 ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
                 other => eprintln!("Unexpected response: {other:?}"),
             }
+            // We're root here (installing the service). Grant the invoking user
+            // operator access so they can run `ray` without sudo from now on,
+            // the way `tailscale up --operator=$USER` does.
+            grant_operator_to_invoking_user().await;
             Ok(())
         }
         None => {
@@ -1180,6 +1222,27 @@ async fn install_and_start_service() -> Result<()> {
             );
             print_daemon_log_tail();
             std::process::exit(1);
+        }
+    }
+}
+
+/// When the service is (re)installed under `sudo`, grant the invoking user
+/// (`$SUDO_USER`) operator access so subsequent `ray` commands work without
+/// root. Best-effort: silent if there is no `$SUDO_USER` or the daemon refuses.
+async fn grant_operator_to_invoking_user() {
+    let Ok(user) = std::env::var("SUDO_USER") else {
+        return;
+    };
+    if user == "root" {
+        return;
+    }
+    let Some(uid) = uid_for_user(&user) else {
+        return;
+    };
+    if let Ok(mut stream) = ipc::connect().await {
+        let _ = ipc::send(&mut stream, ipc::IpcMessage::SetOperator { uid }).await;
+        if let Ok(ipc::IpcMessage::Ok { .. }) = ipc::recv(&mut stream).await {
+            println!("granted operator access to '{user}' — run ray without sudo");
         }
     }
 }

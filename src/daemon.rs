@@ -2119,8 +2119,14 @@ impl DaemonState {
             };
         }
 
+        // Non-fatal problems hit while activating. The daemon stays up, but we
+        // return these to the client so `ray up` can tell the user something is
+        // wrong instead of silently reporting success on a degraded VPN.
+        let mut warnings: Vec<String> = Vec::new();
+
         if let Err(e) = tun::set_link_up(&self.tun_name) {
             tracing::warn!(error = %e, "failed to bring TUN interface up");
+            warnings.push(format!("failed to bring TUN interface up: {e}"));
         }
 
         // Configure system DNS to route .ray queries to our local resolver.
@@ -2132,6 +2138,9 @@ impl DaemonState {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to configure system DNS (Magic DNS requires manual setup)");
+                warnings.push(format!(
+                    "failed to configure system DNS, so .ray names won't resolve: {e}"
+                ));
             }
         }
 
@@ -2200,8 +2209,17 @@ impl DaemonState {
         }
 
         tracing::info!(networks = count, "VPN activated");
-        IpcMessage::Ok {
-            message: "VPN up".into(),
+        if warnings.is_empty() {
+            IpcMessage::Ok {
+                message: "VPN up".into(),
+            }
+        } else {
+            let mut message = String::from("VPN up, but some things need attention:");
+            for w in &warnings {
+                message.push_str("\n  - ");
+                message.push_str(w);
+            }
+            IpcMessage::Ok { message }
         }
     }
 

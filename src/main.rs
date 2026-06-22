@@ -1122,19 +1122,23 @@ async fn cmd_up() -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service()
+    install_and_start_service().await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
-fn install_and_start_service() -> Result<()> {
+///
+/// Starting the service is fire-and-forget at the OS level, so we then wait for
+/// the daemon to actually accept an IPC connection before declaring success. If
+/// it never comes up (e.g. it crashed on a port/route conflict with another
+/// VPN), we surface the tail of its log so the user knows what went wrong
+/// instead of seeing a cheerful "started" followed by a dead `ray status`.
+async fn install_and_start_service() -> Result<()> {
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
     {
         run_cmd("systemctl", &["enable", "rayfish"]);
         run_cmd("systemctl", &["restart", "rayfish"]);
-        println!("rayfish service started. Check `ray status`.");
-        return Ok(());
     }
 
     #[cfg(target_os = "macos")]
@@ -1144,13 +1148,75 @@ fn install_and_start_service() -> Result<()> {
         // binary path) before loading the freshly written plist.
         run_cmd_quiet("launchctl", &["unload", path]);
         run_cmd("launchctl", &["load", "-w", path]);
-        println!("rayfish service started. Check `ray status`.");
-        return Ok(());
     }
 
-    #[allow(unreachable_code)]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!("system service not supported on this platform");
+    }
+
+    // Wait for the freshly started daemon to accept IPC, then activate the VPN.
+    match wait_for_daemon(std::time::Duration::from_secs(8)).await {
+        Some(mut stream) => {
+            ipc::send(&mut stream, ipc::IpcMessage::Up).await?;
+            match ipc::recv(&mut stream).await? {
+                ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
+                ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
+                other => eprintln!("Unexpected response: {other:?}"),
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "rayfish service was started but the daemon never became reachable.\n\
+                 It likely crashed on startup — a common cause is another VPN (e.g. Tailscale)\n\
+                 already using the 100.64.0.0/10 range, DNS port 53, or a conflicting route."
+            );
+            print_daemon_log_tail();
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Poll the IPC socket until the daemon answers or the deadline passes.
+async fn wait_for_daemon(timeout: std::time::Duration) -> Option<ipc::IpcFramed> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(stream) = ipc::connect().await {
+            return Some(stream);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Print the last few lines of the daemon log so a failed startup is diagnosable.
+fn print_daemon_log_tail() {
+    #[cfg(target_os = "macos")]
+    {
+        let path = "/var/log/rayfish.log";
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let tail: Vec<&str> = contents.lines().rev().take(15).collect();
+                if tail.is_empty() {
+                    eprintln!("\n(daemon log {path} is empty)");
+                } else {
+                    eprintln!("\nLast lines of {path}:");
+                    for line in tail.into_iter().rev() {
+                        eprintln!("  {line}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("\n(could not read daemon log {path}: {e})"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("\nRecent daemon log (journalctl -u rayfish):");
+        run_cmd("journalctl", &["-u", "rayfish", "-n", "15", "--no-pager"]);
     }
 }
 

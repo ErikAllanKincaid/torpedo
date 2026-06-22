@@ -18,6 +18,31 @@ pub trait DnsConfigurator: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// Run `f` on a dedicated OS thread, off the async runtime.
+///
+/// The Linux DNS backends use `zbus::blocking`, which internally drives its own
+/// executor via `block_on`. Calling that directly from a tokio worker thread
+/// panics with "Cannot start a runtime from within a runtime". A scoped thread
+/// runs the work on a plain (non-runtime) thread while still borrowing locals.
+#[cfg(target_os = "linux")]
+fn off_runtime<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    std::thread::scope(|s| s.spawn(f).join().expect("DNS worker thread panicked"))
+}
+
+/// Revert a DNS configuration, running blocking backends off the async runtime.
+pub fn revert(configurator: &dyn DnsConfigurator) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return off_runtime(|| configurator.revert());
+    }
+    #[allow(unreachable_code)]
+    configurator.revert()
+}
+
 pub fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> {
     #[cfg(target_os = "macos")]
     {
@@ -29,25 +54,29 @@ pub fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> 
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(c) = try_systemd_resolved_dbus(tun_name) {
+        // The D-Bus backends use zbus::blocking, so run detection + apply off the
+        // async runtime to avoid the nested-runtime panic.
+        return off_runtime(|| {
+            if let Some(c) = try_systemd_resolved_dbus(tun_name) {
+                c.apply()?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
+            if let Some(c) = try_networkmanager_dbus(tun_name) {
+                c.apply()?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
+            if let Some(c) = try_systemd_resolved_cli(tun_name) {
+                c.apply()?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
+            if let Some(c) = try_resolvconf() {
+                c.apply()?;
+                return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
+            }
+            let c = DirectResolvConf;
             c.apply()?;
-            return Ok(Box::new(c));
-        }
-        if let Some(c) = try_networkmanager_dbus(tun_name) {
-            c.apply()?;
-            return Ok(Box::new(c));
-        }
-        if let Some(c) = try_systemd_resolved_cli(tun_name) {
-            c.apply()?;
-            return Ok(Box::new(c));
-        }
-        if let Some(c) = try_resolvconf() {
-            c.apply()?;
-            return Ok(Box::new(c));
-        }
-        let c = DirectResolvConf;
-        c.apply()?;
-        return Ok(Box::new(c));
+            Ok(Box::new(c) as Box<dyn DnsConfigurator>)
+        });
     }
 
     #[allow(unreachable_code)]
@@ -131,7 +160,7 @@ fn set_search_domains(
     }
     #[cfg(target_os = "linux")]
     {
-        set_search_domains_linux(rayfish_domains, network_names, tun_name)
+        off_runtime(|| set_search_domains_linux(rayfish_domains, network_names, tun_name))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

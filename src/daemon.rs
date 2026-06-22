@@ -3265,7 +3265,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
             _ = token.cancelled() => {
                 tracing::info!("daemon shutting down");
                 if let Some(ref configurator) = dns_configurator
-                    && let Err(e) = configurator.revert() {
+                    && let Err(e) = dns_config::revert(configurator.as_ref()) {
                         tracing::warn!(error = %e, "failed to revert DNS configuration");
                     }
                 dns_config::clear_search_domains(&tun_name);

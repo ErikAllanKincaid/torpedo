@@ -24,8 +24,8 @@ pub fn resolve_collision(desired: &str, taken: &[&str]) -> String {
     if !taken.contains(&desired) {
         return desired.to_string();
     }
-    for i in 2u32.. {
-        let candidate = format!("{desired}{i}");
+    for i in 1u32.. {
+        let candidate = format!("{desired}-{i}");
         if !taken.contains(&candidate.as_str()) {
             return candidate;
         }
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn collision_appends_number() {
-        assert_eq!(resolve_collision("alice", &["alice"]), "alice2");
-        assert_eq!(resolve_collision("alice", &["alice", "alice2"]), "alice3");
+        assert_eq!(resolve_collision("alice", &["alice"]), "alice-1");
+        assert_eq!(resolve_collision("alice", &["alice", "alice-1"]), "alice-2");
     }
 }

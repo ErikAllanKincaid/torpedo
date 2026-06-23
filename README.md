@@ -82,6 +82,7 @@ ping 100.64.23.142       # or just by IP
 ray leave gaming         # leave a network
 ray down                 # standby: TUN + DNS torn down, daemon keeps running
 ray up                   # reactivate (no root needed)
+ray up --hostname dario  # set your default name for future create/join (collisions become dario-1, dario-2, …)
 sudo ray restart         # restart the service (e.g. after upgrading the binary)
 sudo ray install         # install/refresh the service and start it
 sudo ray set-operator bob # let user 'bob' run ray without sudo

@@ -1093,7 +1093,7 @@ impl DaemonState {
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up => self.activate().await,
+            IpcMessage::Up { hostname } => self.activate(hostname).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1214,7 +1214,10 @@ impl DaemonState {
                 );
                 h
             }
-            None => crate::hostname::generate_hostname(),
+            None => config::load()
+                .ok()
+                .and_then(|c| c.default_hostname)
+                .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
         let mut member_list = MemberList::new();
@@ -1575,7 +1578,10 @@ impl DaemonState {
                 );
                 h
             }
-            None => crate::hostname::generate_hostname(),
+            None => config::load()
+                .ok()
+                .and_then(|c| c.default_hostname)
+                .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
         let cancel = self.shutdown_token.child_token();
@@ -2276,7 +2282,30 @@ impl DaemonState {
     /// reconnect every saved network. Idempotent — a no-op if already active.
     /// Runs entirely inside the (root) daemon, so the IPC client needs no
     /// privileges.
-    async fn activate(self: &Arc<Self>) -> IpcMessage {
+    async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+        // Persist the personal default hostname first (before the already-active
+        // short-circuit) so `ray up --hostname X` records the new default even
+        // when the VPN is already up. Used as the fallback for future
+        // creates/joins; doesn't rename networks already joined.
+        if let Some(h) = hostname {
+            if !crate::hostname::is_valid_hostname(&h) {
+                return IpcMessage::Error {
+                    message: format!(
+                        "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                    ),
+                };
+            }
+            match config::load() {
+                Ok(mut app_config) => {
+                    app_config.default_hostname = Some(h);
+                    if let Err(e) = config::save(&app_config) {
+                        tracing::warn!(error = %e, "failed to persist default hostname");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to load config to set default hostname"),
+            }
+        }
+
         if self.active.swap(true, Ordering::SeqCst) {
             return IpcMessage::Ok {
                 message: "already up".into(),
@@ -3909,7 +3938,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     // Start active by default so a fresh boot behaves like before; `ray up` /
     // `ray down` toggle this at runtime without restarting the process.
-    daemon.activate().await;
+    daemon.activate(None).await;
 
     serve_ipc(&daemon, token).await
 }

@@ -128,6 +128,11 @@ pub struct AppConfig {
     /// `--operator` model). `None` means root-only for mutating commands.
     #[serde(default)]
     pub operator_uid: Option<u32>,
+    /// Personal default hostname used when creating/joining a network without an
+    /// explicit `--hostname`. Set via `ray up --hostname <name>`. `None` falls
+    /// back to a random generated name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_hostname: Option<String>,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -137,6 +142,7 @@ impl Default for AppConfig {
         Self {
             mdns_enabled: true,
             operator_uid: None,
+            default_hostname: None,
             networks: Vec::new(),
         }
     }

@@ -23,7 +23,7 @@ ray leave <net> | nuke <net>   # nuke = publish empty record then leave
 ray hostname <net> <name>      # change hostname on existing network
 ray status                     # all networks (works without daemon)
 ray report                     # bundle logs+metrics, open a pre-filled GitHub issue
-ray up | down                  # activate / standby (TUN + DNS), daemon stays running
+ray up [--hostname h] | down   # activate / standby (TUN + DNS), daemon stays running; --hostname sets your default name for future create/join
 
 ray invite <net> [--expires 7d]            # coordinator-only: mint single-use invite (+QR)
 ray invite <net> list|revoke <id>          # list / revoke invites
@@ -74,12 +74,12 @@ A single iroh Endpoint and TUN device are shared across all networks. Each netwo
 - `src/dht.rs` — one pkarr record per network (blob hash + seed peers); only the coordinator (per-network secret key) can publish.
 - `src/control.rs` — length-prefixed msgpack control protocol over QUIC streams (`JoinRequest`, `JoinPending`, Welcome, MemberApproved, MeshHello, BlobUpdated, …); `DeviceCert`, `PairMsg`. A fresh joiner sends `JoinRequest { invite_secret, hostname, device_cert }` first; the coordinator replies `Welcome`, `JoinPending`, or `JoinDenied` on the same stream.
 - `src/peers.rs` — `PeerTable` (dual v4/v6 DashMaps), `DeviceUserMap`. A peer keeps one virtual IP across every network it joins, so each `PeerEntry` holds a *set* of connections (`network → Connection`); `lookup_v4/v6` return a `PeerRoute` (a deterministically-chosen connection + all shared networks, for union ACL checks). A multi-homed peer stays reachable while it shares one live connection; `remove_peer_from_network()` drops a single network's route without unrouting the peer, while `remove()` drops it everywhere.
-- `src/config.rs` — network config (`~/.config/rayfish/networks.toml`): per-network secret/public key, `my_hostname`, `group_mode` (open/restricted, persisted at create); `AppConfig.operator_uid`.
+- `src/config.rs` — network config (`~/.config/rayfish/networks.toml`): per-network secret/public key, `my_hostname`, `group_mode` (open/restricted, persisted at create); `AppConfig.operator_uid`, `AppConfig.default_hostname` (personal fallback name set by `ray up --hostname`, used when create/join omit `--hostname`).
 - `src/acl.rs` — identity/tag-based ACL engine + `.acl` file format; no rules = allow-all, any rules = deny-all except explicit allows.
 - `src/firewall.rs` — per-device firewall (direction/proto/port/peer + optional arrival-`network`), `ArcSwap` for lock-free reads, dual-stack packet parsing; `firewall.toml`. The optional `network` field (`None` = any, back-compat) scopes a rule to traffic on one network, so a multi-homed host can restrict a peer per-network (e.g. allow `:8080` only from peers reached via `db`).
 - `src/dns.rs` — Magic DNS server on `127.0.0.1:53` (A/AAAA/PTR/SOA for `*.ray`); forward `HostnameTable` + `ReverseLookupTable`.
 - `src/dns_config.rs` — OS DNS config (`DnsConfigurator` trait). macOS: SCDynamicStore. Linux detection chain: systemd-resolved D-Bus → NetworkManager D-Bus → resolvectl → resolvconf → `/etc/resolv.conf`.
-- `src/hostname.rs` / `src/network_name.rs` — hostname + local-alias generation and collision resolution.
+- `src/hostname.rs` / `src/network_name.rs` — hostname + local-alias generation and collision resolution (`resolve_collision` appends `-1`, `-2`, … on a clash, e.g. `dario` → `dario-1`).
 - `src/stats.rs` — iroh-metrics `ForwardMetrics`/`PeerMetrics`, Prometheus export on `:9090`; `ForwardMetrics::snapshot()` reads counters into a serializable `MetricsSnapshot` for `ray report`.
 - `src/logdir.rs` — daemon log directory (`/var/log/rayfish` on Linux, `/Library/Logs/rayfish` on macOS). The daemon writes rolling daily files there via `tracing-appender` (set up in `main::init_tracing`); `ray report` bundles them.
 - `src/shutdown.rs` — SIGINT/SIGTERM via `CancellationToken`. `src/audit.rs` — append-only audit log (not yet wired in).

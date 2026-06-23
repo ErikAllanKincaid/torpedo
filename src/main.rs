@@ -133,7 +133,12 @@ enum Command {
     #[command(hide = true)]
     Daemon,
     /// Install the system service if needed and start it
-    Up,
+    Up {
+        /// Set your default hostname for future networks (e.g. "dario"). Used
+        /// when create/join don't specify one; doesn't rename existing networks
+        #[arg(long)]
+        hostname: Option<String>,
+    },
     /// Disconnect from all networks (signals daemon to shut down)
     Down,
     /// Uninstall system service
@@ -582,7 +587,7 @@ async fn main() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up => cmd_up().await,
+        Command::Up { hostname } => cmd_up(hostname).await,
         Command::Down => ipc_down().await,
         Command::Uninstall => cmd_uninstall_service(),
         Command::Install => cmd_install().await,
@@ -1631,9 +1636,9 @@ fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-async fn cmd_up() -> Result<()> {
+async fn cmd_up(hostname: Option<String>) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(&mut stream, ipc::IpcMessage::Up).await?;
+        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -1650,7 +1655,7 @@ async fn cmd_up() -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service().await
+    install_and_start_service(hostname).await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -1660,7 +1665,7 @@ async fn cmd_up() -> Result<()> {
 /// it never comes up (e.g. it crashed on a port/route conflict with another
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
-async fn install_and_start_service() -> Result<()> {
+async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -1686,7 +1691,7 @@ async fn install_and_start_service() -> Result<()> {
     // Wait for the freshly started daemon to accept IPC, then activate the VPN.
     match wait_for_daemon(std::time::Duration::from_secs(8)).await {
         Some(mut stream) => {
-            ipc::send(&mut stream, ipc::IpcMessage::Up).await?;
+            ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
                 ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -1748,7 +1753,7 @@ fn require_root() -> Result<()> {
 /// install), then start it and verify the daemon comes up. Requires root.
 async fn cmd_install() -> Result<()> {
     require_root()?;
-    install_and_start_service().await
+    install_and_start_service(None).await
 }
 
 /// `ray restart`: restart the already-installed system service via the OS

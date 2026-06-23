@@ -48,8 +48,12 @@ pub enum IpcMessage {
     Shutdown,
     /// Activate the VPN: bring the TUN interface up, configure system DNS, and
     /// reconnect all saved networks. Handled by the already-running daemon, so
-    /// no root privileges are needed on the client.
-    Up,
+    /// no root privileges are needed on the client. An optional `hostname` sets
+    /// the personal default hostname used for future creates/joins.
+    Up {
+        #[serde(default)]
+        hostname: Option<String>,
+    },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
     /// running so it can be reactivated with `Up`.

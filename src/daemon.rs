@@ -3463,6 +3463,11 @@ impl DaemonState {
             s.suggested_firewall = suggestions;
         }
         update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        // The coordinator is the blob's source, so the group poller's hash
+        // check (local == published) short-circuits and it never re-applies its
+        // own authored suggestions. Materialize them here so the coordinator is
+        // subject to its own rules like any other member (auto-take or queue).
+        apply_suggested_firewall(&self.firewall, self.endpoint.id(), network, &state);
         IpcMessage::Ok {
             message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
         }

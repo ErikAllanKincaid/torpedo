@@ -621,7 +621,7 @@ fn format_action(a: Action) -> &'static str {
 /// to identities via `resolve` (the blob's member list); unresolved peers are
 /// skipped — their rules materialize once they join. Every rule is inbound,
 /// network-scoped to `net`, and tagged `origin: Network(net)`. When the subject
-/// has an allow-list (or `default: deny`), a trailing network-scoped catch-all
+/// has an allow-list, a trailing network-scoped catch-all
 /// deny is appended so only the listed peers pass, without touching the global
 /// default action. Each port spec token is `proto:ports` or a bare proto keyword
 /// (`icmp`, `any`, `tcp`); a comma-separated value yields one rule per token.
@@ -657,8 +657,10 @@ pub fn materialize_suggestions(
             }
         }
     }
-    let want_default_deny = matches!(host.default.as_deref(), Some("deny"))
-        || (!host.allows.is_empty() && host.default.is_none());
+    // Whitelist mode: an allow-list is present ⇒ only listed peers pass,
+    // append a network-scoped catch-all deny. A subject with only `denies`
+    // (blacklist) or neither list stays open (global default applies).
+    let want_default_deny = !host.allows.is_empty();
     if want_default_deny {
         rules.push(FirewallRule {
             direction: Direction::In,
@@ -1399,20 +1401,28 @@ mod tests {
     }
 
     #[test]
-    fn materialize_explicit_default_deny_also_appends_catch_all() {
+    fn materialize_deny_only_blacklist_no_catch_all() {
+        // A subject with only `denies` (blacklist mode) does NOT get a
+        // catch-all deny — the listed peer is blocked, the rest stays open.
         let me = test_id(1);
+        let eve = test_id(3);
         let resolve = |h: &str| match h {
             "me" => Some(me),
+            "eve" => Some(eve),
             _ => None,
         };
         let entry = HostSuggestions {
-            default: Some("deny".to_string()),
+            denies: [("eve".to_string(), "any".to_string())].into(),
             ..Default::default()
         };
         let mut suggestions = SuggestedFirewall::new();
         suggestions.insert("me".to_string(), entry);
         let rules = materialize_suggestions("prod", "me", &suggestions, &resolve);
-        assert!(rules.iter().any(|r| r.action == Action::Deny && r.peer == PeerFilter::Any));
+        // One deny rule for eve, no catch-all deny.
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].action, Action::Deny);
+        assert_eq!(rules[0].peer, PeerFilter::Identity(eve));
+        assert!(rules.iter().all(|r| r.peer != PeerFilter::Any));
     }
 
     #[test]

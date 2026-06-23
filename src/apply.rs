@@ -10,8 +10,13 @@
 //! The spec reuses [`ray_proto::policy::SuggestedFirewall`] verbatim, so the
 //! wire/blob shape and the authoring shape are identical: an admin authors the
 //! exact rules a node will materialize, keyed by hostname, before any host has
-//! joined. TOML is the on-disk format (matching `networks.toml`); the top level
-//! is a `networks` table whose keys are network names.
+//! joined. Loading is format-agnostic via the [`config`] crate — YAML, TOML, or
+//! JSON, detected by file extension. Output (`--dry-run`, `--example`) is YAML.
+//!
+//! Firewall model: if a subject has an `allows` list, only those peers pass
+//! (a network-scoped catch-all deny is appended); a subject with only `denies`
+//! is a blacklist (rest allowed); an empty subject is fully open. There is no
+//! `default` field — the mode is inferred from which list is non-empty.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,66 +46,61 @@ pub struct NetworkSpec {
 /// produce byte-identical files.
 pub type DeploySpec = BTreeMap<String, NetworkSpec>;
 
-/// Load a deploy spec from a TOML file.
+/// Load a deploy spec from a file. Format is auto-detected from the file
+/// extension by the [`config`] crate (`.yaml`/`.yml` → YAML, `.toml` → TOML,
+/// `.json` → JSON). A top-level `networks:` wrapper is accepted (and
+/// unwrapped); a flat map (network names at the top level) is also accepted.
+/// Unknown fields error.
 pub fn load(path: &Path) -> Result<DeploySpec> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading spec {}", path.display()))?;
-    parse(&contents).with_context(|| format!("parsing spec {}", path.display()))
+    let cfg = config::Config::builder()
+        .add_source(config::File::from(path.to_path_buf()))
+        .build()
+        .with_context(|| format!("parsing spec {}", path.display()))?;
+    deserialize_spec(cfg)
 }
 
-/// Parse a spec from TOML text. The top level is a `[networks]` table; a flat
-/// map (no `networks` wrapper) is also accepted for ergonomic single-file use.
-/// Unknown fields are rejected so a typo'd key (e.g. `trusted = "yes"` or a
-/// misspelled network field) surfaces as an error instead of being silently
-/// dropped with defaults.
-pub fn parse(toml: &str) -> Result<DeploySpec> {
-    // Canonical `[networks]` form (with a wrapper). `deny_unknown_fields` means
-    // a flat-shaped input errors here instead of silently yielding an empty map.
+/// Try the canonical `networks:` wrapper form, then fall back to a flat map.
+fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Wrapper {
-        #[serde(default)]
         networks: DeploySpec,
     }
-    if let Ok(w) = toml::from_str::<Wrapper>(toml) {
+    if let Ok(w) = cfg.clone().try_deserialize::<Wrapper>() {
         return Ok(w.networks);
     }
-    // Ergonomic flat form: top-level keys are network names.
-    toml::from_str::<DeploySpec>(toml).context("expected a [networks] table or a flat map")
+    cfg.try_deserialize::<DeploySpec>()
+        .context("expected a `networks:` table or a flat map of network names")
 }
 
-/// Serialize a spec to TOML (sorted, stable, canonical `[networks.*]` form).
-/// Used by `ray apply --dry-run` to echo the normalized intent.
-pub fn to_toml(spec: &DeploySpec) -> Result<String> {
-    #[derive(Serialize)]
-    struct Wrapper<'a> {
-        networks: &'a DeploySpec,
-    }
-    toml::to_string_pretty(&Wrapper { networks: spec }).context("serializing spec")
+/// Serialize a spec to YAML (sorted, stable, canonical). Used by `ray apply
+/// --dry-run` to echo the normalized intent.
+pub fn to_yaml(spec: &DeploySpec) -> Result<String> {
+    serde_yml::to_string(spec).context("serializing spec to YAML")
 }
 
-/// The example spec printed by `ray apply --example`.
+/// The example spec printed by `ray apply --example` (YAML).
 pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
-# Top level is a [networks] table; keys are network names.
-# Each port spec token is `proto:ports` or a bare proto keyword.
-#   tcp:22 | tcp:80-443 | tcp:* | udp:53 | icmp | any
-# Comma-separate multiple tokens: `tcp:22,icmp`
+# Top level is a `networks:` map; keys are network names.
+# Save as e.g. deploy.yaml and run: ray apply deploy.yaml
+# Format is detected by extension (yaml/toml/json).
 
-[networks.gaming]
-trusted = true
-
-# Subject hostname "alice" accepts inbound :22 from "bob" and denies ICMP
-# from "eve", with a catch-all deny on everything else from this network.
-[networks.gaming.firewall.alice]
-default = "deny"
-[networks.gaming.firewall.alice.allows]
-bob = "tcp:22"
-[networks.gaming.firewall.alice.denies]
-eve = "icmp"
-
-[networks.gaming.firewall.bob]
-[networks.gaming.firewall.bob.allows]
-alice = "tcp:9000,tcp:8123"
+networks:
+  gaming:
+    trusted: true
+    firewall:
+      # alice has an allow-list ⇒ only listed peers pass, rest denied.
+      alice:
+        allows:
+          bob: "tcp:22"
+        denies:
+          eve: "icmp"
+      # bob's allow-list uses comma-separated proto:ports tokens.
+      bob:
+        allows:
+          alice: "tcp:9000,tcp:8123"
+      # An empty subject is fully open (no rules materialized).
+      carol: {}
 "#;
 
 /// Union of every hostname mentioned in the spec's `firewall:` blocks — both
@@ -127,44 +127,80 @@ mod tests {
     use super::*;
     use ray_proto::policy::HostSuggestions;
 
-    #[test]
-    fn parse_networks_wrapper() {
-        let toml = r#"
-[networks.gaming]
-trusted = true
+    /// Parse a spec from YAML text. The top level may be a `networks:` table
+    /// (wrapper form) or a flat map whose keys are network names. Unknown
+    /// fields are rejected so a typo'd key surfaces as an error instead of
+    /// being silently dropped with defaults.
+    fn parse(text: &str) -> Result<DeploySpec> {
+        let cfg = config::Config::builder()
+            .add_source(config::File::from_str(text, config::FileFormat::Yaml))
+            .build()
+            .context("building config")?;
+        deserialize_spec(cfg)
+    }
 
-[networks.gaming.firewall.alice]
-default = "deny"
-allows = { bob = "tcp:22" }
+    #[test]
+    fn parse_yaml_wrapper() {
+        let yaml = r#"
+networks:
+  gaming:
+    trusted: true
+    firewall:
+      alice:
+        allows:
+          bob: "tcp:22"
 "#;
-        let spec = parse(toml).unwrap();
+        let spec = parse(yaml).unwrap();
         assert_eq!(spec.len(), 1);
         let g = spec.get("gaming").unwrap();
         assert!(g.trusted);
         let alice = g.firewall.get("alice").unwrap();
-        assert_eq!(alice.default.as_deref(), Some("deny"));
         assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("tcp:22"));
     }
 
     #[test]
-    fn parse_flat_form() {
-        let toml = r#"
-["gaming"]
-trusted = true
+    fn parse_yaml_flat() {
+        let yaml = r#"
+gaming:
+  trusted: true
 "#;
-        let spec = parse(toml).unwrap();
+        let spec = parse(yaml).unwrap();
         assert!(spec["gaming"].trusted);
         assert!(spec["gaming"].firewall.is_empty());
     }
 
     #[test]
-    fn roundtrip_is_stable_and_sorted() {
+    fn load_toml_wrapper() {
+        // `load` auto-detects format by extension. Write a .toml temp file
+        // to exercise the TOML path (config-rs handles it via the `toml` feature).
+        let dir = std::env::temp_dir().join(format!("rayfish-apply-toml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spec.toml");
+        std::fs::write(&path, r#"
+[networks.gaming]
+trusted = true
+
+[networks.gaming.firewall.alice]
+[networks.gaming.firewall.alice.allows]
+bob = "tcp:22"
+"#).unwrap();
+        let spec = load(&path).unwrap();
+        let g = spec.get("gaming").unwrap();
+        assert!(g.trusted);
+        assert_eq!(
+            g.firewall.get("alice").unwrap().allows.get("bob").map(|s| s.as_str()),
+            Some("tcp:22")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roundtrip_yaml_is_stable_and_sorted() {
         let mut spec = DeploySpec::new();
         let mut fw = SuggestedFirewall::new();
         fw.insert(
             "alice".to_string(),
             HostSuggestions {
-                default: Some("deny".to_string()),
                 allows: [("bob".to_string(), "tcp:22".to_string())].into(),
                 denies: [].into(),
             },
@@ -183,30 +219,25 @@ trusted = true
                 firewall: SuggestedFirewall::new(),
             },
         );
-        let s1 = to_toml(&spec).unwrap();
-        let s2 = to_toml(&parse(&s1).unwrap()).unwrap();
-        assert_eq!(
-            s1, s2,
-            "roundtrip must be byte-identical (sorted canonical)"
-        );
-        // Canonical wrapper form.
-        assert!(s1.contains("[networks.admin]"));
-        assert!(s1.contains("[networks.gaming]"));
+        let s1 = to_yaml(&spec).unwrap();
+        let s2 = to_yaml(&parse(&s1).unwrap()).unwrap();
+        assert_eq!(s1, s2, "roundtrip must be byte-identical (sorted canonical)");
         // admin (empty firewall, omitted) sorts before gaming; both present.
-        let admin_idx = s1.find("[networks.admin]").unwrap();
-        let gaming_idx = s1.find("[networks.gaming]").unwrap();
+        let admin_idx = s1.find("admin:").unwrap();
+        let gaming_idx = s1.find("gaming:").unwrap();
         assert!(admin_idx < gaming_idx);
     }
 
     #[test]
     fn empty_firewall_omits_field() {
-        let toml = r#"
-[networks.gaming]
-trusted = true
+        let yaml = r#"
+networks:
+  gaming:
+    trusted: true
 "#;
-        let spec = parse(toml).unwrap();
-        // Round-trips without emitting `firewall = {}`.
-        let out = to_toml(&spec).unwrap();
+        let spec = parse(yaml).unwrap();
+        // Round-trips without emitting `firewall: {}`.
+        let out = to_yaml(&spec).unwrap();
         assert!(!out.contains("firewall"));
     }
 
@@ -217,7 +248,6 @@ trusted = true
         fw.insert(
             "alice".to_string(),
             HostSuggestions {
-                default: None,
                 allows: [("bob".to_string(), "tcp:22".to_string())].into(),
                 denies: [("carol".to_string(), "icmp".to_string())].into(),
             },
@@ -237,10 +267,19 @@ trusted = true
     }
 
     #[test]
-    fn invalid_spec_errors() {
-        assert!(parse("not = valid = toml").is_err());
-        // missing required shape: a value that isn't a NetworkSpec
-        assert!(parse("[networks.gaming]\ntrusted = \"yes\"").is_err());
+    fn unknown_field_errors() {
+        // `bogus` is not a valid NetworkSpec field.
+        let yaml = r#"
+networks:
+  gaming:
+    trusted = true
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn invalid_yaml_errors() {
+        assert!(parse("key: [unclosed").is_err());
     }
 
     #[test]
@@ -249,9 +288,10 @@ trusted = true
         let spec = parse(EXAMPLE_SPEC).expect("EXAMPLE_SPEC must parse");
         let g = spec.get("gaming").unwrap();
         assert!(g.trusted);
-        assert_eq!(g.firewall.len(), 2);
+        assert_eq!(g.firewall.len(), 3);
         let alice = g.firewall.get("alice").unwrap();
-        assert_eq!(alice.default.as_deref(), Some("deny"));
         assert_eq!(alice.allows.get("bob").map(|s| s.as_str()), Some("tcp:22"));
+        // carol is an empty subject → fully open.
+        assert!(g.firewall.get("carol").unwrap().allows.is_empty());
     }
 }

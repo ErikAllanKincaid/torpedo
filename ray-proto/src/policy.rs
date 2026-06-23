@@ -18,16 +18,15 @@ use serde::{Deserialize, Serialize};
 /// Suggested firewall rules for one subject host, keyed by peer hostname.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSuggestions {
-    /// Catch-all action for traffic on this network to the subject ("allow" |
-    /// "deny"). When `Some("deny")` (or an allow-list is present) the node
-    /// installs a trailing network-scoped deny so only the listed peers pass.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
-    /// peer hostname -> comma-separated ports (e.g. `"9000,8123"` or `"9999"`):
-    /// the subject accepts inbound from that peer on those ports.
+    /// peer hostname -> proto:ports spec (e.g. `"tcp:22"`, `"icmp"`, `"tcp:*"`):
+    /// the subject accepts inbound from that peer. When non-empty, the node
+    /// installs a trailing network-scoped catch-all deny so only the listed
+    /// peers pass (whitelist mode). When empty (and `denies` is non-empty), the
+    /// subject is in blacklist mode (rest allowed).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub allows: BTreeMap<String, String>,
-    /// peer hostname -> ports the subject explicitly denies inbound from.
+    /// peer hostname -> ports the subject explicitly denies inbound from. Use
+    /// this for a blacklist (everything allowed except these peers).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub denies: BTreeMap<String, String>,
 }

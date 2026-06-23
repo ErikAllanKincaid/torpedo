@@ -361,9 +361,6 @@ enum FirewallAction {
         /// Same token grammar as `--allow`.
         #[arg(long, value_name = "PEER:SPEC")]
         deny: Vec<String>,
-        /// Default action for the subject on this network: allow or deny
-        #[arg(long)]
-        default: Option<String>,
     },
     /// Show suggested rules queued for manual review on a trusted network
     /// (a member that did not join with `--allow-trusted`).
@@ -1386,10 +1383,9 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         subject,
         allow,
         deny,
-        default,
     } = action
     {
-        return ipc_firewall_suggest(&network, &subject, allow, deny, default).await;
+        return ipc_firewall_suggest(&network, &subject, allow, deny).await;
     }
     let mut stream = ipc::connect().await?;
     let req = match action {
@@ -1436,7 +1432,6 @@ async fn ipc_firewall_suggest(
     subject: &str,
     allow: Vec<String>,
     deny: Vec<String>,
-    default: Option<String>,
 ) -> Result<()> {
     use ray_proto::HostSuggestions;
 
@@ -1472,9 +1467,6 @@ async fn ipc_firewall_suggest(
     };
 
     let entry = suggestions.entry(subject.to_string()).or_default();
-    if let Some(d) = default {
-        entry.default = Some(d);
-    }
     for a in &allow {
         let (peer, ports) = parse(a, "--allow")?;
         entry.allows.insert(peer, ports);
@@ -1537,7 +1529,7 @@ async fn ipc_apply(
     }
     if dry_run {
         println!("{}", style::bold("Spec (normalized):"));
-        print!("{}", apply::to_toml(&spec)?);
+        print!("{}", apply::to_yaml(&spec)?);
         println!("{}", style::faint("(dry-run; no changes applied)"));
         return Ok(());
     }

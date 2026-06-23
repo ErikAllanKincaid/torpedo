@@ -61,16 +61,48 @@ pub fn load(path: &Path) -> Result<DeploySpec> {
 
 /// Try the canonical `networks:` wrapper form, then fall back to a flat map.
 fn deserialize_spec(cfg: config::Config) -> Result<DeploySpec> {
+    // config-rs represents YAML `null` (e.g. an empty `beta:` subject) as
+    // `ValueKind::Nil`. serde can't turn a present-but-Nil value into a struct
+    // — field-level `#[serde(default)]` only fires for *absent* keys — so an
+    // empty subject would error ("invalid type: null, expected struct") and
+    // make the wrapper path fall through to the flat-map fallback, producing a
+    // confusing "unknown field" error. Normalize Nil → empty Table first: in
+    // this spec a null always means "default/empty" (an open subject).
+    let mut value: config::Value = cfg.try_deserialize().context("reading config tree")?;
+    normalize_nil(&mut value);
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Wrapper {
         networks: DeploySpec,
     }
-    if let Ok(w) = cfg.clone().try_deserialize::<Wrapper>() {
+    if let Ok(w) = value.clone().try_deserialize::<Wrapper>() {
         return Ok(w.networks);
     }
-    cfg.try_deserialize::<DeploySpec>()
+    value
+        .try_deserialize::<DeploySpec>()
         .context("expected a `networks:` table or a flat map of network names")
+}
+
+/// Recursively replace `ValueKind::Nil` with an empty `Table` so a null
+/// (YAML `key:` with no value) deserializes as a default struct.
+fn normalize_nil(v: &mut config::Value) {
+    use config::ValueKind;
+    match &mut v.kind {
+        ValueKind::Nil => {
+            v.kind = ValueKind::Table(config::Map::new());
+        }
+        ValueKind::Table(t) => {
+            for (_k, child) in t.iter_mut() {
+                normalize_nil(child);
+            }
+        }
+        ValueKind::Array(a) => {
+            for child in a.iter_mut() {
+                normalize_nil(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Serialize a spec to YAML (sorted, stable, canonical). Used by `ray apply
@@ -170,25 +202,54 @@ gaming:
     }
 
     #[test]
+    fn parse_yaml_null_subject_is_open() {
+        // A subject written as `beta:` (YAML null) means "empty / fully open".
+        // Must deserialize to a default HostSuggestions, not error.
+        let yaml = r#"
+networks:
+  net1:
+    trusted: true
+    firewall:
+      beta:
+      gamma:
+"#;
+        let spec = parse(yaml).unwrap();
+        let g = spec.get("net1").unwrap();
+        assert!(g.trusted);
+        assert_eq!(g.firewall.len(), 2);
+        assert!(g.firewall.get("beta").unwrap().allows.is_empty());
+        assert!(g.firewall.get("gamma").unwrap().allows.is_empty());
+    }
+
+    #[test]
     fn load_toml_wrapper() {
         // `load` auto-detects format by extension. Write a .toml temp file
         // to exercise the TOML path (config-rs handles it via the `toml` feature).
         let dir = std::env::temp_dir().join(format!("rayfish-apply-toml-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("spec.toml");
-        std::fs::write(&path, r#"
+        std::fs::write(
+            &path,
+            r#"
 [networks.gaming]
 trusted = true
 
 [networks.gaming.firewall.alice]
 [networks.gaming.firewall.alice.allows]
 bob = "tcp:22"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let spec = load(&path).unwrap();
         let g = spec.get("gaming").unwrap();
         assert!(g.trusted);
         assert_eq!(
-            g.firewall.get("alice").unwrap().allows.get("bob").map(|s| s.as_str()),
+            g.firewall
+                .get("alice")
+                .unwrap()
+                .allows
+                .get("bob")
+                .map(|s| s.as_str()),
             Some("tcp:22")
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -221,7 +282,10 @@ bob = "tcp:22"
         );
         let s1 = to_yaml(&spec).unwrap();
         let s2 = to_yaml(&parse(&s1).unwrap()).unwrap();
-        assert_eq!(s1, s2, "roundtrip must be byte-identical (sorted canonical)");
+        assert_eq!(
+            s1, s2,
+            "roundtrip must be byte-identical (sorted canonical)"
+        );
         // admin (empty firewall, omitted) sorts before gaming; both present.
         let admin_idx = s1.find("admin:").unwrap();
         let gaming_idx = s1.find("gaming:").unwrap();

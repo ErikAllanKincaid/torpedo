@@ -140,19 +140,27 @@ impl CoordinatorAcceptState {
             let hostname_table = self.hostname_table.clone();
             let reverse_table = self.reverse_table.clone();
             let device_user_map = self.device_user_map.clone();
+            let peers_ctrl = self.peers.clone();
+            let blob_store_ctrl = self.blob_store.clone();
+            let dht_notify_ctrl = self.dht_notify.clone();
+            let token_ctrl = token.clone();
+            let network_ctrl = network.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members).await;
-                spawn_coordinator_hello_reader(
+                spawn_coordinator_control_reader(
                     conn.clone(),
                     remote_id,
                     peer_ip,
-                    &network,
+                    network_ctrl,
                     state,
                     hostname_table,
                     reverse_table,
                     device_user_map.clone(),
-                )
-                .await;
+                    peers_ctrl,
+                    blob_store_ctrl,
+                    dht_notify_ctrl,
+                    token_ctrl,
+                );
                 forward::spawn_peer_reader(
                     conn,
                     remote_id,
@@ -400,6 +408,22 @@ impl CoordinatorAcceptState {
             conn.clone(),
             remote_id,
             &self.network_name,
+        );
+        // Keep reading control streams from this member so a later rename (sent
+        // as a MeshHello) propagates immediately, not just after a reconnect.
+        spawn_coordinator_control_reader(
+            conn.clone(),
+            remote_id,
+            peer_ip,
+            self.network_name.clone(),
+            self.state.clone(),
+            self.hostname_table.clone(),
+            self.reverse_table.clone(),
+            self.device_user_map.clone(),
+            self.peers.clone(),
+            self.blob_store.clone(),
+            self.dht_notify.clone(),
+            self.token.clone(),
         );
         forward::spawn_peer_reader(
             conn,
@@ -933,6 +957,9 @@ pub struct NetworkHandle {
     role: NetworkRole,
     my_ip: Ipv4Addr,
     state: Arc<std::sync::RwLock<NetworkState>>,
+    /// DHT republish trigger; `Some` only on the coordinator (the sole publisher).
+    /// Lets `set_hostname` re-publish the group blob on a coordinator self-rename.
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
     /// Child of the daemon `shutdown_token`. Cancelling it stops this network's
     /// background tasks (reconnect loop, group poller, publisher, peer readers)
     /// without affecting the rest of the daemon.
@@ -1387,7 +1414,7 @@ impl DaemonState {
                 disconnect_tx,
                 token: cancel.clone(),
                 stats: self.stats.clone(),
-                dht_notify: Some(dht_notify),
+                dht_notify: Some(dht_notify.clone()),
                 blob_store: self.blob_store.clone(),
                 shared_acl: self.shared_acl.clone(),
                 firewall: self.firewall.clone(),
@@ -1405,6 +1432,7 @@ impl DaemonState {
             role: NetworkRole::Coordinator,
             my_ip,
             state,
+            dht_notify: Some(dht_notify),
             cancel,
             tasks,
             invite_lock,
@@ -1627,6 +1655,8 @@ impl DaemonState {
             net_pubkey,
             self.device_cert.clone(),
             self.device_user_map.clone(),
+            self.hostname_table.clone(),
+            self.reverse_table.clone(),
             invite,
             initial,
         )
@@ -1713,6 +1743,7 @@ impl DaemonState {
             role: NetworkRole::Member,
             my_ip,
             state,
+            dht_notify: None,
             cancel,
             tasks,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1925,6 +1956,7 @@ impl DaemonState {
                 role: NetworkRole::Member,
                 my_ip,
                 state: live_state,
+                dht_notify: None,
                 cancel,
                 tasks,
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2154,7 +2186,7 @@ impl DaemonState {
                 disconnect_tx,
                 token: cancel.clone(),
                 stats: self.stats.clone(),
-                dht_notify: Some(dht_notify),
+                dht_notify: Some(dht_notify.clone()),
                 blob_store: self.blob_store.clone(),
                 shared_acl: self.shared_acl.clone(),
                 firewall: self.firewall.clone(),
@@ -2198,6 +2230,7 @@ impl DaemonState {
             role: NetworkRole::Coordinator,
             my_ip,
             state,
+            dht_notify: Some(dht_notify),
             cancel,
             tasks,
             invite_lock,
@@ -2748,8 +2781,13 @@ impl DaemonState {
             };
         }
 
-        let handle = match self.networks.get(network) {
-            Some(h) => h,
+        let (my_ip, is_coord, state, dht_notify) = match self.networks.get(network) {
+            Some(h) => (
+                h.my_ip,
+                h.role.is_coordinator(),
+                h.state.clone(),
+                h.dht_notify.clone(),
+            ),
             None => {
                 return IpcMessage::Error {
                     message: format!("network '{}' not found", network),
@@ -2757,18 +2795,35 @@ impl DaemonState {
             }
         };
 
-        let my_ip = handle.my_ip;
         let my_identity = self.endpoint.id();
-        let new_hostname = hostname.to_string();
 
-        // Update member list in memory
-        if let Ok(mut state) = handle.state.write()
-            && let Some(me) = state.members.get_mut(&my_identity)
+        // The coordinator is authoritative, so it resolves collisions against the
+        // roster up front. A member applies its requested name optimistically and
+        // lets the coordinator correct it via the authoritative MemberSync.
+        let new_hostname = if is_coord {
+            let taken: Vec<String> = {
+                let s = state.read().unwrap();
+                s.members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != my_identity)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect()
+            };
+            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            hostname::resolve_collision(hostname, &taken_refs)
+        } else {
+            hostname.to_string()
+        };
+
+        // Update our own member entry.
+        if let Ok(mut s) = state.write()
+            && let Some(me) = s.members.get_mut(&my_identity)
         {
             me.hostname = Some(new_hostname.clone());
         }
 
-        // Update DNS table: remove old entry for our IP, insert new one
+        // Update DNS table: remove old entry for our IP, insert new one.
         dns::remove_hostname_by_ip(&self.hostname_table, &self.reverse_table, network, my_ip).await;
         dns::update_hostname(
             &self.hostname_table,
@@ -2780,7 +2835,7 @@ impl DaemonState {
         )
         .await;
 
-        // Persist to config
+        // Persist to config.
         if let Ok(mut app_config) = config::load() {
             if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == network) {
                 net.my_hostname = Some(new_hostname.clone());
@@ -2788,17 +2843,28 @@ impl DaemonState {
             let _ = config::save(&app_config);
         }
 
-        // Re-send MeshHello to all peers on this network
-        let peers = self.peers.peers_for_network_with_conn(network);
-        for (_peer_id, _peer_ip, conn) in &peers {
-            if let Ok((mut send, _recv)) = conn.open_bi().await {
-                let msg = ControlMsg::MeshHello {
-                    identity: my_identity,
-                    ip: my_ip,
-                    hostname: Some(new_hostname.clone()),
-                    device_cert: self.device_cert.clone(),
-                };
-                let _ = control::send_msg(&mut send, &msg).await;
+        if is_coord {
+            // Authoritative: republish the group blob and push the new roster to
+            // every peer immediately.
+            update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            let members: Vec<Member> =
+                state.read().unwrap().members.all().into_iter().cloned().collect();
+            broadcast_member_sync(&self.peers, &members, None).await;
+        } else {
+            // Notify the coordinator via MeshHello (sent to all connected peers;
+            // only the coordinator's continuous control reader acts on it). It
+            // resolves collisions and broadcasts the authoritative MemberSync.
+            let peers = self.peers.peers_for_network_with_conn(network);
+            for (_peer_id, _peer_ip, conn) in &peers {
+                if let Ok((mut send, _recv)) = conn.open_bi().await {
+                    let msg = ControlMsg::MeshHello {
+                        identity: my_identity,
+                        ip: my_ip,
+                        hostname: Some(new_hostname.clone()),
+                        device_cert: self.device_cert.clone(),
+                    };
+                    let _ = control::send_msg(&mut send, &msg).await;
+                }
             }
         }
 
@@ -4457,67 +4523,156 @@ fn spawn_peer_cleanup(
     })
 }
 
+/// Coordinator-side per-member control reader. Continuously accepts control
+/// streams from one member and processes `MeshHello`s as live create-or-update
+/// signals — the only path by which a member's hostname (or device cert) reaches
+/// the coordinator after the initial handshake. On a hostname that differs from
+/// the stored one, the coordinator resolves collisions authoritatively, updates
+/// the roster + DNS, republishes the group blob, and broadcasts `MemberSync` so
+/// every peer reflects the change immediately. Runs until the network token is
+/// cancelled or the connection drops.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_coordinator_hello_reader(
+fn spawn_coordinator_control_reader(
     conn: Connection,
     remote_id: EndpointId,
     peer_ip: Ipv4Addr,
-    network_name: &str,
+    network_name: String,
     state: Arc<std::sync::RwLock<NetworkState>>,
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     device_user_map: peers::DeviceUserMap,
+    peers: PeerTable,
+    blob_store: FsStore,
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    token: CancellationToken,
 ) {
-    let result: Result<()> = async {
-        let (_send, mut recv) = tokio::time::timeout(
-            Duration::from_secs(5),
-            conn.accept_bi(),
-        ).await.context("timeout waiting for MeshHello")?
-        .context("accept bi for MeshHello")?;
-        let msg = control::recv_msg(&mut recv).await?;
-        if let ControlMsg::MeshHello { hostname, device_cert, .. } = msg {
-            // Verify and store device cert if present
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                _ = token.cancelled() => return,
+                r = conn.accept_bi() => r,
+            };
+            let mut recv = match accepted {
+                Ok((_send, recv)) => recv,
+                Err(_) => return, // connection closed
+            };
+            let msg = match control::recv_msg(&mut recv).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let ControlMsg::MeshHello {
+                hostname,
+                device_cert,
+                ..
+            } = msg
+            else {
+                continue;
+            };
+
+            // Verify and store device cert if present.
             if let Some(ref cert) = device_cert
                 && cert.verify()
                 && cert.device_key == remote_id
             {
-                let mut s = state.write().unwrap();
-                if let Some(m) = s.members.get_mut(&remote_id) {
-                    m.user_identity = Some(cert.user_identity);
-                    m.device_cert = Some(cert.clone());
-                }
-                device_user_map.insert(remote_id, cert.user_identity);
-                tracing::info!(
-                    peer = %remote_id.fmt_short(),
-                    user = %cert.user_identity.fmt_short(),
-                    "verified device certificate"
-                );
-            }
-            if let Some(desired) = hostname {
-                let taken: Vec<String> = {
-                    let s = state.read().unwrap();
-                    s.members.all().iter()
-                        .filter(|m| m.identity != remote_id)
-                        .filter_map(|m| m.hostname.clone())
-                        .collect()
-                };
-                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-                let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
-                tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname via MeshHello");
                 {
                     let mut s = state.write().unwrap();
                     if let Some(m) = s.members.get_mut(&remote_id) {
-                        m.hostname = Some(final_hostname.clone());
+                        m.user_identity = Some(cert.user_identity);
+                        m.device_cert = Some(cert.clone());
                     }
                 }
-                let ipv6 = derive_ipv6(&remote_id);
-                dns::update_hostname(&hostname_table, &reverse_table, network_name, &final_hostname, peer_ip, ipv6).await;
+                device_user_map.insert(remote_id, cert.user_identity);
+            }
+
+            let Some(desired) = hostname else { continue };
+
+            // Resolve collisions authoritatively against the rest of the roster,
+            // then detect whether this is a genuine change for this member.
+            let (final_hostname, changed) = {
+                let s = state.read().unwrap();
+                let taken: Vec<String> = s
+                    .members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != remote_id)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect();
+                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+                let final_hostname = crate::hostname::resolve_collision(&desired, &taken_refs);
+                let old = s
+                    .members
+                    .all()
+                    .iter()
+                    .find(|m| m.identity == remote_id)
+                    .and_then(|m| m.hostname.clone());
+                let changed = old.as_deref() != Some(final_hostname.as_str());
+                (final_hostname, changed)
+            };
+
+            if changed {
+                let mut s = state.write().unwrap();
+                if let Some(m) = s.members.get_mut(&remote_id) {
+                    m.hostname = Some(final_hostname.clone());
+                }
+            }
+
+            // Re-assert this peer's DNS entry (idempotent; clears any stale name
+            // sharing its IP before inserting the current one).
+            dns::remove_hostname_by_ip(&hostname_table, &reverse_table, &network_name, peer_ip).await;
+            let ipv6 = derive_ipv6(&remote_id);
+            dns::update_hostname(
+                &hostname_table,
+                &reverse_table,
+                &network_name,
+                &final_hostname,
+                peer_ip,
+                ipv6,
+            )
+            .await;
+
+            if changed {
+                tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname changed; propagating");
+                update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
+                let members: Vec<Member> =
+                    state.read().unwrap().members.all().into_iter().cloned().collect();
+                broadcast_member_sync(&peers, &members, None).await;
             }
         }
-        Ok(())
-    }.await;
-    if let Err(e) = result {
-        tracing::debug!(peer = %remote_id.fmt_short(), error = %e, "failed to read MeshHello from peer");
+    });
+}
+
+/// Rebuild a network's DNS entries from its member roster (the single source of
+/// truth) and persist our own — possibly coordinator-corrected — hostname. Called
+/// whenever a roster update arrives so renames, joins, and departures all reflect
+/// in `*.ray` resolution immediately.
+async fn apply_roster_to_dns(
+    members: &[Member],
+    network_name: &str,
+    my_identity: EndpointId,
+    hostname_table: &dns::HostnameTable,
+    reverse_table: &dns::ReverseLookupTable,
+) {
+    let entries: Vec<(String, Ipv4Addr, std::net::Ipv6Addr)> = members
+        .iter()
+        .filter_map(|m| {
+            m.hostname
+                .as_ref()
+                .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
+        })
+        .collect();
+    dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
+
+    // Persist our own name if the coordinator adjusted it (e.g. collision → -1).
+    if let Some(mine) = members
+        .iter()
+        .find(|m| m.identity == my_identity)
+        .and_then(|m| m.hostname.clone())
+        && let Ok(mut cfg) = config::load()
+        && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network_name)
+        && net.my_hostname.as_deref() != Some(mine.as_str())
+    {
+        net.my_hostname = Some(mine);
+        let _ = config::save(&cfg);
     }
 }
 
@@ -4573,6 +4728,8 @@ async fn join_mesh_shared(
     net_pubkey: EndpointId,
     device_cert: Option<control::DeviceCert>,
     device_user_map: peers::DeviceUserMap,
+    hostname_table: dns::HostnameTable,
+    reverse_table: dns::ReverseLookupTable,
     invite_secret: Option<Vec<u8>>,
     initial: bool,
 ) -> Result<JoinResult> {
@@ -4817,6 +4974,9 @@ async fn join_mesh_shared(
         let peers_c = peers.clone();
         let endpoint_c = ep.clone();
         let shared_acl_ctrl = shared_acl.clone();
+        let hostname_table_c = hostname_table.clone();
+        let reverse_table_c = reverse_table.clone();
+        let my_identity_c = my_identity;
         async move {
             loop {
                 tokio::select! {
@@ -4833,15 +4993,17 @@ async fn join_mesh_shared(
                                     }
                                     Ok(ControlMsg::MemberSync { members }) => {
                                         tracing::info!(count = members.len(), "member list updated");
-                                        let snap_bytes = {
+                                        let (snap_bytes, roster) = {
                                             let mut s = live_state.write().unwrap();
                                             s.members = MemberList::from_members(members);
                                             s.refresh_snapshot();
-                                            s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+                                            let roster: Vec<Member> = s.members.all().into_iter().cloned().collect();
+                                            (s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()), roster)
                                         };
                                         if let Some(bytes) = snap_bytes {
                                             let _ = blob_store.blobs().add_slice(&bytes).await;
                                         }
+                                        apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
                                     }
                                     Ok(ControlMsg::BlobUpdated { hash }) => {
                                         tracing::info!(hash = %hash, "received blob update");
@@ -4867,11 +5029,15 @@ async fn join_mesh_shared(
                                             match crate::membership::verify_group_blob(&bytes, &hash) {
                                                 Ok(data) => {
                                                     shared_acl_ctrl.set(&network_name, data.acl.clone());
-                                                    let mut s = live_state.write().unwrap();
-                                                    s.members = MemberList::from_members(data.members);
-                                                    s.approved = ApprovedList::from_entries(data.approved);
-                                                    s.acl = data.acl;
-                                                    s.refresh_snapshot();
+                                                    let roster = {
+                                                        let mut s = live_state.write().unwrap();
+                                                        s.members = MemberList::from_members(data.members);
+                                                        s.approved = ApprovedList::from_entries(data.approved);
+                                                        s.acl = data.acl;
+                                                        s.refresh_snapshot();
+                                                        s.members.all().into_iter().cloned().collect::<Vec<Member>>()
+                                                    };
+                                                    apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
                                                     tracing::info!("group blob updated");
                                                 }
                                                 Err(e) => tracing::warn!(error = %e, "group blob verification failed"),

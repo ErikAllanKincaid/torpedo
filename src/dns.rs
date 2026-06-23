@@ -97,6 +97,33 @@ pub async fn remove_hostname_by_ip(
     }
 }
 
+/// Replace all hostname entries for a network with `entries`, rebuilding the
+/// reverse-lookup entries to match. Used when a roster update (MemberSync or
+/// group blob) arrives so renamed, added, and removed peers all reflect
+/// immediately — the roster is the single source of truth for DNS.
+pub async fn sync_network_hostnames(
+    table: &HostnameTable,
+    reverse: &ReverseLookupTable,
+    network: &str,
+    entries: &[(String, Ipv4Addr, Ipv6Addr)],
+) {
+    let mut t = table.write().await;
+    // Drop reverse entries for the network's previous set before rebuilding.
+    if let Some(old) = t.get(network) {
+        for (_, (v4, v6)) in old.iter() {
+            reverse.remove(&IpAddr::V4(*v4));
+            reverse.remove(&IpAddr::V6(*v6));
+        }
+    }
+    let mut hosts = HashMap::with_capacity(entries.len());
+    for (name, v4, v6) in entries {
+        hosts.insert(name.clone(), (*v4, *v6));
+        reverse.insert(IpAddr::V4(*v4), (name.clone(), network.to_string()));
+        reverse.insert(IpAddr::V6(*v6), (name.clone(), network.to_string()));
+    }
+    t.insert(network.to_string(), hosts);
+}
+
 /// Remove all hostnames for a network from both tables.
 pub async fn remove_network(table: &HostnameTable, reverse: &ReverseLookupTable, network: &str) {
     let mut t = table.write().await;
@@ -532,6 +559,44 @@ mod tests {
             result.map(|(v4, _)| v4),
             Some(Ipv4Addr::new(100, 64, 10, 5))
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_network_hostnames_rename_and_remove() {
+        let table = new_hostname_table();
+        let reverse = new_reverse_table();
+        let v6 = |n: u16| Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, n);
+        let alice_v4 = Ipv4Addr::new(100, 64, 10, 5);
+        let bob_v4 = Ipv4Addr::new(100, 64, 10, 6);
+
+        // Initial roster: alice + bob.
+        sync_network_hostnames(
+            &table,
+            &reverse,
+            "net",
+            &[
+                ("alice".to_string(), alice_v4, v6(1)),
+                ("bob".to_string(), bob_v4, v6(2)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            resolve_name("alice.net.ray", SUFFIX, &table).await.map(|(v4, _)| v4),
+            Some(alice_v4)
+        );
+        assert_eq!(reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()), Some("alice".to_string()));
+
+        // alice renames to dario; bob leaves.
+        sync_network_hostnames(&table, &reverse, "net", &[("dario".to_string(), alice_v4, v6(1))]).await;
+        assert_eq!(
+            resolve_name("dario.net.ray", SUFFIX, &table).await.map(|(v4, _)| v4),
+            Some(alice_v4)
+        );
+        // Old name and departed peer no longer resolve; reverse is rebuilt.
+        assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
+        assert_eq!(resolve_name("bob.net.ray", SUFFIX, &table).await, None);
+        assert_eq!(reverse.get(&IpAddr::V4(bob_v4)).map(|e| e.0.clone()), None);
+        assert_eq!(reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()), Some("dario".to_string()));
     }
 
     #[tokio::test]

@@ -103,6 +103,15 @@ pub enum ControlMsg {
     BlobUpdated {
         hash: blake3::Hash,
     },
+    /// Coordinator grants the per-network secret key to another member, making it
+    /// a co-coordinator (can publish the signed blob / suggest firewall rules).
+    /// Sent over the network's authenticated mesh ALPN, so only the targeted peer
+    /// receives it. The recipient stores the key and spawns a publisher.
+    AdminGrant {
+        network_pubkey: EndpointId,
+        /// 32-byte per-network secret key (`SecretKey::to_bytes`).
+        secret_key: [u8; 32],
+    },
     FileOffer {
         from: EndpointId,
         filename: String,
@@ -321,6 +330,21 @@ mod tests {
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_admin_grant() {
+        let key = test_key(7);
+        let msg = ControlMsg::AdminGrant {
+            network_pubkey: test_id(1),
+            secret_key: key.to_bytes(),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+        if let ControlMsg::AdminGrant { secret_key, .. } = decoded {
+            assert_eq!(SecretKey::from(secret_key).public(), key.public());
+        }
     }
 
     fn test_key(seed: u8) -> SecretKey {

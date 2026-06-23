@@ -122,6 +122,12 @@ pub struct NetworkConfig {
     /// --allow-trusted`. Only meaningful on a `trusted` network.
     #[serde(default)]
     pub allow_trusted: bool,
+    /// Identities this coordinator has granted the per-network secret key to
+    /// (`ray admin add`). Local tracking only — the key is shared and not
+    /// attributable, so this is the coordinator's record of grants, not a
+    /// verifiable roster. Never published in the GroupBlob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admins: Vec<EndpointId>,
 }
 
 fn default_true() -> bool {
@@ -240,6 +246,7 @@ mod tests {
                     transport: None,
                     trusted: false,
                     allow_trusted: false,
+                    admins: vec![],
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -253,6 +260,7 @@ mod tests {
                     transport: None,
                     trusted: false,
                     allow_trusted: false,
+                    admins: vec![],
                 },
             ],
             ..Default::default()
@@ -287,6 +295,7 @@ mod tests {
             transport: None,
             trusted: false,
             allow_trusted: false,
+            admins: vec![],
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -309,6 +318,7 @@ mod tests {
                 transport: None,
                 trusted: false,
                 allow_trusted: false,
+                admins: vec![],
             }],
             ..Default::default()
         };
@@ -324,6 +334,7 @@ mod tests {
             transport: None,
             trusted: false,
             allow_trusted: false,
+            admins: vec![],
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -350,6 +361,7 @@ mod tests {
                     transport: None,
                     trusted: false,
                     allow_trusted: false,
+                    admins: vec![],
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -363,6 +375,7 @@ mod tests {
                     transport: None,
                     trusted: false,
                     allow_trusted: false,
+                    admins: vec![],
                 },
             ],
             ..Default::default()
@@ -404,6 +417,7 @@ mod tests {
                 transport: None,
                 trusted: false,
                 allow_trusted: false,
+                admins: vec![],
             }],
             ..Default::default()
         };
@@ -430,6 +444,7 @@ mod tests {
                 transport: None,
                 trusted: false,
                 allow_trusted: false,
+                admins: vec![],
             }],
             ..Default::default()
         };

@@ -1148,6 +1148,10 @@ impl DaemonState {
             IpcMessage::Requests { network } => self.list_requests(&network),
             IpcMessage::AcceptRequest { network, id } => self.accept_request(&network, &id).await,
             IpcMessage::DenyRequest { network, id } => self.deny_request(&network, &id),
+            IpcMessage::AdminAdd { network, identity } => {
+                self.admin_add(&network, &identity).await
+            }
+            IpcMessage::AdminList { network } => self.admin_list(&network),
             other => IpcMessage::Error {
                 message: format!("unexpected message: {:?}", other),
             },
@@ -1312,6 +1316,7 @@ impl DaemonState {
                 transport: None,
                 trusted,
                 allow_trusted: false,
+                admins: vec![],
             },
         );
         config::save(&app_config)?;
@@ -2147,6 +2152,7 @@ impl DaemonState {
                 transport: None,
                 trusted: false,
                 allow_trusted: false,
+                admins: vec![],
             },
         );
         config::save(&app_config)?;
@@ -3140,6 +3146,121 @@ impl DaemonState {
                 message: format!("no pending request matching '{id_prefix}'"),
             },
         }
+    }
+
+    /// Coordinator-only: grant the per-network secret key to a member over an
+    /// authenticated mesh stream, making it a co-coordinator (can publish /
+    /// suggest firewall rules). The key is shared (shared-key model), so this is
+    /// a transfer of publish capability, not an attributable delegation. The
+    /// grant is recorded locally for `ray admin list`.
+    async fn admin_add(&self, network: &str, identity_str: &str) -> IpcMessage {
+        let Some(identity) = self.resolve_short_id_any_network(identity_str) else {
+            return IpcMessage::Error {
+                message: format!(
+                    "could not resolve identity '{identity_str}' (use a short id of a joined member)"
+                ),
+            };
+        };
+        let (net_pubkey, net_secret_key) = match self.networks.get(network) {
+            Some(h) => {
+                let key = {
+                    let s = h.state.read().unwrap();
+                    s.network_secret_key.clone()
+                };
+                if key.is_none() {
+                    return IpcMessage::Error {
+                        message: "only a coordinator (network key holder) can grant admin".to_string(),
+                    };
+                }
+                (h.network_key, key)
+            }
+            None => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            }
+        };
+        let Some(net_secret_key) = net_secret_key else {
+            return IpcMessage::Error {
+                message: "network key not available".to_string(),
+            };
+        };
+
+        // The target must be a member of this network. Open a fresh stream over
+        // the network's ALPN (already peer-authenticated by iroh's TLS).
+        let alpn = transport::network_alpn(&net_pubkey);
+        let conn = match transport::connect_to_peer_with_alpn(&self.endpoint, identity, &alpn).await {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("could not reach {identity}: {e}"),
+                };
+            }
+        };
+        let grant = ControlMsg::AdminGrant {
+            network_pubkey: net_pubkey,
+            secret_key: net_secret_key.to_bytes(),
+        };
+        match conn.open_bi().await {
+            Ok((mut send, _)) => match control::send_msg(&mut send, &grant).await {
+                Ok(()) => {}
+                Err(e) => {
+                    return IpcMessage::Error {
+                        message: format!("failed to send admin grant: {e}"),
+                    };
+                }
+            },
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to open stream to {identity}: {e}"),
+                };
+            }
+        }
+
+        // Record the grant locally (coordinator's record; not verifiable).
+        if let Ok(mut cfg) = config::load()
+            && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network)
+            && !net.admins.contains(&identity)
+        {
+            net.admins.push(identity);
+            let _ = config::save(&cfg);
+        }
+        IpcMessage::Ok {
+            message: format!("granted network key to {}", identity.fmt_short()),
+        }
+    }
+
+    /// List this network's key-holders: the local node (if it holds the key) plus
+    /// every identity it has granted the key to (`ray admin add`).
+    fn admin_list(&self, network: &str) -> IpcMessage {
+        let self_id = self.endpoint.id();
+        let mut admins = Vec::new();
+        let self_holds_key = match self.networks.get(network) {
+            Some(h) => h.state.read().unwrap().network_secret_key.is_some(),
+            None => false,
+        };
+        if self_holds_key {
+            admins.push(ipc::AdminInfo {
+                short_id: self_id.fmt_short().to_string(),
+                self_node: true,
+            });
+        }
+        if let Ok(cfg) = config::load()
+            && let Some(net) = cfg.networks.iter().find(|n| n.name == network)
+        {
+            for id in &net.admins {
+                admins.push(ipc::AdminInfo {
+                    short_id: id.fmt_short().to_string(),
+                    self_node: false,
+                });
+            }
+        }
+        if !self_holds_key && admins.is_empty() {
+            return IpcMessage::Error {
+                message: format!("network '{network}' not found or not a coordinator"),
+            };
+        }
+        IpcMessage::AdminListResponse { admins }
     }
 
     /// Store the current group snapshot as a blob and re-publish the pkarr record
@@ -4175,6 +4296,70 @@ fn spawn_network_publisher(
     })
 }
 
+/// A polling publisher for a *granted* co-coordinator (a member that received
+/// the network key via `AdminGrant`). Unlike [`spawn_network_publisher`] (which
+/// is notify-driven and spawned at create/restore time), this is spawned at
+/// runtime when a member is promoted: it has no `dht_notify` handle, so it
+/// re-reads the snapshot hash every few seconds and republishes on change.
+/// Latency is bounded by `LAZY_PUBLISH_INTERVAL`; members' 60s group poller is
+/// the downstream backstop regardless.
+#[allow(clippy::too_many_arguments)]
+fn spawn_lazy_publisher(
+    client: PkarrRelayClient,
+    net_secret_key: SecretKey,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    endpoint_id: EndpointId,
+    peers: PeerTable,
+    network_name: String,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    const LAZY_PUBLISH_INTERVAL: Duration = Duration::from_secs(10);
+    tokio::spawn(async move {
+        let mut last_hash: Option<blake3::Hash> = None;
+        loop {
+            let hash = {
+                let s = state.read().unwrap();
+                s.snapshot
+                    .as_ref()
+                    .map(|snap| snap.hash)
+                    .unwrap_or_else(|| {
+                        group_blob_hash(
+                            &s.members,
+                            &s.approved,
+                            s.trusted,
+                            &s.suggested_firewall,
+                            s.network_name.as_deref(),
+                        )
+                    })
+            };
+            if last_hash != Some(hash) {
+                let mut seed_peers: Vec<EndpointId> = peers
+                    .peers_for_network(&network_name)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                seed_peers.push(endpoint_id);
+                seed_peers.sort_by_key(|id| id.to_string());
+                seed_peers.dedup();
+                match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            network = %network_name,
+                            "lazy publisher: published network record"
+                        );
+                        last_hash = Some(hash);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "lazy publisher: publish failed"),
+                }
+            }
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(LAZY_PUBLISH_INTERVAL) => {},
+            }
+        }
+    })
+}
+
 /// Materialize this node's suggested firewall rules for `network` from the
 /// verified blob state, then either install them (replacing the prior
 /// `Network(net)` set, leaving `Local` rules untouched) when the network is
@@ -4762,6 +4947,7 @@ async fn join_mesh_shared(
             transport: None,
             trusted,
             allow_trusted,
+            admins: vec![],
         },
     );
     config::save(&app_config)?;
@@ -4893,6 +5079,7 @@ async fn join_mesh_shared(
         let reverse_table_c = reverse_table.clone();
         let firewall_c = firewall.clone();
         let my_identity_c = my_identity;
+        let net_pubkey_c = net_pubkey;
         async move {
             loop {
                 tokio::select! {
@@ -4962,6 +5149,52 @@ async fn join_mesh_shared(
                                                 }
                                                 Err(e) => tracing::warn!(error = %e, "group blob verification failed"),
                                             }
+                                        }
+                                    }
+                                    Ok(ControlMsg::AdminGrant { network_pubkey, secret_key }) => {
+                                        // Coordinator granted us the per-network key.
+                                        // Verify it targets this network (the stream is
+                                        // already ALPN-scoped, but defense in depth).
+                                        if network_pubkey != net_pubkey_c {
+                                            tracing::warn!(
+                                                peer = %remote_id.fmt_short(),
+                                                "admin grant for a different network; ignoring"
+                                            );
+                                            continue;
+                                        }
+                                        let key = SecretKey::from(secret_key);
+                                        // Persist + take local publish capability.
+                                        if let Ok(mut cfg) = config::load()
+                                            && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network_name)
+                                        {
+                                            net.network_secret_key = Some(key.clone());
+                                            let _ = config::save(&cfg);
+                                        }
+                                        let endpoint_id = endpoint_c.id();
+                                        {
+                                            let mut s = live_state.write().unwrap();
+                                            s.network_secret_key = Some(key.clone());
+                                            if let Some(m) = s.members.get_mut(&my_identity_c) {
+                                                m.is_coordinator = true;
+                                            }
+                                            s.refresh_snapshot();
+                                        }
+                                        // Spawn a lazy publisher (this node can now
+                                        // publish the signed blob / suggest rules).
+                                        if let Ok(client) = dht::create_pkarr_client(&endpoint_c) {
+                                            spawn_lazy_publisher(
+                                                client,
+                                                key,
+                                                live_state.clone(),
+                                                endpoint_id,
+                                                peers_c.clone(),
+                                                network_name.clone(),
+                                                token.clone(),
+                                            );
+                                            tracing::info!(
+                                                network = %network_name,
+                                                "promoted to co-coordinator; lazy publisher started"
+                                            );
                                         }
                                     }
                                     Ok(_) => {}

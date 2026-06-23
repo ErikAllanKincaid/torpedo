@@ -190,6 +190,15 @@ enum Command {
         /// Short id of the pending peer (from `ray requests`)
         id: String,
     },
+    /// Grant the network key to a member (coordinator only). The grantee becomes
+    /// a co-coordinator: it can publish the signed blob and suggest firewall
+    /// rules. Trusted-network multi-admin.
+    Admin {
+        /// Network name
+        network: String,
+        #[command(subcommand)]
+        action: AdminAction,
+    },
     /// Manage local device firewall rules
     Firewall {
         #[command(subcommand)]
@@ -268,6 +277,17 @@ enum PairAction {
         /// The encrypted backup string
         backup: String,
     },
+}
+
+#[derive(Subcommand)]
+enum AdminAction {
+    /// Grant the network key to a member (coordinator only)
+    Add {
+        /// Short id of the member to promote (from `ray status`)
+        identity: String,
+    },
+    /// List this network's key-holders (the local node + granted members)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -614,6 +634,7 @@ async fn main() -> Result<()> {
         Command::Requests { network } => ipc_requests(&network).await,
         Command::Accept { network, id } => ipc_accept_request(&network, &id).await,
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
+        Command::Admin { network, action } => ipc_admin(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Mdns { state } => cmd_mdns(&state),
@@ -1292,6 +1313,36 @@ async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
     .await?;
     match ipc::recv(&mut stream).await? {
         ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
+        other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn ipc_admin(network: &str, action: AdminAction) -> Result<()> {
+    let req = match action {
+        AdminAction::Add { identity } => ipc::IpcMessage::AdminAdd {
+            network: network.to_string(),
+            identity,
+        },
+        AdminAction::List => ipc::IpcMessage::AdminList {
+            network: network.to_string(),
+        },
+    };
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, req).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::AdminListResponse { admins } => {
+            if admins.is_empty() {
+                println!("No admins recorded.");
+            } else {
+                for a in admins {
+                    let me = if a.self_node { " (self)" } else { "" };
+                    println!("  {}{}", style::bold(&a.short_id), me);
+                }
+            }
+        }
         ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }

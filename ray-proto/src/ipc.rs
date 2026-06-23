@@ -165,6 +165,17 @@ pub enum IpcMessage {
         network: String,
         id: String,
     },
+    /// Coordinator-only: grant the per-network secret key to a member, making it
+    /// a co-coordinator (can publish / suggest firewall rules).
+    AdminAdd {
+        network: String,
+        identity: String,
+    },
+    /// List the identities this coordinator has granted the network key to
+    /// (plus itself). Open read.
+    AdminList {
+        network: String,
+    },
 
     // Responses
     Ok {
@@ -239,6 +250,19 @@ pub enum IpcMessage {
     PendingRequests {
         requests: Vec<PendingRequestInfo>,
     },
+    /// The list of network key-holders (reply to `AdminList`): the local node
+    /// plus every identity it has granted the key to.
+    AdminListResponse {
+        admins: Vec<AdminInfo>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminInfo {
+    /// Short id of the key-holder.
+    pub short_id: String,
+    /// `true` if this is the local node.
+    pub self_node: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

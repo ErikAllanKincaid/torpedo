@@ -3,11 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Bytes, BytesMut};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::net::UnixStream;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
 use crate::{GroupMode, SuggestedFirewall, TransportMode};
 
@@ -342,11 +342,39 @@ pub enum ConnType {
     Unknown,
 }
 
-pub struct MsgpackCodec<T>(PhantomData<T>);
+/// Maximum IPC frame size (body). Matches the previous hand-rolled guard;
+/// `LengthDelimitedCodec` rejects anything larger so a malformed/hostile peer
+/// can't make us allocate an unbounded buffer.
+const MAX_FRAME_LEN: usize = 1_048_576;
+
+/// A codec that frames msgpack-serialized `T`s using tokio's
+/// [`LengthDelimitedCodec`] (a 4-byte big-endian length prefix — the wire format
+/// is unchanged, so this stays compatible with the previous hand-rolled
+/// framing). Framing is delegated to the battle-tested tokio codec; this layer
+/// only does the msgpack (de)serialization on top of each length-delimited
+/// frame.
+///
+/// Structs are serialized with `to_vec_named` (field-name maps, not positional
+/// arrays) — required for correctness when a struct uses `skip_serializing_if`:
+/// with positional arrays, skipping a field shifts later fields into the wrong
+/// slot on decode (e.g. `HostSuggestions` with `default: None` + non-empty
+/// `allows` misaligns and fails with "invalid type: map, expected a string").
+/// The decoder (`from_slice`) handles both named and unnamed representations,
+/// so it's forward-compatible with older peers.
+pub struct MsgpackCodec<T> {
+    framed: LengthDelimitedCodec,
+    _t: PhantomData<T>,
+}
 
 impl<T> MsgpackCodec<T> {
     pub fn new() -> Self {
-        Self(PhantomData)
+        Self {
+            framed: LengthDelimitedCodec::builder()
+                .length_field_length(4)
+                .max_frame_length(MAX_FRAME_LEN)
+                .new_codec(),
+            _t: PhantomData,
+        }
     }
 }
 
@@ -360,9 +388,10 @@ impl<T: Serialize> Encoder<T> for MsgpackCodec<T> {
     type Error = anyhow::Error;
 
     fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<()> {
-        let body = rmp_serde::to_vec(&item).context("serialize IPC message")?;
-        dst.put_u32(body.len() as u32);
-        dst.extend_from_slice(&body);
+        let body = rmp_serde::to_vec_named(&item).context("serialize IPC message")?;
+        self.framed
+            .encode(Bytes::from(body), dst)
+            .context("frame IPC message")?;
         Ok(())
     }
 }
@@ -372,19 +401,12 @@ impl<T: DeserializeOwned> Decoder for MsgpackCodec<T> {
     type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<T>> {
-        if src.len() < 4 {
-            return Ok(None);
+        match self.framed.decode(src).context("frame IPC message")? {
+            Some(frame) => Ok(Some(
+                rmp_serde::from_slice(&frame).context("decode IPC message")?,
+            )),
+            None => Ok(None),
         }
-        let len = u32::from_be_bytes(src[..4].try_into().unwrap()) as usize;
-        anyhow::ensure!(len <= 1_048_576, "IPC message too large");
-        if src.len() < 4 + len {
-            return Ok(None);
-        }
-        src.advance(4);
-        let body = src.split_to(len);
-        Ok(Some(
-            rmp_serde::from_slice(&body).context("decode IPC message")?,
-        ))
     }
 }
 
@@ -440,6 +462,56 @@ mod tests {
                 assert_eq!(mode, GroupMode::Open);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn firewall_suggest_roundtrips_through_named_codec() {
+        // Regression: with positional-array (`to_vec`) serialization, a
+        // `HostSuggestions` whose `default` is `None` (skipped) but whose
+        // `allows` is non-empty misaligns on decode and fails with
+        // "invalid type: map, expected a string". The codec must serialize
+        // structs as named maps so `skip_serializing_if` is safe.
+        use crate::policy::HostSuggestions;
+        use std::collections::BTreeMap;
+
+        let mut fw: SuggestedFirewall = BTreeMap::new();
+        fw.insert(
+            "alpha".to_string(),
+            HostSuggestions {
+                default: Some("deny".to_string()),
+                allows: [("beta".to_string(), "22".to_string())].into(),
+                denies: BTreeMap::new(),
+            },
+        );
+        // The triggering case: `default: None` + non-empty `allows`.
+        fw.insert(
+            "gamma".to_string(),
+            HostSuggestions {
+                default: None,
+                allows: [("alpha".to_string(), "8080".to_string())].into(),
+                denies: BTreeMap::new(),
+            },
+        );
+        let msg = IpcMessage::FirewallSuggest {
+            network: "net1".to_string(),
+            suggestions: fw,
+        };
+
+        let mut codec = MsgpackCodec::<IpcMessage>::new();
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+
+        let decoded = codec.decode(&mut buf).unwrap().expect("frame not complete");
+        match decoded {
+            IpcMessage::FirewallSuggest { network, suggestions } => {
+                assert_eq!(network, "net1");
+                assert_eq!(suggestions.len(), 2);
+                let gamma = suggestions.get("gamma").unwrap();
+                assert_eq!(gamma.default, None);
+                assert_eq!(gamma.allows.get("alpha").map(|s| s.as_str()), Some("8080"));
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

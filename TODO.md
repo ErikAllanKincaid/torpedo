@@ -152,6 +152,23 @@ Foundational but not blocking the MVP demo. Land before you have users who'd be 
 
 ## Tier 4 — Hardening (DEMOTED — after the protocol stops moving)
 
+- [ ] **Automated e2e test pyramid (CI-gating)** — currently the only e2e scenarios are
+  manual Scaleway runs, absent from CI. Two new tiers:
+  - **Tier 1 — mock-TUN data-path tests** (`cargo test`, deterministic, no root): thin
+    `TunRead`/`TunWrite` trait seam in `src/tun.rs` so the real `forward.rs` path can be
+    driven with injected packets + a fake `PeerTable`. Asserts routing (v4/v6), firewall
+    enforcement (deny/whitelist/network-scoped), oversized drops, conntrack return traffic.
+  - **Tier 2 — Docker e2e** (`ubuntu-latest`, `--cap-add NET_ADMIN,NET_RAW --device
+    /dev/net/tun`): each node a container on a user-defined bridge (auto-NAT egress so real
+    pkarr/relay work; mDNS direct-connect over the bridge). `docker exec` swaps in for the
+    Scaleway `ssh` transport in `tests/lib/common.sh`. Scenarios: port device-cert +
+    connect, plus coordinator-offline reconnect, multi-homed + per-net firewall, and
+    leave/nuke/rename convergence. Reliability rule: no `sleep` asserts — poll real
+    end-state (`ray status --json`); wrap the one external step (`join`'s pkarr lookup) in
+    bounded retries.
+  - **Rejected:** mocking the iroh transport (no loopback in iroh 1.0.0; ~2-3wk fragile
+    custom transport that *hides* the real connection — the thing most worth testing).
+  - Full design: `~/.claude/plans/let-s-brainstorm-how-it-playful-ladybug.md`
 - [ ] **Deterministic network simulator (TigerBeetle-style VOPR)**
   - Premature as a *next* item: multi-month sink to harden a committed protocol
   - For now: targeted tests for the one thing you doubt — membership/ACL convergence

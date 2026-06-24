@@ -1006,6 +1006,10 @@ pub struct NetworkHandle {
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
     invite_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Disconnect channel for this network's accept handlers, kept so a member
+    /// promoted to coordinator (via `AdminGrant`) can re-register a
+    /// [`CoordinatorAcceptState`] on the live channel without rebuilding it.
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -1037,6 +1041,13 @@ pub struct DaemonState {
     active: Arc<AtomicBool>,
     /// The system-DNS configurator owned while active, so `Down` can revert it.
     dns_configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
+    /// Promotion signal: a co-coordinator's per-peer control reader sends the
+    /// network name here after persisting an `AdminGrant` key, and the main
+    /// daemon loop ([`serve_ipc`]) drains it into
+    /// [`DaemonState::promote_to_coordinator`]. The reader holds only field
+    /// clones (not the full `DaemonState`), so it can't promote itself — hence
+    /// the channel hand-off to the loop that does hold the `Arc<DaemonState>`.
+    promote_tx: mpsc::Sender<String>,
 }
 
 /// Map key-holding status to a [`NetworkRole`].
@@ -1050,6 +1061,14 @@ fn role_for_key_holder(holds_network_key: bool) -> NetworkRole {
     } else {
         NetworkRole::Member
     }
+}
+
+/// Whether a network in `current` role should be (re-)registered as coordinator.
+///
+/// A member promoted via `AdminGrant` must swap to the coordinator accept
+/// handler; a network already running as coordinator is a no-op.
+fn should_promote(current: NetworkRole) -> bool {
+    !current.is_coordinator()
 }
 
 impl DaemonState {
@@ -1110,6 +1129,39 @@ impl DaemonState {
         if let Some(mut handle) = self.networks.get_mut(network) {
             handle.role = NetworkRole::Coordinator;
         }
+    }
+
+    /// Re-register the [`CoordinatorAcceptState`] for `network` so a node just
+    /// granted the per-network key (via `AdminGrant`) can admit fresh joiners
+    /// instead of silently dropping their `JoinRequest`s under
+    /// `AcceptHandler::Member`.
+    ///
+    /// Idempotent: a network already running as coordinator is left untouched
+    /// ([`should_promote`]). The needed [`NetworkHandle`] fields are cloned
+    /// inside a scoped block so the `DashMap` ref is dropped before the
+    /// (synchronous) registration — never held across it.
+    async fn promote_to_coordinator(&self, network: &str) {
+        let parts = {
+            let Some(h) = self.networks.get(network) else {
+                return;
+            };
+            if !should_promote(h.role.clone()) {
+                return;
+            }
+            (
+                h.state.clone(),
+                h.invite_lock.clone(),
+                h.dht_notify.clone(),
+                h.network_key,
+                h.disconnect_tx.clone(),
+                h.cancel.clone(),
+            )
+        }; // DashMap ref dropped before the registration below.
+        self.register_coordinator_handler(
+            network, parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,
+        );
+        self.refresh_alpns().await;
+        tracing::info!(network, "promoted to coordinator accept handler");
     }
 
     /// Tailscale-style access control. Read-only queries are open to any local
@@ -1509,6 +1561,7 @@ impl DaemonState {
             cancel: cancel.clone(),
             tasks,
             invite_lock: invite_lock.clone(),
+            disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.clone(), handle);
 
@@ -1748,6 +1801,7 @@ impl DaemonState {
             data.reusable_keys.clone(),
             auto_accept_firewall,
             initial,
+            self.promote_tx.clone(),
         )
         .await?
         {
@@ -1777,7 +1831,7 @@ impl DaemonState {
                     invite_lock,
                     None,
                     net_public_key,
-                    disconnect_tx,
+                    disconnect_tx.clone(),
                     cancel.clone(),
                 );
             }
@@ -1789,7 +1843,7 @@ impl DaemonState {
                         state: state.clone(),
                         peers: self.peers.clone(),
                         tun_tx: self.tun_tx.clone(),
-                        disconnect_tx,
+                        disconnect_tx: disconnect_tx.clone(),
                         token: cancel.clone(),
                         stats: self.stats.clone(),
                         blob_store: self.blob_store.clone(),
@@ -1856,6 +1910,7 @@ impl DaemonState {
             cancel,
             tasks,
             invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            disconnect_tx,
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns().await;
@@ -2096,6 +2151,7 @@ impl DaemonState {
                 cancel,
                 tasks,
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                disconnect_tx,
             };
             self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns().await;
@@ -2475,6 +2531,7 @@ impl DaemonState {
             cancel,
             tasks,
             invite_lock,
+            disconnect_tx,
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_alpns().await;
@@ -4449,13 +4506,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     check_cgnat_conflict()?;
 
-    let (daemon, _metrics_server) = build_daemon(token.clone(), stats).await?;
+    let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
 
     // Start active by default so a fresh boot behaves like before; `ray up` /
     // `ray down` toggle this at runtime without restarting the process.
     daemon.activate(None).await;
 
-    serve_ipc(&daemon, token).await
+    serve_ipc(&daemon, promote_rx, token).await
 }
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
@@ -4469,6 +4526,7 @@ async fn build_daemon(
 ) -> Result<(
     Arc<DaemonState>,
     Option<iroh_metrics::service::MetricsServer>,
+    mpsc::Receiver<String>,
 )> {
     // --- Identity (persistent transport key + optional device certificate) ---
     let key = identity::load_or_create()?;
@@ -4565,6 +4623,9 @@ async fn build_daemon(
         key.clone(),
         pairing_secret.clone(),
     ));
+    // Promotion channel: a co-coordinator's control reader signals the main
+    // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
+    let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
         identity,
@@ -4586,6 +4647,7 @@ async fn build_daemon(
         device_user_map,
         active: Arc::new(AtomicBool::new(false)),
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
+        promote_tx,
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
@@ -4594,7 +4656,7 @@ async fn build_daemon(
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
-    Ok((daemon, metrics_server))
+    Ok((daemon, metrics_server, promote_rx))
 }
 
 /// Spawn the Magic DNS resolver on `127.0.0.1:53`. Non-fatal: if the socket
@@ -4692,7 +4754,11 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
-async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Result<()> {
+async fn serve_ipc(
+    daemon: &Arc<DaemonState>,
+    mut promote_rx: mpsc::Receiver<String>,
+    token: CancellationToken,
+) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -4711,6 +4777,13 @@ async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Resul
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
+            }
+            // A co-coordinator just persisted an `AdminGrant` key: swap its
+            // accept handler to coordinator so it can admit fresh joiners.
+            // Idempotent and quick (a synchronous handler swap), so running it
+            // inline in the loop is fine.
+            Some(net) = promote_rx.recv() => {
+                daemon.promote_to_coordinator(&net).await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
@@ -5449,6 +5522,10 @@ async fn join_mesh_shared(
     // Consent: auto-install suggested rules without a manual review queue.
     auto_accept_firewall: bool,
     initial: bool,
+    // Promotion signal: the per-peer control reader sends this network's name
+    // here after persisting an `AdminGrant` key, so the daemon loop can swap in
+    // the coordinator accept handler (see `DaemonState::promote_to_coordinator`).
+    promote_tx: mpsc::Sender<String>,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -5711,6 +5788,7 @@ async fn join_mesh_shared(
         let firewall_c = firewall.clone();
         let my_identity_c = my_identity;
         let net_pubkey_c = net_pubkey;
+        let promote_tx = promote_tx.clone();
         async move {
             loop {
                 tokio::select! {
@@ -5790,6 +5868,14 @@ async fn join_mesh_shared(
                                                 "promoted to co-coordinator; lazy publisher started"
                                             );
                                         }
+                                        // Signal the daemon loop to swap this
+                                        // network's accept handler to coordinator
+                                        // so it can admit fresh joiners (not just
+                                        // welcome pre-approved peers). The loop
+                                        // holds the `Arc<DaemonState>` this task
+                                        // does not. Best-effort: a closed channel
+                                        // only means the daemon is shutting down.
+                                        let _ = promote_tx.send(network_name.clone()).await;
                                     }
                                     Ok(_) => {}
                                     Err(_) => {}
@@ -6083,5 +6169,12 @@ mod accept_handler_tests {
     fn holds_key_implies_coordinator_role() {
         assert_eq!(role_for_key_holder(true), NetworkRole::Coordinator);
         assert_eq!(role_for_key_holder(false), NetworkRole::Member);
+    }
+
+    #[test]
+    fn promote_is_idempotent_decision() {
+        // Re-registering an already-coordinator network is a no-op decision.
+        assert!(should_promote(NetworkRole::Member));
+        assert!(!should_promote(NetworkRole::Coordinator));
     }
 }

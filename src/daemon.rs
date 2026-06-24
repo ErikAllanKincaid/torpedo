@@ -243,7 +243,7 @@ impl CoordinatorAcceptState {
                 }
                 Err(e) => {
                     tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "invite rejected");
-                    self.deny(send, format!("invite rejected: {e}")).await;
+                    self.deny(&conn, send, format!("invite rejected: {e}")).await;
                 }
             }
             return;
@@ -272,13 +272,18 @@ impl CoordinatorAcceptState {
                 tracing::info!(peer = %remote_id.fmt_short(), ip = %peer_ip, "join queued for approval");
                 let mut send = send;
                 let _ = control::send_msg(&mut send, &ControlMsg::JoinPending).await;
+                // We return (dropping `conn`) right after; wait for the joiner
+                // to read JoinPending so the connection isn't torn down first.
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
             }
         }
     }
 
-    /// Reply on the joiner's stream that the join was refused.
-    async fn deny(&self, mut send: iroh::endpoint::SendStream, reason: String) {
+    /// Reply on the joiner's stream that the join was refused, then wait for the
+    /// joiner to close so the JoinDenied flushes before `conn` is dropped.
+    async fn deny(&self, conn: &Connection, mut send: iroh::endpoint::SendStream, reason: String) {
         let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     }
 
     /// Admit a non-member peer into the network: assign hostname/IP, add to the
@@ -319,6 +324,7 @@ impl CoordinatorAcceptState {
             };
             if trusted && taken.iter().any(|h| h == &desired) {
                 self.deny(
+                    &conn,
                     send,
                     format!("hostname '{desired}' is already in use on this trusted network"),
                 )
@@ -343,7 +349,7 @@ impl CoordinatorAcceptState {
             }
         };
         if collision {
-            self.deny(send, format!("IP collision: {peer_ip} already assigned"))
+            self.deny(&conn, send, format!("IP collision: {peer_ip} already assigned"))
                 .await;
             return false;
         }
@@ -3337,7 +3343,11 @@ impl DaemonState {
         };
         match conn.open_bi().await {
             Ok((mut send, _)) => match control::send_msg(&mut send, &grant).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    // The grant connection is dropped when this handler returns;
+                    // wait for the grantee to read it so it flushes first.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                }
                 Err(e) => {
                     return IpcMessage::Error {
                         message: format!("failed to send admin grant: {e}"),
@@ -3786,7 +3796,8 @@ impl DaemonState {
                             message: format!("failed to send offer: {e}"),
                         };
                     }
-                    let _ = send.finish();
+                    // send_msg already finished the stream; wait for the peer to
+                    // read the offer so it flushes before this `conn` is dropped.
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {

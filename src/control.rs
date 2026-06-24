@@ -143,6 +143,14 @@ pub async fn send_msg(stream: &mut SendStream, msg: &ControlMsg) -> Result<()> {
         .write_all(&data)
         .await
         .context("send control message")?;
+    // Finish the stream so the FIN flushes the message. The protocol sends
+    // exactly one message per bidirectional stream (the reader does
+    // `accept_bi → recv_msg` in a loop), so finishing here is always correct.
+    // Without it, dropping the `SendStream` resets it (RESET_STREAM) and the
+    // peer loses any data not yet acknowledged — e.g. roster broadcasts sent
+    // over a persistent connection. (Delivery before a *connection* drop still
+    // needs the caller to wait on `conn.closed()`.)
+    let _ = stream.finish();
     Ok(())
 }
 

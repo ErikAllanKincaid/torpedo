@@ -1114,6 +1114,18 @@ fn role_for_key_holder(holds_network_key: bool) -> NetworkRole {
     }
 }
 
+/// Whether an `AdminGrant`'s key is genuinely this network's key.
+///
+/// Self-authenticating admission of the granted key: we adopt it only if its
+/// public half equals the network pubkey. An attacker who does not already hold
+/// the real secret cannot forge a key that passes, so a forged `AdminGrant`
+/// from a non-coordinator member is rejected without any roster lookup (and so
+/// without depending on reconverge timing for the granter's `is_coordinator`
+/// flag, which a sender-identity check would).
+fn admin_grant_key_valid(secret_key: [u8; 32], net_pubkey: EndpointId) -> bool {
+    SecretKey::from(secret_key).public() == net_pubkey
+}
+
 /// Whether a network in `current` role should be (re-)registered as coordinator.
 ///
 /// A member promoted via `AdminGrant` must swap to the coordinator accept
@@ -6218,6 +6230,20 @@ async fn join_mesh_shared(
                                             );
                                             continue;
                                         }
+                                        // Self-authenticating: only adopt a key
+                                        // that genuinely is this network's key
+                                        // (its public half must equal the network
+                                        // pubkey). Defeats a forged AdminGrant
+                                        // from a non-coordinator member without
+                                        // relying on reconverge timing for the
+                                        // granter's is_coordinator flag.
+                                        if !admin_grant_key_valid(secret_key, net_pubkey_c) {
+                                            tracing::warn!(
+                                                peer = %remote_id.fmt_short(),
+                                                "admin grant key does not match network pubkey; ignoring"
+                                            );
+                                            continue;
+                                        }
                                         let key = SecretKey::from(secret_key);
                                         // Persist + take local publish capability.
                                         if let Ok(mut cfg) = config::load()
@@ -6625,6 +6651,35 @@ mod coordinator_dial_order_tests {
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
         assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
+    }
+
+    #[test]
+    fn admin_grant_key_accepted_only_when_public_matches_network() {
+        // The real network key: its public half is the network pubkey.
+        let net_secret = iroh::SecretKey::from({
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        });
+        let net_pubkey = net_secret.public();
+
+        // A genuine grant carries the real secret → accepted.
+        assert!(super::admin_grant_key_valid(
+            net_secret.to_bytes(),
+            net_pubkey
+        ));
+
+        // A forged grant carries an attacker-chosen key whose public half does
+        // not match the network pubkey → rejected (no roster lookup needed).
+        let forged = iroh::SecretKey::from({
+            let mut b = [0u8; 32];
+            b[0] = 7;
+            b
+        });
+        assert!(!super::admin_grant_key_valid(
+            forged.to_bytes(),
+            net_pubkey
+        ));
     }
 
     #[test]

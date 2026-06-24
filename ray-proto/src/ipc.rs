@@ -479,16 +479,13 @@ mod tests {
         fw.insert(
             "alpha".to_string(),
             HostSuggestions {
-                default: Some("deny".to_string()),
                 allows: [("beta".to_string(), "22".to_string())].into(),
                 denies: BTreeMap::new(),
             },
         );
-        // The triggering case: `default: None` + non-empty `allows`.
         fw.insert(
             "gamma".to_string(),
             HostSuggestions {
-                default: None,
                 allows: [("alpha".to_string(), "8080".to_string())].into(),
                 denies: BTreeMap::new(),
             },
@@ -508,7 +505,6 @@ mod tests {
                 assert_eq!(network, "net1");
                 assert_eq!(suggestions.len(), 2);
                 let gamma = suggestions.get("gamma").unwrap();
-                assert_eq!(gamma.default, None);
                 assert_eq!(gamma.allows.get("alpha").map(|s| s.as_str()), Some("8080"));
             }
             other => panic!("wrong variant: {other:?}"),

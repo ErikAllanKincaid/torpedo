@@ -1524,8 +1524,13 @@ async fn ipc_apply(
         anyhow::bail!("a spec file path is required (or use --example to print a template)");
     };
     let spec = apply::load(std::path::Path::new(&spec_path))?;
-    if spec.is_empty() {
+    if spec.networks.is_empty() {
         anyhow::bail!("spec contains no networks");
+    }
+    // A non-trusted spec may only create networks — firewall suggestions ride a
+    // trusted blob, so reject them up front rather than failing per-network.
+    if !spec.trusted && spec.networks.values().any(|fw| !fw.is_empty()) {
+        anyhow::bail!("firewall suggestions require `trusted: true`");
     }
     if dry_run {
         println!("{}", style::bold("Spec (normalized):"));
@@ -1541,16 +1546,17 @@ async fn ipc_apply(
 
     let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
 
-    for (net_name, net_spec) in &spec {
+    for (net_name, net_firewall) in &spec.networks {
         let is_active = active_names.contains(net_name.as_str());
         // B2 — create-if-absent.
         if !is_active {
             println!(
-                "{} {}: creating trusted network",
+                "{} {}: creating {} network",
                 style::label("apply"),
-                style::bold(net_name)
+                style::bold(net_name),
+                if spec.trusted { "trusted" } else { "closed" }
             );
-            if let Err(e) = ipc_create_trusted(net_name).await {
+            if let Err(e) = ipc_apply_create(net_name, spec.trusted).await {
                 eprintln!("{}  create failed: {e}", style::red("  !"));
                 continue;
             }
@@ -1565,23 +1571,22 @@ async fn ipc_apply(
         // B2 — publish suggestions (idempotent). With --prune, publish exactly
         // the spec's set; without it, merge into the live set (so `apply` never
         // silently drops subjects authored out-of-band — use --prune for that).
-        let to_publish = if prune {
-            net_spec.firewall.clone()
-        } else {
-            let mut live = ipc_firewall_suggestions_get(net_name).await.unwrap_or_default();
-            // Merge spec subjects over live (spec wins on conflict).
-            for (subj, rules) in &net_spec.firewall {
-                live.insert(subj.clone(), rules.clone());
-            }
-            live
-        };
-        match ipc_firewall_suggest_set(net_name, to_publish).await {
-            Ok(msg) => println!("{}   {msg}", style::faint("→")),
-            Err(e) => {
-                eprintln!("{}   suggest failed: {e}", style::red("  !"));
-                if !net_spec.trusted {
-                    eprintln!("{}    network is not trusted; recreate with --trusted", style::faint(""));
+        // Non-trusted specs only create networks (validated above to carry no
+        // firewall blocks), so there is nothing to publish.
+        if spec.trusted {
+            let to_publish = if prune {
+                net_firewall.clone()
+            } else {
+                let mut live = ipc_firewall_suggestions_get(net_name).await.unwrap_or_default();
+                // Merge spec subjects over live (spec wins on conflict).
+                for (subj, rules) in net_firewall {
+                    live.insert(subj.clone(), rules.clone());
                 }
+                live
+            };
+            match ipc_firewall_suggest_set(net_name, to_publish).await {
+                Ok(msg) => println!("{}   {msg}", style::faint("→")),
+                Err(e) => eprintln!("{}   suggest failed: {e}", style::red("  !")),
             }
         }
 
@@ -1643,7 +1648,7 @@ async fn ipc_status_networks() -> Result<Vec<ipc::NetworkStatus>> {
     }
 }
 
-async fn ipc_create_trusted(name: &str) -> Result<()> {
+async fn ipc_apply_create(name: &str, trusted: bool) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send(
         &mut stream,
@@ -1652,7 +1657,7 @@ async fn ipc_create_trusted(name: &str) -> Result<()> {
             name: Some(name.to_string()),
             hostname: None,
             transport: None,
-            trusted: true,
+            trusted,
         },
     )
     .await?;

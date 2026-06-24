@@ -17,6 +17,15 @@ pub const FILES_ALPN: &[u8] = b"rayfish/files/1";
 /// addressed to this node's contact key.
 pub const CONNECT_ALPN: &[u8] = b"rayfish/connect/1";
 
+/// Fixed UDP port the endpoint binds so users can port-forward a stable, known
+/// port for guaranteed direct reachability (Tailscale-style). Unlike an ephemeral
+/// port, this stays the same across daemon restarts, so a manual router forward
+/// keeps working and the external NAT mapping doesn't churn. iroh still does
+/// automatic NAT traversal (UPnP/NAT-PMP/PCP), discovery, and relay fallback on
+/// top of this. If the port is already taken, the endpoint falls back to an
+/// ephemeral port (see `create_endpoint_with_alpns`).
+pub const RAYFISH_LISTEN_PORT: u16 = 41383;
+
 pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
     let full = network_pubkey.to_string();
     let prefix = &full[..full.len().min(16)];
@@ -31,18 +40,51 @@ pub async fn create_endpoint_with_alpns(
     alpns: Vec<Vec<u8>>,
     tor: bool,
 ) -> Result<Endpoint> {
+    // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
+    // port across restarts. The builder is consumed by `.bind()`, so we rebuild
+    // it for the ephemeral fallback. Falling back keeps the `0.0.0.0:0` guarantee
+    // that the daemon always starts even if the fixed port is already in use.
+    let fixed = format!("0.0.0.0:{RAYFISH_LISTEN_PORT}");
+    let ep = match bind_endpoint(&secret_key, &alpns, tor, &fixed).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            tracing::warn!(
+                port = RAYFISH_LISTEN_PORT,
+                error = %e,
+                "fixed UDP port unavailable; falling back to an ephemeral port"
+            );
+            bind_endpoint(&secret_key, &alpns, tor, "0.0.0.0:0")
+                .await
+                .context("failed to bind iroh endpoint")?
+        }
+    };
+
+    tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
+
+    Ok(ep)
+}
+
+/// Builds and binds an iroh endpoint at `bind` with the N0 preset and (when
+/// requested + compiled in) the Tor custom transport. Factored out so the caller
+/// can retry with a different bind address after a port collision.
+async fn bind_endpoint(
+    secret_key: &SecretKey,
+    alpns: &[Vec<u8>],
+    tor: bool,
+    bind: &str,
+) -> Result<Endpoint> {
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key.clone())
-        .alpns(alpns)
+        .alpns(alpns.to_vec())
         .clear_ip_transports()
-        .bind_addr("0.0.0.0:0")
+        .bind_addr(bind)
         .context("invalid bind address")?;
 
     #[cfg(feature = "tor")]
     if tor {
         let tor_transport = iroh_tor_transport::TorCustomTransport::builder()
-            .build(secret_key)
+            .build(secret_key.clone())
             .await
             .context("failed to create Tor transport — is Tor running with ControlPort 9051?")?;
         builder = builder
@@ -58,14 +100,7 @@ pub async fn create_endpoint_with_alpns(
         anyhow::bail!("Tor support requires building with --features tor");
     }
 
-    let ep = builder
-        .bind()
-        .await
-        .context("failed to bind iroh endpoint")?;
-
-    tracing::info!(id = %ep.id().fmt_short(), "iroh endpoint ready");
-
-    Ok(ep)
+    builder.bind().await.context("failed to bind iroh endpoint")
 }
 
 #[allow(dead_code)]

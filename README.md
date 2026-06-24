@@ -19,7 +19,7 @@ ping alice.gaming.ray      # reach each other by name
 - **No infrastructure.** There's no control server to host or trust. Peers find each other through a DHT and connect directly; the only "server" is whoever ran `ray create`, and they can be offline once everyone's admitted.
 - **Identity, not IP.** Every machine has a cryptographic identity, and its addresses are *derived* from that identity — stable, collision-free, and assigned without any coordinator handing them out.
 - **Private by default.** Networks are closed unless you say otherwise. The code you share to *discover* a network isn't enough to *join* it.
-- **It just works over NAT.** Hole-punching and end-to-end encryption come from [iroh](https://iroh.computer). When a direct path isn't possible (~10% of the time), traffic falls back to encrypted relays.
+- **It just works over NAT.** Hole-punching and end-to-end encryption come from [iroh](https://iroh.computer), including automatic port mapping (UPnP/NAT-PMP/PCP). When a direct path isn't possible (~10% of the time), traffic falls back to encrypted relays. For routers that block automatic port mapping, the daemon listens on a **fixed UDP port (41383)** you can manually forward to guarantee a direct path. (A manual forward maps the port to one machine, so only one node per LAN benefits; the others still use automatic traversal and relay fallback.)
 - **Reach peers by name.** Magic DNS gives you `name.network.ray` so you never memorize a virtual IP.
 
 ## How it works

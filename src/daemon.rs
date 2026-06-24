@@ -104,10 +104,15 @@ struct CoordinatorAcceptState {
 impl CoordinatorAcceptState {
     async fn handle_connection(&self, conn: Connection) {
         let remote_id = conn.remote_id();
-        let peer_ip = self.identity.derive_ip(&remote_id);
 
-        // Known member reconnecting
-        let is_member = self.state.read().unwrap().members.is_member(&remote_id);
+        // Known member reconnecting: reuse its roster IP (which carries any
+        // collision_index), not a fresh index-0 derivation.
+        let member_ip = {
+            let s = self.state.read().unwrap();
+            s.members.get(&remote_id).map(|m| m.ip)
+        };
+        let peer_ip = member_ip.unwrap_or_else(|| self.identity.derive_ip(&remote_id));
+        let is_member = member_ip.is_some();
         if is_member {
             tracing::info!(ip = %peer_ip, "known member reconnecting");
             crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
@@ -134,6 +139,7 @@ impl CoordinatorAcceptState {
             let dht_notify_ctrl = self.dht_notify.clone();
             let token_ctrl = token.clone();
             let network_ctrl = network.clone();
+            let invite_lock_ctrl = self.invite_lock.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn).await;
                 spawn_coordinator_control_reader(
@@ -149,6 +155,7 @@ impl CoordinatorAcceptState {
                     blob_store_ctrl,
                     dht_notify_ctrl,
                     token_ctrl,
+                    invite_lock_ctrl,
                 );
                 forward::spawn_peer_reader(
                     conn,
@@ -252,6 +259,29 @@ impl CoordinatorAcceptState {
                         if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
                             let _ = store.restore(&secret);
                         }
+                    } else {
+                        // Tell the other coordinators this single-use invite is
+                        // spent so their ledgers burn it too. Hash only, no secret.
+                        let secret_hash = crate::invite::hash_secret(&secret);
+                        let members: Vec<crate::membership::Member> = self
+                            .state
+                            .read()
+                            .unwrap()
+                            .members
+                            .all()
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        gossip_to_coordinators(
+                            &self.peers,
+                            &self.network_name,
+                            &members,
+                            self.identity.local_identity(),
+                            &ControlMsg::InviteUsed {
+                                secret_hash: secret_hash.into_bytes(),
+                            },
+                        )
+                        .await;
                     }
                 }
                 Err(single_use_err) => {
@@ -340,7 +370,7 @@ impl CoordinatorAcceptState {
         conn: Connection,
         mut send: iroh::endpoint::SendStream,
         remote_id: EndpointId,
-        peer_ip: Ipv4Addr,
+        _suggested_ip: Ipv4Addr,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         was_approved: bool,
@@ -349,6 +379,15 @@ impl CoordinatorAcceptState {
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
     ) -> bool {
+        // Assign the IP authoritatively from the current roster: lowest free
+        // collision index whose derived IPv4 isn't already held by a *different*
+        // identity. This (not the peer-suggested address) is what we store and
+        // report back, so two coordinators that both admit at index 0 produce a
+        // roster the reconverge tiebreak can resolve deterministically.
+        let (peer_ip, collision_index) = {
+            let s = self.state.read().unwrap();
+            crate::membership::assign_ip(&s.members, &remote_id)
+        };
         // Resolve the hostname. An authoritative (invite-bound) name already bound
         // to a different identity is rejected. A joiner-chosen name keeps
         // collision resolution (`name` → `name-1` → …).
@@ -410,6 +449,7 @@ impl CoordinatorAcceptState {
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
+                collision_index,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -488,6 +528,7 @@ impl CoordinatorAcceptState {
             self.blob_store.clone(),
             self.dht_notify.clone(),
             self.token.clone(),
+            self.invite_lock.clone(),
         );
         forward::spawn_peer_reader(
             conn,
@@ -594,20 +635,30 @@ impl MemberAcceptState {
             .await;
         }
         if is_approved {
-            let snap_bytes = {
+            let (snap_bytes, ip) = {
                 let mut s = self.state.write().unwrap();
-                s.approved.remove(&peer_identity);
+                let approved_entry = s.approved.remove(&peer_identity);
                 let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+                // Trust the authoritative IP + collision index recorded when the
+                // peer was approved, not the peer-supplied MeshHello.ip.
+                let (member_ip, member_idx) = approved_entry
+                    .as_ref()
+                    .map(|e| (e.ip, e.collision_index))
+                    .unwrap_or((ip, 0));
                 let _ = s.members.add(Member {
                     identity: peer_identity,
-                    ip,
+                    ip: member_ip,
                     is_coordinator: false,
                     hostname: final_hostname.clone(),
                     user_identity: user_id_opt,
                     device_cert: device_cert.clone(),
+                    collision_index: member_idx,
                 });
                 s.refresh_snapshot();
-                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+                (
+                    s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()),
+                    member_ip,
+                )
             };
             if let Some(bytes) = snap_bytes {
                 let _ = self.blob_store.blobs().add_slice(&bytes).await;
@@ -686,6 +737,13 @@ impl MemberAcceptState {
 enum AcceptHandler {
     Coordinator(Arc<CoordinatorAcceptState>),
     Member(Arc<MemberAcceptState>),
+}
+
+#[cfg(test)]
+impl AcceptHandler {
+    fn is_coordinator(&self) -> bool {
+        matches!(self, AcceptHandler::Coordinator(_))
+    }
 }
 
 struct MeshProtocol {
@@ -999,6 +1057,10 @@ pub struct NetworkHandle {
     /// joins can't double-burn a single-use invite (TOCTOU on the toml file).
     /// Shared with this network's [`CoordinatorAcceptState`].
     invite_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Disconnect channel for this network's accept handlers, kept so a member
+    /// promoted to coordinator (via `AdminGrant`) can re-register a
+    /// [`CoordinatorAcceptState`] on the live channel without rebuilding it.
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
 }
 
 /// Shared, always-on daemon state. Cloned (via `Arc`) into every IPC handler
@@ -1030,6 +1092,46 @@ pub struct DaemonState {
     active: Arc<AtomicBool>,
     /// The system-DNS configurator owned while active, so `Down` can revert it.
     dns_configurator: Arc<std::sync::Mutex<Option<Box<dyn dns_config::DnsConfigurator>>>>,
+    /// Promotion signal: a co-coordinator's per-peer control reader sends the
+    /// network name here after persisting an `AdminGrant` key, and the main
+    /// daemon loop ([`serve_ipc`]) drains it into
+    /// [`DaemonState::promote_to_coordinator`]. The reader holds only field
+    /// clones (not the full `DaemonState`), so it can't promote itself — hence
+    /// the channel hand-off to the loop that does hold the `Arc<DaemonState>`.
+    promote_tx: mpsc::Sender<String>,
+}
+
+/// Map key-holding status to a [`NetworkRole`].
+///
+/// A node that holds the per-network secret key (original coordinator or one
+/// promoted via `ray admin add`) runs as `Coordinator`; all other nodes run
+/// as `Member`.
+fn role_for_key_holder(holds_network_key: bool) -> NetworkRole {
+    if holds_network_key {
+        NetworkRole::Coordinator
+    } else {
+        NetworkRole::Member
+    }
+}
+
+/// Whether an `AdminGrant`'s key is genuinely this network's key.
+///
+/// Self-authenticating admission of the granted key: we adopt it only if its
+/// public half equals the network pubkey. An attacker who does not already hold
+/// the real secret cannot forge a key that passes, so a forged `AdminGrant`
+/// from a non-coordinator member is rejected without any roster lookup (and so
+/// without depending on reconverge timing for the granter's `is_coordinator`
+/// flag, which a sender-identity check would).
+fn admin_grant_key_valid(secret_key: [u8; 32], net_pubkey: EndpointId) -> bool {
+    SecretKey::from(secret_key).public() == net_pubkey
+}
+
+/// Whether a network in `current` role should be (re-)registered as coordinator.
+///
+/// A member promoted via `AdminGrant` must swap to the coordinator accept
+/// handler; a network already running as coordinator is a no-op.
+fn should_promote(current: NetworkRole) -> bool {
+    !current.is_coordinator()
 }
 
 impl DaemonState {
@@ -1044,6 +1146,85 @@ impl DaemonState {
 
         let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
         dns_config::update_search_domains(&network_names, &self.tun_name).await;
+    }
+
+    /// Register a [`CoordinatorAcceptState`] handler for `network` and update
+    /// the network's role in `self.networks` to [`NetworkRole::Coordinator`].
+    ///
+    /// Calling this at create, restore, and admin-promotion sites keeps the
+    /// coordinator-registration logic in one place. The method is synchronous
+    /// (no `.await`) because `protocol_router.register` is a plain HashMap
+    /// swap; the caller is responsible for spawning the `disconnect_rx` cleanup
+    /// task **before** calling this so the channel is live when the first
+    /// incoming connection arrives.
+    #[allow(clippy::too_many_arguments)]
+    fn register_coordinator_handler(
+        &self,
+        network: &str,
+        state: Arc<std::sync::RwLock<NetworkState>>,
+        invite_lock: Arc<tokio::sync::Mutex<()>>,
+        dht_notify: Option<Arc<tokio::sync::Notify>>,
+        network_key: EndpointId,
+        disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+        cancel: CancellationToken,
+    ) {
+        self.protocol_router.register(
+            transport::network_alpn(&network_key),
+            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+                network_name: network.to_string(),
+                identity: self.identity.clone(),
+                state,
+                peers: self.peers.clone(),
+                tun_tx: self.tun_tx.clone(),
+                disconnect_tx,
+                token: cancel,
+                stats: self.stats.clone(),
+                dht_notify,
+                blob_store: self.blob_store.clone(),
+                firewall: self.firewall.clone(),
+                hostname_table: self.hostname_table.clone(),
+                reverse_table: self.reverse_table.clone(),
+                device_user_map: self.device_user_map.clone(),
+                invite_lock,
+            })),
+        );
+        // Flip the stored role so `ray status` reports Coordinator immediately.
+        if let Some(mut handle) = self.networks.get_mut(network) {
+            handle.role = NetworkRole::Coordinator;
+        }
+    }
+
+    /// Re-register the [`CoordinatorAcceptState`] for `network` so a node just
+    /// granted the per-network key (via `AdminGrant`) can admit fresh joiners
+    /// instead of silently dropping their `JoinRequest`s under
+    /// `AcceptHandler::Member`.
+    ///
+    /// Idempotent: a network already running as coordinator is left untouched
+    /// ([`should_promote`]). The needed [`NetworkHandle`] fields are cloned
+    /// inside a scoped block so the `DashMap` ref is dropped before the
+    /// (synchronous) registration — never held across it.
+    async fn promote_to_coordinator(&self, network: &str) {
+        let parts = {
+            let Some(h) = self.networks.get(network) else {
+                return;
+            };
+            if !should_promote(h.role.clone()) {
+                return;
+            }
+            (
+                h.state.clone(),
+                h.invite_lock.clone(),
+                h.dht_notify.clone(),
+                h.network_key,
+                h.disconnect_tx.clone(),
+                h.cancel.clone(),
+            )
+        }; // DashMap ref dropped before the registration below.
+        self.register_coordinator_handler(
+            network, parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,
+        );
+        self.refresh_alpns().await;
+        tracing::info!(network, "promoted to coordinator accept handler");
     }
 
     /// Tailscale-style access control. Read-only queries are open to any local
@@ -1302,6 +1483,7 @@ impl DaemonState {
                 hostname: Some(my_hostname.clone()),
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             })
             .expect("self-add cannot collide");
 
@@ -1432,41 +1614,31 @@ impl DaemonState {
             }),
         ));
 
-        // Register protocol handler for this network
-        self.protocol_router.register(
-            transport::network_alpn(&net_public_key),
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                network_name: name.clone(),
-                identity: self.identity.clone(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx,
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                dht_notify: Some(dht_notify.clone()),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-                invite_lock: invite_lock.clone(),
-            })),
-        );
-
-        // Update ALPNs
+        // Insert the handle first so register_coordinator_handler can update the role.
         let handle = NetworkHandle {
             name: name.clone(),
             network_key: net_public_key,
             role: NetworkRole::Coordinator,
             my_ip,
-            state,
-            dht_notify: Some(dht_notify),
-            cancel,
+            state: state.clone(),
+            dht_notify: Some(dht_notify.clone()),
+            cancel: cancel.clone(),
             tasks,
-            invite_lock,
+            invite_lock: invite_lock.clone(),
+            disconnect_tx: disconnect_tx.clone(),
         };
         self.networks.insert(name.clone(), handle);
+
+        // Register protocol handler for this network
+        self.register_coordinator_handler(
+            &name,
+            state,
+            invite_lock,
+            Some(dht_notify),
+            net_public_key,
+            disconnect_tx,
+            cancel,
+        );
         self.refresh_alpns().await;
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
@@ -1616,24 +1788,6 @@ impl DaemonState {
             anyhow::bail!("already in network '{display_name}'");
         }
 
-        // Admission always runs through the coordinator (only it can approve an
-        // unknown peer or redeem an invite). An invite pins the coordinator's id;
-        // otherwise it's the member flagged `is_coordinator` in the GroupBlob.
-        let coordinator_id = coordinator
-            .or_else(|| {
-                data.members
-                    .iter()
-                    .find(|m| m.is_coordinator)
-                    .map(|m| m.identity)
-            })
-            .context("no coordinator found in network record")?;
-        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-        let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
-            })?;
-
         let my_hostname = match hostname {
             Some(h) => {
                 anyhow::ensure!(
@@ -1648,81 +1802,249 @@ impl DaemonState {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let cancel = self.shutdown_token.child_token();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+        // Dial-fallback loop (fresh joins only): try each coordinator in order
+        // (minter first, then other coordinators from the blob) until one
+        // welcomes us. JoinPending means this coordinator accepted the request
+        // and queued it — stop here and let the caller retry with backoff.
+        // JoinDenied / unreachable → advance to the next coordinator.
+        // For reconnects/restores (initial=false) the coordinator speaks first,
+        // so we keep the existing single-coordinator path.
+        // One invite-ledger lock for this network, shared between the join's
+        // control listener (which may handle InviteShare/InviteUsed once this
+        // node is promoted to co-coordinator) and the coordinator handler we may
+        // register below — so all ledger access stays serialized.
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
 
-        let tasks = vec![spawn_reconnect_loop(
-            disconnect_rx,
-            self.endpoint.clone(),
-            alpn.clone(),
-            display_name.to_string(),
-            self.identity.local_identity(),
-            my_ip,
-            Some(my_hostname.clone()),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-            self.stats.clone(),
-            self.firewall.clone(),
-            self.device_cert.clone(),
-            self.device_user_map.clone(),
-        )];
-
-        let state = match join_mesh_shared(
-            conn,
-            &self.endpoint,
-            display_name,
-            &self.identity,
-            &alpn,
-            Some(my_hostname.clone()),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-            self.stats.clone(),
-            self.blob_store.clone(),
-            self.firewall.clone(),
-            net_pubkey,
-            self.device_cert.clone(),
-            self.device_user_map.clone(),
-            self.hostname_table.clone(),
-            self.reverse_table.clone(),
-            invite,
-            data.suggested_firewall.clone(),
-            data.reusable_keys.clone(),
-            auto_accept_firewall,
-            initial,
-        )
-        .await?
-        {
-            JoinResult::Joined(state) => state,
-            JoinResult::Pending => {
-                // Closed network: we've been queued for live approval. Stop the
-                // just-spawned reconnect loop (nothing is connected yet) and let
-                // the caller retry on a backoff until `ray accept` lets us in.
-                cancel.cancel();
-                return Ok(TryJoin::Pending);
+        let (state, cancel, disconnect_tx, tasks) = if initial {
+            let my_id = self.identity.local_identity();
+            // When there is no invite, use my own id as the nominal minter;
+            // coordinator_dial_order filters it out (minter != me check), so we
+            // simply get all coordinators from the blob in order.
+            let minter = coordinator.unwrap_or(my_id);
+            let order = coordinator_dial_order(minter, &data.members, my_id);
+            if order.is_empty() {
+                anyhow::bail!("no coordinator found in network record");
             }
-        };
 
-        self.protocol_router.register(
-            alpn.clone(),
-            AcceptHandler::Member(Arc::new(MemberAcceptState {
-                network_name: display_name.to_string(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx,
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-            })),
-        );
+            // Resources produced by a successful coordinator handshake.
+            type JoinResources = (
+                Arc<std::sync::RwLock<NetworkState>>,
+                CancellationToken,
+                mpsc::Sender<forward::DisconnectEvent>,
+                Vec<tokio::task::JoinHandle<()>>,
+            );
+            let mut last_err = anyhow::anyhow!("no coordinators tried");
+            let mut found: Option<JoinResources> = None;
+
+            for coordinator_id in &order {
+                let cancel = self.shutdown_token.child_token();
+                let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+                let tasks = vec![spawn_reconnect_loop(
+                    disconnect_rx,
+                    self.endpoint.clone(),
+                    alpn.clone(),
+                    display_name.to_string(),
+                    my_id,
+                    my_ip,
+                    Some(my_hostname.clone()),
+                    self.peers.clone(),
+                    self.tun_tx.clone(),
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                    self.stats.clone(),
+                    self.firewall.clone(),
+                    self.device_cert.clone(),
+                    self.device_user_map.clone(),
+                )];
+
+                tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+                let conn = match transport::connect_to_peer_with_alpn(&self.endpoint, *coordinator_id, &alpn).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        last_err = anyhow::anyhow!("coordinator offline: {e}");
+                        continue;
+                    }
+                };
+
+                match join_mesh_shared(
+                    conn,
+                    &self.endpoint,
+                    display_name,
+                    &self.identity,
+                    &alpn,
+                    Some(my_hostname.clone()),
+                    self.peers.clone(),
+                    self.tun_tx.clone(),
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                    self.stats.clone(),
+                    self.blob_store.clone(),
+                    self.firewall.clone(),
+                    net_pubkey,
+                    self.device_cert.clone(),
+                    self.device_user_map.clone(),
+                    self.hostname_table.clone(),
+                    self.reverse_table.clone(),
+                    invite.clone(),
+                    data.suggested_firewall.clone(),
+                    data.reusable_keys.clone(),
+                    auto_accept_firewall,
+                    true,
+                    self.promote_tx.clone(),
+                    invite_lock.clone(),
+                )
+                .await
+                {
+                    Ok(JoinResult::Joined(state)) => {
+                        found = Some((state, cancel, disconnect_tx, tasks));
+                        break;
+                    }
+                    Ok(JoinResult::Pending) => {
+                        // This coordinator queued the request — don't try the
+                        // next; let the caller retry with backoff until accepted.
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        return Ok(TryJoin::Pending);
+                    }
+                    Err(e) => {
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
+
+            match found {
+                Some(resources) => resources,
+                None => anyhow::bail!(
+                    "no coordinator admitted the join (tried {}): {last_err:#}",
+                    order.len()
+                ),
+            }
+        } else {
+            // Reconnect/restore: coordinator speaks first; pick the single
+            // coordinator from the blob (same as the original path).
+            let coordinator_id = coordinator
+                .or_else(|| {
+                    data.members
+                        .iter()
+                        .find(|m| m.is_coordinator)
+                        .map(|m| m.identity)
+                })
+                .context("no coordinator found in network record")?;
+            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+            let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
+                })?;
+
+            let cancel = self.shutdown_token.child_token();
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+            let tasks = vec![spawn_reconnect_loop(
+                disconnect_rx,
+                self.endpoint.clone(),
+                alpn.clone(),
+                display_name.to_string(),
+                self.identity.local_identity(),
+                my_ip,
+                Some(my_hostname.clone()),
+                self.peers.clone(),
+                self.tun_tx.clone(),
+                disconnect_tx.clone(),
+                cancel.clone(),
+                self.stats.clone(),
+                self.firewall.clone(),
+                self.device_cert.clone(),
+                self.device_user_map.clone(),
+            )];
+
+            let state = match join_mesh_shared(
+                conn,
+                &self.endpoint,
+                display_name,
+                &self.identity,
+                &alpn,
+                Some(my_hostname.clone()),
+                self.peers.clone(),
+                self.tun_tx.clone(),
+                disconnect_tx.clone(),
+                cancel.clone(),
+                self.stats.clone(),
+                self.blob_store.clone(),
+                self.firewall.clone(),
+                net_pubkey,
+                self.device_cert.clone(),
+                self.device_user_map.clone(),
+                self.hostname_table.clone(),
+                self.reverse_table.clone(),
+                invite,
+                data.suggested_firewall.clone(),
+                data.reusable_keys.clone(),
+                auto_accept_firewall,
+                false,
+                self.promote_tx.clone(),
+                invite_lock.clone(),
+            )
+            .await?
+            {
+                JoinResult::Joined(state) => state,
+                JoinResult::Pending => {
+                    // Closed network: we've been queued for live approval. Stop the
+                    // just-spawned reconnect loop (nothing is connected yet) and let
+                    // the caller retry on a backoff until `ray accept` lets us in.
+                    cancel.cancel();
+                    return Ok(TryJoin::Pending);
+                }
+            };
+            (state, cancel, disconnect_tx, tasks)
+        };
+        let state = state;
+
+        // A node that already holds the network secret key (e.g. a
+        // co-coordinator joining after a config-only restore) should run as
+        // Coordinator so it can admit future peers immediately — even though
+        // it arrived here via join rather than restore.
+        let held_key = state.read().unwrap().network_secret_key.clone();
+        let role = role_for_key_holder(held_key.is_some());
+        match role {
+            NetworkRole::Coordinator => {
+                let net_public_key = state.read().unwrap().network_public_key;
+                self.register_coordinator_handler(
+                    display_name,
+                    state.clone(),
+                    invite_lock.clone(),
+                    None,
+                    net_public_key,
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                );
+            }
+            NetworkRole::Member => {
+                self.protocol_router.register(
+                    alpn.clone(),
+                    AcceptHandler::Member(Arc::new(MemberAcceptState {
+                        network_name: display_name.to_string(),
+                        state: state.clone(),
+                        peers: self.peers.clone(),
+                        tun_tx: self.tun_tx.clone(),
+                        disconnect_tx: disconnect_tx.clone(),
+                        token: cancel.clone(),
+                        stats: self.stats.clone(),
+                        blob_store: self.blob_store.clone(),
+                        firewall: self.firewall.clone(),
+                        hostname_table: self.hostname_table.clone(),
+                        reverse_table: self.reverse_table.clone(),
+                        device_user_map: self.device_user_map.clone(),
+                    })),
+                );
+            }
+        }
 
         // Set the network public key on the state
         {
@@ -1777,7 +2099,8 @@ impl DaemonState {
             dht_notify: None,
             cancel,
             tasks,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock,
+            disconnect_tx,
         };
         self.networks.insert(display_name.to_string(), handle);
         self.refresh_alpns().await;
@@ -2018,6 +2341,7 @@ impl DaemonState {
                 cancel,
                 tasks,
                 invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+                disconnect_tx,
             };
             self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns().await;
@@ -2180,6 +2504,7 @@ impl DaemonState {
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
+                            collision_index: 0,
                         });
                     }
                     for entry in &nc.approved {
@@ -2189,6 +2514,7 @@ impl DaemonState {
                             hostname: entry.hostname.clone(),
                             user_identity: None,
                             device_cert: None,
+                            collision_index: 0,
                         };
                         let _ = approved_list.approve(ae, &member_list);
                     }
@@ -2204,6 +2530,7 @@ impl DaemonState {
                     hostname: persisted_hostname.clone(),
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 })
                 .expect("self-add cannot collide");
         }
@@ -2327,25 +2654,14 @@ impl DaemonState {
             }),
         ));
 
-        self.protocol_router.register(
-            transport::network_alpn(&net_public_key),
-            AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-                network_name: name.to_string(),
-                identity: self.identity.clone(),
-                state: state.clone(),
-                peers: self.peers.clone(),
-                tun_tx: self.tun_tx.clone(),
-                disconnect_tx: disconnect_tx.clone(),
-                token: cancel.clone(),
-                stats: self.stats.clone(),
-                dht_notify: Some(dht_notify.clone()),
-                blob_store: self.blob_store.clone(),
-                firewall: self.firewall.clone(),
-                hostname_table: self.hostname_table.clone(),
-                reverse_table: self.reverse_table.clone(),
-                device_user_map: self.device_user_map.clone(),
-                invite_lock: invite_lock.clone(),
-            })),
+        self.register_coordinator_handler(
+            name,
+            state.clone(),
+            invite_lock.clone(),
+            Some(dht_notify.clone()),
+            net_public_key,
+            disconnect_tx.clone(),
+            cancel.clone(),
         );
 
         // Register hostnames in DNS table
@@ -2408,6 +2724,7 @@ impl DaemonState {
             cancel,
             tasks,
             invite_lock,
+            disconnect_tx,
         };
         self.networks.insert(name.to_string(), handle);
         self.refresh_alpns().await;
@@ -3150,6 +3467,37 @@ impl DaemonState {
             Ok((secret, id)) => {
                 let code =
                     crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+                // Gossip the new invite (hash only, never the secret) to other
+                // coordinators so any of them can later redeem it. The wire field
+                // carries the hex hash's UTF-8 bytes; receivers decode back to the
+                // ledger's hex `String`.
+                let secret_hash = crate::invite::hash_secret(&secret);
+                let expires = now_secs().saturating_add(expires_secs);
+                if let Some(handle) = self.networks.get(network) {
+                    let members: Vec<crate::membership::Member> = handle
+                        .state
+                        .read()
+                        .unwrap()
+                        .members
+                        .all()
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    let me = self.endpoint.id();
+                    drop(handle);
+                    gossip_to_coordinators(
+                        &self.peers,
+                        network,
+                        &members,
+                        me,
+                        &ControlMsg::InviteShare {
+                            id: id.clone(),
+                            secret_hash: secret_hash.into_bytes(),
+                            expires,
+                        },
+                    )
+                    .await;
+                }
                 IpcMessage::InviteCreated {
                     code,
                     id,
@@ -3381,15 +3729,17 @@ impl DaemonState {
             };
         };
 
-        let ip = self.identity.derive_ip(&identity);
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
-        {
+        let ip = {
             let Some(handle) = self.networks.get(network) else {
                 return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
             let mut s = handle.state.write().unwrap();
+            // Assign authoritatively from the current roster so two coordinators
+            // accepting concurrently can be reconciled by the reconverge tiebreak.
+            let (ip, collision_index) = crate::membership::assign_ip(&s.members, &identity);
             let members = s.members.clone();
             let _ = s.approved.approve(
                 ApprovedEntry {
@@ -3398,11 +3748,13 @@ impl DaemonState {
                     hostname: pj.hostname.clone(),
                     user_identity: user_id,
                     device_cert: pj.device_cert.clone(),
+                    collision_index,
                 },
                 &members,
             );
             s.refresh_snapshot();
-        }
+            ip
+        };
         self.store_and_publish_group(network).await;
         broadcast_control_msg(
             &self.peers,
@@ -3533,6 +3885,20 @@ impl DaemonState {
                 };
             }
         }
+
+        // Publish the grantee as a coordinator in the signed group blob so
+        // joiners can discover co-coordinators to dial.
+        {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let mut s = handle.state.write().unwrap();
+            crate::membership::mark_coordinator(&mut s.members, &identity);
+            s.refresh_snapshot();
+        }
+        self.store_and_publish_group(network).await;
 
         // Record the grant locally (coordinator's record; not verifiable).
         if let Ok(mut cfg) = config::load()
@@ -4382,13 +4748,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
     check_cgnat_conflict()?;
 
-    let (daemon, _metrics_server) = build_daemon(token.clone(), stats).await?;
+    let (daemon, _metrics_server, promote_rx) = build_daemon(token.clone(), stats).await?;
 
     // Start active by default so a fresh boot behaves like before; `ray up` /
     // `ray down` toggle this at runtime without restarting the process.
     daemon.activate(None).await;
 
-    serve_ipc(&daemon, token).await
+    serve_ipc(&daemon, promote_rx, token).await
 }
 
 /// Construct all always-on daemon infrastructure: identity, iroh endpoint, blob
@@ -4402,6 +4768,7 @@ async fn build_daemon(
 ) -> Result<(
     Arc<DaemonState>,
     Option<iroh_metrics::service::MetricsServer>,
+    mpsc::Receiver<String>,
 )> {
     // --- Identity (persistent transport key + optional device certificate) ---
     let key = identity::load_or_create()?;
@@ -4498,6 +4865,9 @@ async fn build_daemon(
         key.clone(),
         pairing_secret.clone(),
     ));
+    // Promotion channel: a co-coordinator's control reader signals the main
+    // daemon loop to swap in the coordinator accept handler on `AdminGrant`.
+    let (promote_tx, promote_rx) = mpsc::channel::<String>(16);
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
         identity,
@@ -4519,6 +4889,7 @@ async fn build_daemon(
         device_user_map,
         active: Arc::new(AtomicBool::new(false)),
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
+        promote_tx,
     });
 
     // --- Accept loop (ALPN dispatch) + Prometheus metrics ---
@@ -4527,7 +4898,7 @@ async fn build_daemon(
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
-    Ok((daemon, metrics_server))
+    Ok((daemon, metrics_server, promote_rx))
 }
 
 /// Spawn the Magic DNS resolver on `127.0.0.1:53`. Non-fatal: if the socket
@@ -4625,7 +4996,11 @@ async fn spawn_metrics_server(
 /// `token` is cancelled. On shutdown, put the VPN on standby (revert DNS, drop
 /// connections, bring the TUN down) and remove the socket file. Each request is
 /// handled on its own task so a slow client can't block the accept loop.
-async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Result<()> {
+async fn serve_ipc(
+    daemon: &Arc<DaemonState>,
+    mut promote_rx: mpsc::Receiver<String>,
+    token: CancellationToken,
+) -> Result<()> {
     let socket_path = ipc::socket_path();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -4644,6 +5019,13 @@ async fn serve_ipc(daemon: &Arc<DaemonState>, token: CancellationToken) -> Resul
                 daemon.deactivate().await;
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
+            }
+            // A co-coordinator just persisted an `AdminGrant` key: swap its
+            // accept handler to coordinator so it can admit fresh joiners.
+            // Idempotent and quick (a synchronous handler swap), so running it
+            // inline in the loop is fine.
+            Some(net) = promote_rx.recv() => {
+                daemon.promote_to_coordinator(&net).await;
             }
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
@@ -4939,9 +5321,17 @@ async fn reconverge_and_apply(
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return;
     };
+    // Two coordinators can independently admit a fresh joiner at the same
+    // collision index, producing a roster with duplicate IPs. Resolve it
+    // deterministically (lowest identity keeps the slot, others re-roll) before
+    // it reaches the PeerTable/DNS so every node converges on the same map.
+    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
+    if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
+        tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
+    }
     let roster = {
         let mut s = state.write().unwrap();
-        s.members = MemberList::from_members(data.members.clone());
+        s.members = MemberList::from_members(tiebroken);
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
         s.refresh_snapshot();
@@ -4950,6 +5340,108 @@ async fn reconverge_and_apply(
     apply_roster_to_dns(&roster, network_name, my_identity, hostname_table, reverse_table).await;
     apply_suggested_firewall(firewall, my_identity, network_name, state);
     tracing::info!(network = %network_name, "reconverged from signed record");
+}
+
+/// Compute the order in which a joiner should dial coordinators.
+/// Returns the minter first (if present and not `me`), then every other
+/// `is_coordinator` member except `me`, de-duplicated, preserving order.
+/// Consumed by the join dial-fallback loop.
+fn coordinator_dial_order(
+    minter: EndpointId,
+    members: &[Member],
+    me: EndpointId,
+) -> Vec<EndpointId> {
+    let mut order = Vec::new();
+    let is_coord = |id: EndpointId| {
+        members
+            .iter()
+            .any(|m| m.identity == id && m.is_coordinator)
+    };
+    if minter != me && is_coord(minter) {
+        order.push(minter);
+    }
+    for m in members {
+        if m.is_coordinator && m.identity != me && !order.contains(&m.identity) {
+            order.push(m.identity);
+        }
+    }
+    order
+}
+
+/// Pick the peers to gossip single-use invite state to: every other
+/// `is_coordinator` member, excluding ourselves. Only coordinators (network-key
+/// holders) can admit, so only they need the shared invite ledger; a
+/// non-coordinator is never a target.
+fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<EndpointId> {
+    members
+        .iter()
+        .filter(|m| m.is_coordinator && m.identity != me)
+        .map(|m| m.identity)
+        .collect()
+}
+
+/// Whether `peer` is a coordinator in our verified roster. Invite-gossip arms
+/// (`InviteShare`/`InviteUsed`) act only on messages from a coordinator peer, so
+/// a non-coordinator member can't inject or burn invite state.
+fn sender_is_coordinator(
+    state: &Arc<std::sync::RwLock<NetworkState>>,
+    peer: EndpointId,
+) -> bool {
+    state
+        .read()
+        .unwrap()
+        .members
+        .all()
+        .iter()
+        .any(|m| m.identity == peer && m.is_coordinator)
+}
+
+/// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
+/// connection on `network`. Best-effort: a target without a live connection is
+/// skipped (it will reconverge invite state from a future share/redeem or, for
+/// reusable keys, the signed blob). Never carries the raw secret — only its hash.
+async fn gossip_to_coordinators(
+    peers: &PeerTable,
+    network: &str,
+    members: &[Member],
+    me: EndpointId,
+    msg: &ControlMsg,
+) {
+    let targets = gossip_targets(members, me);
+    if targets.is_empty() {
+        return;
+    }
+    for (eid, _ip, conn) in peers.peers_for_network_with_conn(network) {
+        if !targets.contains(&eid) {
+            continue;
+        }
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, msg).await;
+        }
+    }
+}
+
+/// Outcome of a single coordinator dial attempt during the join fallback loop.
+/// Used as a unit-testable specification of the loop termination policy.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(dead_code)]
+enum DialOutcome {
+    Welcomed,
+    Denied,
+    Unreachable,
+}
+
+/// Returns `(index_of_last_tried, welcomed)`.
+/// Iterates `outcomes` left-to-right and stops at the first `Welcomed`.
+/// If none is found, returns the index of the last element and `false`.
+#[allow(dead_code)]
+fn pick_first_welcome(outcomes: &[DialOutcome]) -> (usize, bool) {
+    for (i, o) in outcomes.iter().enumerate() {
+        if *o == DialOutcome::Welcomed {
+            return (i, true);
+        }
+    }
+    (outcomes.len().saturating_sub(1), false)
 }
 
 /// Last-known roster from persisted config. Used only as a fallback when the
@@ -4969,6 +5461,7 @@ fn persisted_roster(network_name: &str) -> Vec<Member> {
                     hostname: m.hostname,
                     user_identity: None,
                     device_cert: None,
+                    collision_index: 0,
                 })
                 .collect()
         })
@@ -5180,6 +5673,8 @@ fn spawn_coordinator_control_reader(
     blob_store: FsStore,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     token: CancellationToken,
+    // Serializes single-use invite ledger access for the invite-gossip arms.
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -5195,6 +5690,42 @@ fn spawn_coordinator_control_reader(
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            // Invite gossip from another coordinator: a co-coordinator that minted
+            // or redeemed an invite tells us so our ledger stays in sync. Honor it
+            // only from a coordinator peer in our verified roster.
+            match msg {
+                ControlMsg::InviteShare { id, secret_hash, expires } => {
+                    if !sender_is_coordinator(&state, remote_id) {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
+                        continue;
+                    }
+                    let Ok(hash) = String::from_utf8(secret_hash) else {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
+                        continue;
+                    };
+                    let _guard = invite_lock.lock().await;
+                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                        let _ = store.record_shared(id, hash, expires);
+                    }
+                    continue;
+                }
+                ControlMsg::InviteUsed { secret_hash } => {
+                    if !sender_is_coordinator(&state, remote_id) {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
+                        continue;
+                    }
+                    let Ok(hash) = String::from_utf8(secret_hash) else {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
+                        continue;
+                    };
+                    let _guard = invite_lock.lock().await;
+                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                        let _ = store.burn_by_hash(&hash);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let ControlMsg::MeshHello {
                 hostname,
                 device_cert,
@@ -5382,6 +5913,14 @@ async fn join_mesh_shared(
     // Consent: auto-install suggested rules without a manual review queue.
     auto_accept_firewall: bool,
     initial: bool,
+    // Promotion signal: the per-peer control reader sends this network's name
+    // here after persisting an `AdminGrant` key, so the daemon loop can swap in
+    // the coordinator accept handler (see `DaemonState::promote_to_coordinator`).
+    promote_tx: mpsc::Sender<String>,
+    // Guards the single-use invite ledger. Shared with the NetworkHandle so the
+    // control listener's `InviteShare`/`InviteUsed` handling (a co-coordinator
+    // learning of invites it didn't mint) is serialized with mint/redeem.
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -5644,6 +6183,8 @@ async fn join_mesh_shared(
         let firewall_c = firewall.clone();
         let my_identity_c = my_identity;
         let net_pubkey_c = net_pubkey;
+        let promote_tx = promote_tx.clone();
+        let invite_lock = invite_lock.clone();
         async move {
             loop {
                 tokio::select! {
@@ -5653,7 +6194,7 @@ async fn join_mesh_shared(
                             Ok((_send, mut recv)) => {
                                 match control::recv_msg(&mut recv).await {
                                     Ok(ControlMsg::MemberApproved { identity, ip, hostname, .. }) => {
-                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None };
+                                        let entry = ApprovedEntry { identity, ip, hostname, user_identity: None, device_cert: None, collision_index: 0 };
                                         let mut s = live_state.write().unwrap();
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
@@ -5686,6 +6227,20 @@ async fn join_mesh_shared(
                                             tracing::warn!(
                                                 peer = %remote_id.fmt_short(),
                                                 "admin grant for a different network; ignoring"
+                                            );
+                                            continue;
+                                        }
+                                        // Self-authenticating: only adopt a key
+                                        // that genuinely is this network's key
+                                        // (its public half must equal the network
+                                        // pubkey). Defeats a forged AdminGrant
+                                        // from a non-coordinator member without
+                                        // relying on reconverge timing for the
+                                        // granter's is_coordinator flag.
+                                        if !admin_grant_key_valid(secret_key, net_pubkey_c) {
+                                            tracing::warn!(
+                                                peer = %remote_id.fmt_short(),
+                                                "admin grant key does not match network pubkey; ignoring"
                                             );
                                             continue;
                                         }
@@ -5722,6 +6277,49 @@ async fn join_mesh_shared(
                                                 network = %network_name,
                                                 "promoted to co-coordinator; lazy publisher started"
                                             );
+                                        }
+                                        // Signal the daemon loop to swap this
+                                        // network's accept handler to coordinator
+                                        // so it can admit fresh joiners (not just
+                                        // welcome pre-approved peers). The loop
+                                        // holds the `Arc<DaemonState>` this task
+                                        // does not. Best-effort: a closed channel
+                                        // only means the daemon is shutting down.
+                                        let _ = promote_tx.send(network_name.clone()).await;
+                                    }
+                                    Ok(ControlMsg::InviteShare { id, secret_hash, expires }) => {
+                                        // Another coordinator minted a single-use
+                                        // invite; record its hash so we can redeem
+                                        // it too. Only honor it from a peer that is
+                                        // a coordinator in our verified roster.
+                                        if !sender_is_coordinator(&live_state, remote_id) {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
+                                            continue;
+                                        }
+                                        let Ok(hash) = String::from_utf8(secret_hash) else {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
+                                            continue;
+                                        };
+                                        let _guard = invite_lock.lock().await;
+                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                                            let _ = store.record_shared(id, hash, expires);
+                                        }
+                                    }
+                                    Ok(ControlMsg::InviteUsed { secret_hash }) => {
+                                        // Another coordinator redeemed a single-use
+                                        // invite; burn it locally so it can't be
+                                        // reused here. Coordinator-only.
+                                        if !sender_is_coordinator(&live_state, remote_id) {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
+                                            continue;
+                                        }
+                                        let Ok(hash) = String::from_utf8(secret_hash) else {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
+                                            continue;
+                                        };
+                                        let _guard = invite_lock.lock().await;
+                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                                            let _ = store.burn_by_hash(&hash);
                                         }
                                     }
                                     Ok(_) => {}
@@ -5930,5 +6528,195 @@ mod report_tests {
     fn test_collect_recent_logs_missing_dir_is_empty() {
         // The log dir may not exist in CI / non-root test runs; must not panic.
         let _ = collect_recent_logs();
+    }
+}
+
+#[cfg(test)]
+mod accept_handler_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    // Build a minimal NetworkState for use in test AcceptHandler construction.
+    fn make_network_state() -> Arc<std::sync::RwLock<NetworkState>> {
+        let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
+        let net_pub = net_secret.public();
+        Arc::new(std::sync::RwLock::new(NetworkState {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            snapshot: None,
+            network_secret_key: None,
+            network_public_key: net_pub,
+            network_name: Some("test-net".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        }))
+    }
+
+    async fn sample_coordinator_handler() -> AcceptHandler {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = FsStore::load(tmp.path()).await.unwrap();
+        let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
+        let my_key = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let my_id = my_key.public();
+        AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+            network_name: "test-net".to_string(),
+            identity: IrohIdentityProvider::new(my_id, 0),
+            state: make_network_state(),
+            peers: PeerTable::new(),
+            tun_tx,
+            disconnect_tx,
+            token: tokio_util::sync::CancellationToken::new(),
+            stats: Arc::new(ForwardMetrics::default()),
+            dht_notify: None,
+            blob_store,
+            firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
+            hostname_table: dns::new_hostname_table(),
+            reverse_table: dns::new_reverse_table(),
+            device_user_map: peers::DeviceUserMap::new(),
+            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }))
+    }
+
+    async fn sample_member_handler() -> AcceptHandler {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = FsStore::load(tmp.path()).await.unwrap();
+        let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
+        AcceptHandler::Member(Arc::new(MemberAcceptState {
+            network_name: "test-net".to_string(),
+            state: make_network_state(),
+            peers: PeerTable::new(),
+            tun_tx,
+            disconnect_tx,
+            token: tokio_util::sync::CancellationToken::new(),
+            stats: Arc::new(ForwardMetrics::default()),
+            blob_store,
+            firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
+            hostname_table: dns::new_hostname_table(),
+            reverse_table: dns::new_reverse_table(),
+            device_user_map: peers::DeviceUserMap::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn register_replaces_member_handler_with_coordinator() {
+        // AcceptHandler exposes whether it is the coordinator variant.
+        assert!(!sample_member_handler().await.is_coordinator());
+        assert!(sample_coordinator_handler().await.is_coordinator());
+    }
+
+    #[test]
+    fn holds_key_implies_coordinator_role() {
+        assert_eq!(role_for_key_holder(true), NetworkRole::Coordinator);
+        assert_eq!(role_for_key_holder(false), NetworkRole::Member);
+    }
+
+    #[test]
+    fn promote_is_idempotent_decision() {
+        // Re-registering an already-coordinator network is a no-op decision.
+        assert!(should_promote(NetworkRole::Member));
+        assert!(!should_promote(NetworkRole::Coordinator));
+    }
+}
+
+#[cfg(test)]
+mod coordinator_dial_order_tests {
+    use super::*;
+    use crate::membership::{derive_ip, Member};
+
+    fn test_id(seed: u8) -> EndpointId {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        let key = iroh::SecretKey::from(key_bytes);
+        key.public()
+    }
+
+    #[test]
+    fn dial_order_puts_minter_first_then_other_coordinators() {
+        let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+        };
+        let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
+        // minter = b: b first, then the other coordinator a, never c (not coord), never me.
+        assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
+    }
+
+    #[test]
+    fn admin_grant_key_accepted_only_when_public_matches_network() {
+        // The real network key: its public half is the network pubkey.
+        let net_secret = iroh::SecretKey::from({
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        });
+        let net_pubkey = net_secret.public();
+
+        // A genuine grant carries the real secret → accepted.
+        assert!(super::admin_grant_key_valid(
+            net_secret.to_bytes(),
+            net_pubkey
+        ));
+
+        // A forged grant carries an attacker-chosen key whose public half does
+        // not match the network pubkey → rejected (no roster lookup needed).
+        let forged = iroh::SecretKey::from({
+            let mut b = [0u8; 32];
+            b[0] = 7;
+            b
+        });
+        assert!(!super::admin_grant_key_valid(
+            forged.to_bytes(),
+            net_pubkey
+        ));
+    }
+
+    #[test]
+    fn gossip_targets_are_coordinator_peers_only() {
+        let (a, b, c) = (test_id(1), test_id(2), test_id(3));
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+        };
+        let members = vec![mk(a, true), mk(b, false), mk(c, true)];
+        let me = a;
+        // gossip to other coordinators only: c (not b, not me).
+        assert_eq!(super::gossip_targets(&members, me), vec![c]);
+    }
+}
+
+#[cfg(test)]
+mod dial_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn dial_fallback_stops_on_first_welcome() {
+        // outcomes simulate dialing in order: first errors, second welcomes, third never tried.
+        let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Welcomed, DialOutcome::Denied];
+        let (idx, welcomed) = pick_first_welcome(&outcomes);
+        assert_eq!((idx, welcomed), (1, true));
+    }
+
+    #[test]
+    fn dial_fallback_reports_failure_when_all_exhausted() {
+        let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Denied];
+        let (_idx, welcomed) = pick_first_welcome(&outcomes);
+        assert!(!welcomed);
     }
 }

@@ -121,6 +121,11 @@ pub enum ControlMsg {
         mime_type: String,
         blob_hash: blake3::Hash,
     },
+    /// Coordinator → coordinators: share a minted single-use invite's hash so any
+    /// coordinator can redeem it. Carries the hash only, never the secret.
+    InviteShare { id: String, secret_hash: Vec<u8>, expires: u64 },
+    /// Coordinator → coordinators: a shared single-use invite was redeemed; burn it.
+    InviteUsed { secret_hash: Vec<u8> },
 }
 
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
@@ -191,6 +196,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -285,6 +291,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             }],
             approved: vec![ApprovedEntry {
                 identity: test_id(2),
@@ -292,6 +299,7 @@ mod tests {
                 hostname: None,
                 user_identity: None,
                 device_cert: None,
+                collision_index: 0,
             }],
         };
         let bytes = encode_msg(&msg);
@@ -384,6 +392,17 @@ mod tests {
             assert!(c.verify());
         } else {
             panic!("expected MeshHello with cert");
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_invite_share_and_used() {
+        for msg in [
+            ControlMsg::InviteShare { id: "ab3f".into(), secret_hash: vec![1,2,3], expires: 42 },
+            ControlMsg::InviteUsed { secret_hash: vec![4,5,6] },
+        ] {
+            let bytes = encode_msg(&msg);
+            assert_eq!(decode_msg(&bytes).unwrap(), msg);
         }
     }
 }

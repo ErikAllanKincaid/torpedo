@@ -1,6 +1,6 @@
-name: Build Linux (RunsOn)
+name: Build Linux
 
-# Builds the `ray` binary for Linux on RunsOn self-hosted runners.
+# Builds the `ray` binary for Linux on GitHub-hosted runners.
 # Trigger manually from the Actions tab, or on push to master.
 on:
   push:
@@ -18,16 +18,15 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-x64/image=ubuntu22-full-x64/extras=s3-cache
+            runner: ubuntu-22.04
             name: ray-linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            runner: runs-on=${{ github.run_id }}/runner=64cpu-linux-arm64/image=ubuntu22-full-arm64/extras=s3-cache
+            runner: ubuntu-22.04-arm
             name: ray-linux-aarch64
 
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: runs-on/action@v2
       - uses: actions/checkout@v4
 
       - name: Install Rust

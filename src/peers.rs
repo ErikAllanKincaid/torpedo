@@ -79,6 +79,12 @@ impl PeerEntry {
     }
 }
 
+impl Default for PeerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerTable {
     /// Creates an empty table with no audit logging (used in tests).
     pub fn new() -> Self {
@@ -162,11 +168,10 @@ impl PeerTable {
     /// link doesn't unroute a peer still reachable via `db`.
     pub fn remove_peer_from_network(&self, ip: &Ipv4Addr, ipv6: &Ipv6Addr, network: &str) {
         let mut dropped = None;
-        if let Some(mut e) = self.v4.get_mut(ip) {
-            if e.conns.remove(network).is_some() {
+        if let Some(mut e) = self.v4.get_mut(ip)
+            && e.conns.remove(network).is_some() {
                 dropped = Some(e.endpoint_id);
             }
-        }
         self.v4.remove_if(ip, |_, e| e.conns.is_empty());
         if let Some(mut e) = self.v6.get_mut(ipv6) {
             e.conns.remove(network);
@@ -241,6 +246,12 @@ impl PeerTable {
 #[derive(Clone)]
 pub struct DeviceUserMap {
     inner: Arc<FastDashMap<EndpointId, EndpointId>>,
+}
+
+impl Default for DeviceUserMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeviceUserMap {

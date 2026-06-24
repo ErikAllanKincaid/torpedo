@@ -68,6 +68,12 @@ pub struct MemberList {
     members: HashMap<EndpointId, Member>,
 }
 
+impl Default for MemberList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemberList {
     pub fn new() -> Self {
         Self {
@@ -144,6 +150,12 @@ pub struct ApprovedEntry {
 #[derive(Debug, Clone)]
 pub struct ApprovedList {
     entries: HashMap<EndpointId, ApprovedEntry>,
+}
+
+impl Default for ApprovedList {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ApprovedList {

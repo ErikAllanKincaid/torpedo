@@ -1724,24 +1724,6 @@ impl DaemonState {
             anyhow::bail!("already in network '{display_name}'");
         }
 
-        // Admission always runs through the coordinator (only it can approve an
-        // unknown peer or redeem an invite). An invite pins the coordinator's id;
-        // otherwise it's the member flagged `is_coordinator` in the GroupBlob.
-        let coordinator_id = coordinator
-            .or_else(|| {
-                data.members
-                    .iter()
-                    .find(|m| m.is_coordinator)
-                    .map(|m| m.identity)
-            })
-            .context("no coordinator found in network record")?;
-        tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
-        let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
-            })?;
-
         let my_hostname = match hostname {
             Some(h) => {
                 anyhow::ensure!(
@@ -1756,64 +1738,201 @@ impl DaemonState {
                 .unwrap_or_else(crate::hostname::generate_hostname),
         };
 
-        let cancel = self.shutdown_token.child_token();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
-
-        let tasks = vec![spawn_reconnect_loop(
-            disconnect_rx,
-            self.endpoint.clone(),
-            alpn.clone(),
-            display_name.to_string(),
-            self.identity.local_identity(),
-            my_ip,
-            Some(my_hostname.clone()),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-            self.stats.clone(),
-            self.firewall.clone(),
-            self.device_cert.clone(),
-            self.device_user_map.clone(),
-        )];
-
-        let state = match join_mesh_shared(
-            conn,
-            &self.endpoint,
-            display_name,
-            &self.identity,
-            &alpn,
-            Some(my_hostname.clone()),
-            self.peers.clone(),
-            self.tun_tx.clone(),
-            disconnect_tx.clone(),
-            cancel.clone(),
-            self.stats.clone(),
-            self.blob_store.clone(),
-            self.firewall.clone(),
-            net_pubkey,
-            self.device_cert.clone(),
-            self.device_user_map.clone(),
-            self.hostname_table.clone(),
-            self.reverse_table.clone(),
-            invite,
-            data.suggested_firewall.clone(),
-            data.reusable_keys.clone(),
-            auto_accept_firewall,
-            initial,
-            self.promote_tx.clone(),
-        )
-        .await?
-        {
-            JoinResult::Joined(state) => state,
-            JoinResult::Pending => {
-                // Closed network: we've been queued for live approval. Stop the
-                // just-spawned reconnect loop (nothing is connected yet) and let
-                // the caller retry on a backoff until `ray accept` lets us in.
-                cancel.cancel();
-                return Ok(TryJoin::Pending);
+        // Dial-fallback loop (fresh joins only): try each coordinator in order
+        // (minter first, then other coordinators from the blob) until one
+        // welcomes us. JoinPending means this coordinator accepted the request
+        // and queued it — stop here and let the caller retry with backoff.
+        // JoinDenied / unreachable → advance to the next coordinator.
+        // For reconnects/restores (initial=false) the coordinator speaks first,
+        // so we keep the existing single-coordinator path.
+        let (state, cancel, disconnect_tx, tasks) = if initial {
+            let my_id = self.identity.local_identity();
+            // When there is no invite, use my own id as the nominal minter;
+            // coordinator_dial_order filters it out (minter != me check), so we
+            // simply get all coordinators from the blob in order.
+            let minter = coordinator.unwrap_or(my_id);
+            let order = coordinator_dial_order(minter, &data.members, my_id);
+            if order.is_empty() {
+                anyhow::bail!("no coordinator found in network record");
             }
+
+            // Resources produced by a successful coordinator handshake.
+            type JoinResources = (
+                Arc<std::sync::RwLock<NetworkState>>,
+                CancellationToken,
+                mpsc::Sender<forward::DisconnectEvent>,
+                Vec<tokio::task::JoinHandle<()>>,
+            );
+            let mut last_err = anyhow::anyhow!("no coordinators tried");
+            let mut found: Option<JoinResources> = None;
+
+            for coordinator_id in &order {
+                let cancel = self.shutdown_token.child_token();
+                let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+                let tasks = vec![spawn_reconnect_loop(
+                    disconnect_rx,
+                    self.endpoint.clone(),
+                    alpn.clone(),
+                    display_name.to_string(),
+                    my_id,
+                    my_ip,
+                    Some(my_hostname.clone()),
+                    self.peers.clone(),
+                    self.tun_tx.clone(),
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                    self.stats.clone(),
+                    self.firewall.clone(),
+                    self.device_cert.clone(),
+                    self.device_user_map.clone(),
+                )];
+
+                tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+                let conn = match transport::connect_to_peer_with_alpn(&self.endpoint, *coordinator_id, &alpn).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator unreachable, trying next");
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        last_err = anyhow::anyhow!("coordinator offline: {e}");
+                        continue;
+                    }
+                };
+
+                match join_mesh_shared(
+                    conn,
+                    &self.endpoint,
+                    display_name,
+                    &self.identity,
+                    &alpn,
+                    Some(my_hostname.clone()),
+                    self.peers.clone(),
+                    self.tun_tx.clone(),
+                    disconnect_tx.clone(),
+                    cancel.clone(),
+                    self.stats.clone(),
+                    self.blob_store.clone(),
+                    self.firewall.clone(),
+                    net_pubkey,
+                    self.device_cert.clone(),
+                    self.device_user_map.clone(),
+                    self.hostname_table.clone(),
+                    self.reverse_table.clone(),
+                    invite.clone(),
+                    data.suggested_firewall.clone(),
+                    data.reusable_keys.clone(),
+                    auto_accept_firewall,
+                    true,
+                    self.promote_tx.clone(),
+                )
+                .await
+                {
+                    Ok(JoinResult::Joined(state)) => {
+                        found = Some((state, cancel, disconnect_tx, tasks));
+                        break;
+                    }
+                    Ok(JoinResult::Pending) => {
+                        // This coordinator queued the request — don't try the
+                        // next; let the caller retry with backoff until accepted.
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        return Ok(TryJoin::Pending);
+                    }
+                    Err(e) => {
+                        tracing::warn!(coordinator = %coordinator_id.fmt_short(), error = %e, "coordinator denied or unreachable, trying next");
+                        cancel.cancel();
+                        for t in tasks { t.abort(); }
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
+
+            match found {
+                Some(resources) => resources,
+                None => anyhow::bail!(
+                    "no coordinator admitted the join (tried {}): {last_err:#}",
+                    order.len()
+                ),
+            }
+        } else {
+            // Reconnect/restore: coordinator speaks first; pick the single
+            // coordinator from the blob (same as the original path).
+            let coordinator_id = coordinator
+                .or_else(|| {
+                    data.members
+                        .iter()
+                        .find(|m| m.is_coordinator)
+                        .map(|m| m.identity)
+                })
+                .context("no coordinator found in network record")?;
+            tracing::info!(coordinator = %coordinator_id.fmt_short(), "connecting to coordinator");
+            let conn = transport::connect_to_peer_with_alpn(&self.endpoint, coordinator_id, &alpn)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("coordinator offline; cannot join this network right now: {e}")
+                })?;
+
+            let cancel = self.shutdown_token.child_token();
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+            let tasks = vec![spawn_reconnect_loop(
+                disconnect_rx,
+                self.endpoint.clone(),
+                alpn.clone(),
+                display_name.to_string(),
+                self.identity.local_identity(),
+                my_ip,
+                Some(my_hostname.clone()),
+                self.peers.clone(),
+                self.tun_tx.clone(),
+                disconnect_tx.clone(),
+                cancel.clone(),
+                self.stats.clone(),
+                self.firewall.clone(),
+                self.device_cert.clone(),
+                self.device_user_map.clone(),
+            )];
+
+            let state = match join_mesh_shared(
+                conn,
+                &self.endpoint,
+                display_name,
+                &self.identity,
+                &alpn,
+                Some(my_hostname.clone()),
+                self.peers.clone(),
+                self.tun_tx.clone(),
+                disconnect_tx.clone(),
+                cancel.clone(),
+                self.stats.clone(),
+                self.blob_store.clone(),
+                self.firewall.clone(),
+                net_pubkey,
+                self.device_cert.clone(),
+                self.device_user_map.clone(),
+                self.hostname_table.clone(),
+                self.reverse_table.clone(),
+                invite,
+                data.suggested_firewall.clone(),
+                data.reusable_keys.clone(),
+                auto_accept_firewall,
+                false,
+                self.promote_tx.clone(),
+            )
+            .await?
+            {
+                JoinResult::Joined(state) => state,
+                JoinResult::Pending => {
+                    // Closed network: we've been queued for live approval. Stop the
+                    // just-spawned reconnect loop (nothing is connected yet) and let
+                    // the caller retry on a backoff until `ray accept` lets us in.
+                    cancel.cancel();
+                    return Ok(TryJoin::Pending);
+                }
+            };
+            (state, cancel, disconnect_tx, tasks)
         };
+        let state = state;
 
         // A node that already holds the network secret key (e.g. a
         // co-coordinator joining after a config-only restore) should run as
@@ -5109,8 +5228,7 @@ async fn reconverge_and_apply(
 /// Compute the order in which a joiner should dial coordinators.
 /// Returns the minter first (if present and not `me`), then every other
 /// `is_coordinator` member except `me`, de-duplicated, preserving order.
-/// Consumed by the join dial-fallback task.
-#[allow(dead_code)]
+/// Consumed by the join dial-fallback loop.
 fn coordinator_dial_order(
     minter: EndpointId,
     members: &[Member],
@@ -5131,6 +5249,29 @@ fn coordinator_dial_order(
         }
     }
     order
+}
+
+/// Outcome of a single coordinator dial attempt during the join fallback loop.
+/// Used as a unit-testable specification of the loop termination policy.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(dead_code)]
+enum DialOutcome {
+    Welcomed,
+    Denied,
+    Unreachable,
+}
+
+/// Returns `(index_of_last_tried, welcomed)`.
+/// Iterates `outcomes` left-to-right and stops at the first `Welcomed`.
+/// If none is found, returns the index of the last element and `false`.
+#[allow(dead_code)]
+fn pick_first_welcome(outcomes: &[DialOutcome]) -> (usize, bool) {
+    for (i, o) in outcomes.iter().enumerate() {
+        if *o == DialOutcome::Welcomed {
+            return (i, true);
+        }
+    }
+    (outcomes.len().saturating_sub(1), false)
 }
 
 /// Last-known roster from persisted config. Used only as a fallback when the
@@ -6246,5 +6387,25 @@ mod coordinator_dial_order_tests {
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
         assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
+    }
+}
+
+#[cfg(test)]
+mod dial_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn dial_fallback_stops_on_first_welcome() {
+        // outcomes simulate dialing in order: first errors, second welcomes, third never tried.
+        let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Welcomed, DialOutcome::Denied];
+        let (idx, welcomed) = pick_first_welcome(&outcomes);
+        assert_eq!((idx, welcomed), (1, true));
+    }
+
+    #[test]
+    fn dial_fallback_reports_failure_when_all_exhausted() {
+        let outcomes = vec![DialOutcome::Unreachable, DialOutcome::Denied];
+        let (_idx, welcomed) = pick_first_welcome(&outcomes);
+        assert!(!welcomed);
     }
 }

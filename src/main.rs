@@ -14,6 +14,7 @@ mod ipc;
 mod logdir;
 mod membership;
 mod network_name;
+mod onepassword;
 mod peers;
 
 mod shutdown;
@@ -293,11 +294,30 @@ enum PairAction {
         ticket: String,
     },
     /// Export an encrypted backup of the signing key
-    Backup,
+    Backup {
+        /// Store the backup in 1Password (via the `op` CLI) instead of printing it
+        #[arg(long = "1password", alias = "op")]
+        onepassword: bool,
+        /// 1Password vault (defaults to your default vault)
+        #[arg(long)]
+        vault: Option<String>,
+        /// 1Password item title
+        #[arg(long, default_value = "Rayfish Identity")]
+        item: String,
+    },
     /// Restore a signing key from an encrypted backup
     Restore {
-        /// The encrypted backup string
-        backup: String,
+        /// The encrypted backup string (omit when using --1password)
+        backup: Option<String>,
+        /// Read the backup from 1Password (via the `op` CLI)
+        #[arg(long = "1password", alias = "op")]
+        onepassword: bool,
+        /// 1Password vault (defaults to your default vault)
+        #[arg(long)]
+        vault: Option<String>,
+        /// 1Password item title
+        #[arg(long, default_value = "Rayfish Identity")]
+        item: String,
     },
 }
 
@@ -1809,9 +1829,24 @@ async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<
         // `rayfish pair` — start pairing on primary device
         (None, None) => ipc_pair_start().await,
         // `rayfish pair backup`
-        (Some(PairAction::Backup), _) => cmd_pair_backup(),
+        (
+            Some(PairAction::Backup {
+                onepassword,
+                vault,
+                item,
+            }),
+            _,
+        ) => cmd_pair_backup(onepassword, vault.as_deref(), &item),
         // `rayfish pair restore <backup>`
-        (Some(PairAction::Restore { backup }), _) => cmd_pair_restore(&backup),
+        (
+            Some(PairAction::Restore {
+                backup,
+                onepassword,
+                vault,
+                item,
+            }),
+            _,
+        ) => cmd_pair_restore(backup.as_deref(), onepassword, vault.as_deref(), &item),
     }
 }
 
@@ -1877,7 +1912,10 @@ async fn ipc_pair_accept(ticket: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_pair_backup() -> Result<()> {
+/// Produce the encrypted `enc1…` backup blob for the local identity, prompting
+/// for (and confirming) a backup password. Returns the blob and the identity's
+/// public key string.
+fn make_backup_blob() -> Result<(String, String)> {
     use argon2::Argon2;
     use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 
@@ -1912,6 +1950,26 @@ fn cmd_pair_backup() -> Result<()> {
     backup_bytes.extend_from_slice(&ciphertext);
 
     let backup = bs58::encode(&backup_bytes).into_string();
+    Ok((backup, key.public().to_string()))
+}
+
+fn cmd_pair_backup(onepassword: bool, vault: Option<&str>, item: &str) -> Result<()> {
+    // Fail fast if `op` is missing before prompting for a password.
+    if onepassword {
+        onepassword::op_available()?;
+    }
+
+    let (backup, public_key) = make_backup_blob()?;
+
+    if onepassword {
+        onepassword::store(vault, item, &backup, &public_key)?;
+        println!("Stored encrypted backup in 1Password item \"{}\".", item);
+        println!();
+        println!("To restore on a new device:");
+        println!("  rayfish pair restore --1password");
+        return Ok(());
+    }
+
     println!("Backup code: {}", backup);
     println!();
     println!("Store this safely. To restore on a new device:");
@@ -1919,11 +1977,28 @@ fn cmd_pair_backup() -> Result<()> {
     Ok(())
 }
 
-fn cmd_pair_restore(backup: &str) -> Result<()> {
+fn cmd_pair_restore(
+    backup: Option<&str>,
+    onepassword: bool,
+    vault: Option<&str>,
+    item: &str,
+) -> Result<()> {
     use argon2::Argon2;
     use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 
-    let backup_bytes = bs58::decode(backup)
+    let backup = if onepassword {
+        if backup.is_some() {
+            anyhow::bail!("provide either a backup code or --1password, not both");
+        }
+        onepassword::op_available()?;
+        onepassword::read(vault, item)?
+    } else {
+        backup
+            .map(|b| b.to_string())
+            .context("provide a backup code, or use --1password to read it from 1Password")?
+    };
+
+    let backup_bytes = bs58::decode(&backup)
         .into_vec()
         .map_err(|e| anyhow::anyhow!("invalid backup code: {e}"))?;
     if backup_bytes.len() < 4 + 16 + 24 + 32 {

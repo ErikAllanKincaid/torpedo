@@ -265,6 +265,10 @@ enum InviteAction {
         /// `ray invite <net> revoke <id>`.
         #[arg(long)]
         reusable: bool,
+        /// Also render the invite as a scannable QR code (off by default — it
+        /// takes up a lot of terminal space).
+        #[arg(long)]
+        qr: bool,
     },
     /// List issued invites and their status
     List,
@@ -1374,10 +1378,12 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
 }
 
 async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
+    let show_qr = matches!(&action, Some(InviteAction::Create { qr: true, .. }));
     let action = action.unwrap_or(InviteAction::Create {
         expires: None,
         hostname: None,
         reusable: false,
+        qr: false,
     });
     let hostname_opt = match &action {
         InviteAction::Create { hostname, .. } => hostname.clone(),
@@ -1389,6 +1395,7 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
             expires,
             hostname,
             reusable,
+            qr: _,
         } => {
             // Reusable keys default to a longer 30d TTL; single-use to 7d.
             let ttl = expires.unwrap_or_else(|| {
@@ -1431,8 +1438,13 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
             println!();
             println!("  {}", style::bold(&code));
             println!();
-            qr2term::print_qr(&code).ok();
+            if show_qr {
+                qr2term::print_qr(&code).ok();
+            }
             print_next(&[(&format!("ray join {code}"), "the holder runs this to join")]);
+            if !show_qr {
+                println!("  {}", style::faint("add --qr for a scannable QR code"));
+            }
             println!();
             let days = expires_secs / 86400;
             let hours = (expires_secs % 86400) / 3600;

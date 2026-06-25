@@ -32,7 +32,7 @@ ray <cmd> --json               # global flag: machine-readable JSON for status/f
 ray report                     # bundle logs+metrics, open a pre-filled GitHub issue
 ray up [--hostname h] | down   # activate / standby (TUN + DNS), daemon stays running; --hostname sets your default name
 
-ray invite <net> [--expires 7d] [--hostname H]       # coordinator-only: mint single-use invite (+QR); --hostname binds an authoritative name (overrides joiner choice, rejected on collision) the holder takes on join
+ray invite <net> [--expires 7d] [--hostname H] [--qr]   # coordinator-only: mint single-use invite; --qr also prints a scannable QR (off by default, saves screen space); --hostname binds an authoritative name (overrides joiner choice, rejected on collision) the holder takes on join
 ray invite <net> --reusable [--expires 30d]          # mint a reusable (multi-use, expiring) key for unattended fleets; rides the signed blob, no hostname binding. Servers: ray join <key> --hostname H --auto-accept-firewall
 ray invite <net> list|revoke <id>          # list / revoke invites (reusable keys tagged; revoke propagates via the blob)
 ray requests <net>             # coordinator-only: peers awaiting live approval

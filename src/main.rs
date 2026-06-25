@@ -503,12 +503,28 @@ fn init_tracing(to_file: bool) -> LogGuard {
     let (file_layer, appender_guard) = if to_file {
         match std::fs::create_dir_all(logdir::log_dir()) {
             Ok(()) => {
-                let appender = tracing_appender::rolling::daily(logdir::log_dir(), "rayfish.log");
-                let (writer, guard) = tracing_appender::non_blocking(appender);
-                let layer = tracing_subscriber::fmt::layer()
-                    .with_ansi(false)
-                    .with_writer(writer);
-                (Some(layer), Some(guard))
+                // Daily rotation; retain the 7 most recent files so logs older
+                // than ~a week are pruned automatically (bounds disk usage).
+                match tracing_appender::rolling::Builder::new()
+                    .rotation(tracing_appender::rolling::Rotation::DAILY)
+                    .filename_prefix("rayfish.log")
+                    .max_log_files(7)
+                    .build(logdir::log_dir())
+                {
+                    Ok(appender) => {
+                        let (writer, guard) = tracing_appender::non_blocking(appender);
+                        let layer = tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(writer);
+                        (Some(layer), Some(guard))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: cannot build rolling log appender: {e} (file logging disabled)"
+                        );
+                        (None, None)
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(

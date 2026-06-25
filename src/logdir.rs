@@ -9,6 +9,9 @@ use std::path::PathBuf;
 ///
 /// Linux uses the conventional `/var/log/rayfish`; macOS uses `/Library/Logs/rayfish`
 /// (visible in Console.app). Other platforms fall back to the user config dir.
+///
+/// The appender retains the 7 most recent daily files (see `main::init_tracing`),
+/// so logs older than ~a week are pruned automatically.
 pub fn log_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {

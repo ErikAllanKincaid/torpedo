@@ -14,7 +14,9 @@
 #   - whitelist (allow-list ⇒ catch-all deny) vs blacklist (denies-only) semantics
 #     observed by real TCP probes;
 #   - the rule matrix: UDP, a TCP port range, same-selector replace (allow↔deny),
-#     and per-network rule scoping (`--network`) at the data plane.
+#     and per-network rule scoping (`--network`) at the data plane;
+#   - `ray send` reaches a deny-all host: file transfer rides FILES_ALPN (a
+#     control-plane QUIC stream), not TUN/IP traffic, so the firewall never gates it.
 #
 # Reads tests/e2e/firewall/.servers (written by provision.sh). Does NOT modify
 # infra. Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
@@ -119,9 +121,11 @@ on "$C" 'ray firewall default deny' 2>&1 | strip | sed 's/^/   c| /'
 # ---------------------------------------------------------------------------
 step "4. rule matrix — UDP, TCP port range, same-selector replace (local rules)"
 # UDP (never exercised elsewhere): default-deny blocks it, an explicit allow opens.
-fw_denies "$A" "$B_IP" 5353 "UDP denied by default" udp
-on "$B" 'ray firewall add in allow -p udp -P 5353' 2>&1 | strip | sed 's/^/   b| /'
-fw_allows "$A" "$B_IP" 5353 "explicit allow opens UDP:5353" udp
+# Port 5400 is used (not 5353) to avoid colliding with the daemon's own mDNS
+# listener (UDP 5353). The receiver runs on srv-b, reached via its public ip ($B).
+fw_denies "$A" "$B_IP" 5400 "UDP denied by default" udp "$B"
+on "$B" 'ray firewall add in allow -p udp -P 5400' 2>&1 | strip | sed 's/^/   b| /'
+fw_allows "$A" "$B_IP" 5400 "explicit allow opens UDP:5400" udp "$B"
 on "$B" 'ray firewall remove 0' 2>&1 | strip | sed 's/^/   b| /'
 
 # TCP port range: a single rule covers 8000-8010; inside opens, outside stays shut.
@@ -160,6 +164,20 @@ stop_tcp_listener "$B" 7000
 on "$B" 'ray firewall remove 0' 2>&1 | strip | sed 's/^/   b| /'
 on "$B" 'ray firewall remove 0' 2>&1 | strip | sed 's/^/   b| /'
 on "$B" 'ray firewall default deny' 2>&1 | strip | sed 's/^/   b| /'
+
+# ---------------------------------------------------------------------------
+step "6. file send bypasses the firewall (deny-all inbound)"
+# srv-b is left at `default deny` (all inbound TCP/UDP blocked, ICMP-only) by the
+# previous step. `ray send` rides the identity-level FILES_ALPN (rayfish/files/1)
+# as a control-plane QUIC stream, NOT TUN/IP traffic — so the per-device firewall
+# (which filters forwarded packets) never sees it. A deny-all host can still
+# receive files. This proves send availability is gated by shared-network
+# membership, not by the firewall posture.
+DENY_DEFAULT="$(on "$B" 'ray firewall show --json' | jq -r '(.default_inbound // "") | ascii_downcase')"
+[[ "$DENY_DEFAULT" == "deny" ]] \
+  && pass "srv-b inbound default is deny (TCP/UDP blocked)" \
+  || fail "srv-b inbound default is not deny (got '${DENY_DEFAULT}')"
+send_recv "$A" "$B" srv-b "ray send srv-a -> srv-b succeeds despite deny-all firewall"
 
 # ---------------------------------------------------------------------------
 summary

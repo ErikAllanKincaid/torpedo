@@ -4581,12 +4581,14 @@ impl DaemonState {
             None => firewall::PeerFilter::Any,
         };
 
-        if let Some(net) = network
-            && !self.networks.contains_key(net)
-        {
-            return IpcMessage::Error {
-                message: format!("unknown network '{net}'"),
-            };
+        // The `network` field is a match filter, not a reference that must
+        // resolve now: a rule scoped to a network this node hasn't joined yet
+        // (or has temporarily left) is kept and simply never matches until the
+        // node is on that network. We only warn on an unknown name so typos
+        // are still surfaced without rejecting the rule.
+        let unknown_network = network.filter(|net| !self.networks.contains_key(*net));
+        if let Some(net) = unknown_network {
+            tracing::warn!(network = %net, "firewall rule scoped to a network this node is not on");
         }
         let rule = firewall::FirewallRule {
             direction,
@@ -4611,9 +4613,11 @@ impl DaemonState {
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
-        IpcMessage::Ok {
-            message: "rule added".to_string(),
-        }
+        let message = match unknown_network {
+            Some(net) => format!("rule added (note: not currently on network '{net}')"),
+            None => "rule added".to_string(),
+        };
+        IpcMessage::Ok { message }
     }
 
     fn firewall_remove(&self, index: usize) -> IpcMessage {

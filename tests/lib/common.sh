@@ -213,30 +213,35 @@ start_tcp_listener(){
 }
 stop_tcp_listener(){ on "$1" "pkill -f 'http.server $2'" >/dev/null 2>&1 || true; }
 
-# udp_probe <from-ip> <dst-ip> <port> : echo OPEN if a UDP datagram from <from>
-# reaches a listener on <dst>, CLOSED otherwise. Starts a one-shot python
-# receiver on <dst> that drops a marker file on first packet.
+# udp_probe <from-pub-ip> <dst-pub-ip> <dst-vpn-ip> <port> : echo OPEN if a UDP
+# datagram sent from <from-pub-ip> to <dst-vpn-ip> reaches a listener on the
+# destination, CLOSED otherwise. Both hosts are reached over SSH by their PUBLIC
+# ips (the test runner can't route the VPN range); the datagram itself is
+# addressed to <dst-vpn-ip> so it rides the TUN and is subject to the firewall.
+# A one-shot python receiver on the destination drops a marker on first packet.
 udp_probe(){
-  local from="$1" dst="$2" port="$3"
-  on "$dst" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"0.0.0.0\",$port));
+  local from_pub="$1" dst_pub="$2" dst_vpn="$3" port="$4"
+  on "$dst_pub" "rm -f /tmp/udp_got_$port; setsid python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(8); s.bind((\"0.0.0.0\",$port));
 try:
  s.recvfrom(64); open(\"/tmp/udp_got_$port\",\"w\").write(\"1\")
 except Exception: pass' >/dev/null 2>&1 </dev/null & sleep 1" >/dev/null 2>&1 || true
-  on "$from" "python3 -c 'import socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst\",$port))'" >/dev/null 2>&1 || true
+  on "$from_pub" "python3 -c 'import socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b\"x\",(\"$dst_vpn\",$port))'" >/dev/null 2>&1 || true
   sleep 2
-  on "$dst" "[ -f /tmp/udp_got_$port ] && echo OPEN || echo CLOSED" 2>/dev/null | strip | tr -d '[:space:]'
+  on "$dst_pub" "[ -f /tmp/udp_got_$port ] && echo OPEN || echo CLOSED" 2>/dev/null | strip | tr -d '[:space:]'
 }
 
-# fw_allows / fw_denies <from-ip> <dst-ip> <port> <label> [proto] : PASS/FAIL on
-# the expected TCP (default) or UDP reachability. proto = tcp|udp.
+# fw_allows / fw_denies <from-pub-ip> <dst-vpn-ip> <port> <label> [proto] [dst-pub-ip] :
+# PASS/FAIL on the expected TCP (default) or UDP reachability. proto = tcp|udp.
+# For UDP a receiver is started on the destination host, so <dst-pub-ip> (its
+# PUBLIC/SSH ip) is required as the 6th argument; TCP ignores it.
 fw_allows(){
-  local proto="${5:-tcp}" r
-  if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
+  local proto="${5:-tcp}" dst_pub="${6:-}" r
+  if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$dst_pub" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
   [[ "$r" == OPEN ]] && pass "$4 ($proto:$3 open)" || fail "$4 (expected OPEN on $proto:$3, got '$r')"
 }
 fw_denies(){
-  local proto="${5:-tcp}" r
-  if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
+  local proto="${5:-tcp}" dst_pub="${6:-}" r
+  if [[ "$proto" == udp ]]; then r="$(udp_probe "$1" "$dst_pub" "$2" "$3")"; else r="$(tcp_probe "$1" "$2" "$3")"; fi
   [[ "$r" == CLOSED ]] && pass "$4 ($proto:$3 denied)" || fail "$4 (expected CLOSED on $proto:$3, got '$r')"
 }
 

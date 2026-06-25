@@ -78,6 +78,11 @@ pub enum IpcMessage {
     FirewallDefault {
         action: Action,
     },
+    /// Toggle "fail fast" REJECT mode (opt-in, default off): when on, a denied
+    /// packet gets a TCP RST / ICMP-unreachable reply instead of a silent drop.
+    FirewallReject {
+        enabled: bool,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -264,6 +269,10 @@ pub enum IpcMessage {
         default_inbound: Action,
         /// Default action for outbound traffic that matches no explicit rule.
         default_outbound: Action,
+        /// "Fail fast" REJECT mode (opt-in, default off): when on, denied packets
+        /// get a TCP RST / ICMP-unreachable reply instead of a silent drop.
+        #[serde(default)]
+        reject: bool,
         rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to

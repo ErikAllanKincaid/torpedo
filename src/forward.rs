@@ -36,8 +36,9 @@ const TX_POOL_CHUNK: usize = 64 * 1024;
 pub(crate) enum InboundDecision {
     /// Packet passed the firewall check and may be written to the TUN.
     Accept,
-    /// Dropped by the local firewall.
-    DropFirewall,
+    /// Dropped by the local firewall. Carries the parsed packet so a fail-fast
+    /// REJECT reply can be built without re-parsing.
+    DropFirewall(firewall::PacketInfo),
     /// Dropped: too large or not a parseable IP packet.
     DropMalformed,
 }
@@ -63,7 +64,7 @@ pub(crate) fn evaluate_inbound(
         .evaluate_packet(Direction::In, &info, peer_id, Some(network))
         .is_deny()
     {
-        return InboundDecision::DropFirewall;
+        return InboundDecision::DropFirewall(info);
     }
     InboundDecision::Accept
 }
@@ -168,6 +169,14 @@ pub async fn run_mesh(
         {
             tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
             stats.record_drop(DropReason::Firewall);
+            // Fail fast (opt-in): inject a RST / ICMP-unreachable back into our own
+            // TUN so the local app's socket fails immediately instead of hanging.
+            if firewall.reject_enabled()
+                && let Some(reply) = crate::reject::build_reject(&pkt, &info)
+            {
+                stats.record_reject();
+                let _ = tun_tx.send(reply).await;
+            }
             continue;
         }
         tracing::debug!(dst = %info.dst_ip, "routing to peer");
@@ -240,7 +249,20 @@ pub fn spawn_peer_reader(
                         return;
                     }
                 }
-                InboundDecision::DropFirewall => stats.record_drop(DropReason::Firewall),
+                InboundDecision::DropFirewall(info) => {
+                    stats.record_drop(DropReason::Firewall);
+                    // Fail fast (opt-in): send a RST / ICMP-unreachable back over
+                    // this connection so the initiator on the other host fails
+                    // immediately. Its conntrack admits the reply (a RST matches
+                    // its outbound flow; the seeded `allow in icmp` rule admits an
+                    // ICMP error), so the initiator's app sees "connection refused".
+                    if firewall.reject_enabled()
+                        && let Some(reply) = crate::reject::build_reject(&datagram, &info)
+                    {
+                        stats.record_reject();
+                        let _ = conn.send_datagram(reply);
+                    }
+                }
                 InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
             }
         }
@@ -325,6 +347,7 @@ mod tests {
         SharedFirewall::new(firewall::FirewallConfig {
             default_inbound: default,
             default_outbound: Action::Allow,
+            reject: false,
             rules,
         })
     }
@@ -349,7 +372,7 @@ mod tests {
         pkt[6] = 6; // TCP
         assert!(matches!(
             evaluate_inbound(&pkt, &fw, &peer, "test-net"),
-            InboundDecision::DropFirewall
+            InboundDecision::DropFirewall(_)
         ));
     }
 
@@ -372,7 +395,7 @@ mod tests {
         let allowed = make_tcp_packet(80);
         assert!(matches!(
             evaluate_inbound(&blocked, &fw, &peer, "test-net"),
-            InboundDecision::DropFirewall
+            InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
             evaluate_inbound(&allowed, &fw, &peer, "test-net"),
@@ -389,7 +412,7 @@ mod tests {
         let pkt = make_tcp_packet(443);
         assert!(matches!(
             evaluate_inbound(&pkt, &fw, &peer, "test-net"),
-            InboundDecision::DropFirewall
+            InboundDecision::DropFirewall(_)
         ));
     }
 
@@ -458,7 +481,7 @@ mod tests {
         // A different port stays denied.
         assert!(matches!(
             evaluate_inbound(&make_tcp_packet(9090), &fw, &peer, "test-net"),
-            InboundDecision::DropFirewall
+            InboundDecision::DropFirewall(_)
         ));
     }
 }

@@ -164,6 +164,14 @@ pub struct FirewallConfig {
     /// their return traffic back in).
     #[serde(default = "default_outbound_action")]
     pub default_outbound: Action,
+    /// "Fail fast" REJECT mode. When `true`, a denied packet gets a synthetic
+    /// reply (TCP RST or ICMP unreachable, see [`crate::reject`]) so the initiator
+    /// fails immediately instead of hanging; when `false` (the default), denied
+    /// packets are silently dropped (stealthy, no reply). Opt-in via
+    /// `ray firewall reject on`; `#[serde(default)]` keeps existing
+    /// `firewall.toml` files on the silent-drop posture.
+    #[serde(default)]
+    pub reject: bool,
     pub rules: Vec<FirewallRule>,
 }
 
@@ -196,6 +204,7 @@ impl Default for FirewallConfig {
         Self {
             default_inbound: default_inbound_action(),
             default_outbound: default_outbound_action(),
+            reject: false,
             // Ship inbound TCP/UDP denied but inbound ICMP allowed — as a visible,
             // removable rule rather than a hard-coded special case.
             rules: vec![default_icmp_rule()],
@@ -306,6 +315,13 @@ impl SharedFirewall {
     ) -> Action {
         self.match_rule(direction, protocol, dst_port, peer, None)
             .unwrap_or_else(|| self.default_for(direction))
+    }
+
+    /// Whether "fail fast" REJECT mode is enabled (opt-in, default off). When on,
+    /// the data path answers a denied packet with a synthetic reply instead of
+    /// dropping it silently.
+    pub fn reject_enabled(&self) -> bool {
+        self.inner.load().reject
     }
 
     /// Stateful evaluation of a fully-parsed packet. This is what the data plane
@@ -1100,6 +1116,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![],
         });
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
@@ -1110,6 +1127,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1139,6 +1157,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1182,6 +1201,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1211,6 +1231,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1233,6 +1254,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![
                 FirewallRule {
                     direction: Direction::In,
@@ -1330,6 +1352,7 @@ mod tests {
         let config = FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Allow,
@@ -1399,6 +1422,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1442,6 +1466,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1500,6 +1525,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1549,6 +1575,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1592,6 +1619,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::In,
                 action: Action::Deny,
@@ -1633,6 +1661,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Deny,
+            reject: false,
             rules: vec![FirewallRule {
                 direction: Direction::Out,
                 action: Action::Allow,
@@ -1718,6 +1747,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![], // seeded allow-icmp removed
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1747,6 +1777,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1773,6 +1804,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1796,6 +1828,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1822,6 +1855,7 @@ mod tests {
         let fw = SharedFirewall::new(FirewallConfig {
             default_inbound: Action::Deny,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![],
         });
         let me = Ipv6Addr::new(0x2, 0, 0, 0, 0, 0, 0, 2);
@@ -2154,6 +2188,7 @@ mod tests {
         let config = FirewallConfig {
             default_inbound: Action::Allow,
             default_outbound: Action::Allow,
+            reject: false,
             rules: vec![local_rule.clone(), stale_net, other_net.clone()],
         };
         let fw = SharedFirewall::new(config);

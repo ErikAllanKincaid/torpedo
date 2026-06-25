@@ -418,6 +418,14 @@ enum FirewallAction {
         /// Default inbound action: allow or deny
         action: String,
     },
+    /// Toggle "fail fast" REJECT mode (opt-in, default off). When `on`, a denied
+    /// packet gets a TCP RST / ICMP-unreachable reply so the initiator fails
+    /// immediately ("connection refused") instead of hanging to a timeout. When
+    /// `off`, denied packets are silently dropped (stealthy, the default).
+    Reject {
+        /// on or off
+        state: String,
+    },
     /// Coordinator-only: suggest firewall rules for a subject host on a network.
     /// Distributed in the signed blob; each node takes them per its own consent.
     Suggest {
@@ -1958,6 +1966,14 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault {
             action: action.parse().map_err(anyhow::Error::msg)?,
         },
+        FirewallAction::Reject { state } => {
+            let enabled = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => anyhow::bail!("expected `on` or `off`, got '{other}'"),
+            };
+            ipc::IpcMessage::FirewallReject { enabled }
+        }
         FirewallAction::Accept { network } => ipc::IpcMessage::FirewallAccept { network },
         FirewallAction::Deny { network } => ipc::IpcMessage::FirewallDeny { network },
         FirewallAction::AutoAccept { network, state } => {
@@ -1978,18 +1994,20 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         ipc::IpcMessage::FirewallState {
             default_inbound,
             default_outbound,
+            reject,
             rules,
         } => {
             if json_enabled() {
                 print_json(&serde_json::json!({
                     "default_inbound": default_inbound,
                     "default_outbound": default_outbound,
+                    "reject": reject,
                     "rules": rules,
                 }));
             } else {
                 print!(
                     "{}",
-                    render_firewall_rules(Some((default_inbound, default_outbound)), &rules)
+                    render_firewall_rules(Some((default_inbound, default_outbound)), reject, &rules)
                 );
             }
         }
@@ -2008,6 +2026,7 @@ fn print_json(value: &serde_json::Value) {
 /// action shown as a header (omitted for the pending-suggestions list).
 fn render_firewall_rules(
     default: Option<(firewall::Action, firewall::Action)>,
+    reject: bool,
     rules: &[ipc::FirewallRuleView],
 ) -> String {
     let mut out = String::from("\n");
@@ -2026,9 +2045,19 @@ fn render_firewall_rules(
             styled(inbound)
         ));
         out.push_str(&format!(
-            "  {}  {}\n\n",
+            "  {}  {}\n",
             style::label("default out"),
             styled(outbound)
+        ));
+        let reject_styled = if reject {
+            style::green("on")
+        } else {
+            style::faint("off")
+        };
+        out.push_str(&format!(
+            "  {}  {}\n\n",
+            style::label("reject    "),
+            reject_styled
         ));
     }
     if rules.is_empty() {
@@ -2111,7 +2140,7 @@ async fn ipc_firewall_pending(network: &str) -> Result<()> {
     }
     // Non-interactive (piped / NO_COLOR): print the static table and stop.
     if !style::is_enabled() {
-        print!("{}", render_firewall_rules(None, &rules));
+        print!("{}", render_firewall_rules(None, false, &rules));
         return Ok(());
     }
 
@@ -3745,6 +3774,7 @@ mod tests {
         ];
         let out = render_firewall_rules(
             Some((firewall::Action::Allow, firewall::Action::Allow)),
+            false,
             &rules,
         );
         assert!(out.contains("default in   allow"));
@@ -3765,7 +3795,7 @@ mod tests {
     fn empty_firewall_says_no_rules() {
         style::set_plain(true);
         let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), &[]);
+            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, &[]);
         assert!(out.contains("default in   deny"));
         assert!(out.contains("default out  allow"));
         assert!(out.contains("(no rules)"));

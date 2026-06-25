@@ -73,6 +73,7 @@ pub mod peers;
 pub mod picker;
 pub mod progress;
 pub mod ratelimit;
+pub mod reject;
 pub mod shutdown;
 pub mod stats;
 pub mod style;

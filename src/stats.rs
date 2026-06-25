@@ -61,6 +61,8 @@ pub struct ForwardMetrics {
     pub bytes_tx: Counter,
     /// Dropped packets by reason
     pub drops: Family<DropLabels, Counter>,
+    /// REJECT replies sent (TCP RST / ICMP unreachable) when fail-fast mode is on
+    pub rejects_sent: Counter,
 }
 
 impl ForwardMetrics {
@@ -76,6 +78,10 @@ impl ForwardMetrics {
 
     pub fn record_drop(&self, reason: DropReason) {
         self.drops.get_or_create(&DropLabels { reason }).inc();
+    }
+
+    pub fn record_reject(&self) {
+        self.rejects_sent.inc();
     }
 
     fn drop_count(&self, reason: DropReason) -> u64 {

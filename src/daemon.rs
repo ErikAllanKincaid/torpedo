@@ -1490,6 +1490,7 @@ impl DaemonState {
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(action),
+            IpcMessage::FirewallReject { enabled } => self.firewall_reject(enabled),
             IpcMessage::FirewallSuggest {
                 network,
                 suggestions,
@@ -4671,6 +4672,7 @@ impl DaemonState {
         IpcMessage::FirewallState {
             default_inbound: config.default_inbound,
             default_outbound: config.default_outbound,
+            reject: config.reject,
             rules: firewall::rule_views(&config.rules, &short_id),
         }
     }
@@ -4918,6 +4920,21 @@ impl DaemonState {
         }
         IpcMessage::Ok {
             message: format!("inbound default set to {action}"),
+        }
+    }
+
+    fn firewall_reject(&self, enabled: bool) -> IpcMessage {
+        let mut config = (*self.firewall.get_config()).clone();
+        config.reject = enabled;
+        self.firewall.update(config.clone());
+        if let Err(e) = firewall::save_firewall(&config) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        IpcMessage::Ok {
+            message: format!(
+                "fail-fast reject {}",
+                if enabled { "on" } else { "off" }
+            ),
         }
     }
 

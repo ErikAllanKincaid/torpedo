@@ -28,9 +28,11 @@ conventional_commits = true
 filter_unconventional = false
 filter_commits = false
 protect_breaking_commits = true
-# Only `vX.Y.Z` tags are release boundaries — the rolling `nightly` tag is
-# ignored, so `--unreleased` means "commits since the last stable".
-tag_pattern = "v[0-9].*"
+# Only `vX.Y.Z` tags are release boundaries — the rolling `nightly` tag and
+# unrelated tags like `ray-proto-vX.Y.Z` are ignored, so `--unreleased` means
+# "commits since the last stable". Anchored at `^` so a tag merely *containing*
+# `vX.Y.Z` (e.g. `ray-proto-v0.1.1`) is not mistaken for a release boundary.
+tag_pattern = "^v[0-9].*"
 topo_order = false
 sort_commits = "newest"
 # The numeric HTML-comment prefix orders groups; the template strips it.

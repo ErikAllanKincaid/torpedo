@@ -3186,19 +3186,16 @@ impl DaemonState {
         }
     }
 
-    /// Put the daemon on standby: tear down active network connections, revert
-    /// system DNS, and bring the TUN interface down. The daemon process keeps
-    /// running so it can be reactivated with `activate`. Idempotent.
+    /// Put the daemon on standby: take the data plane offline (revert system
+    /// DNS, bring the TUN link down, stop forwarding) while keeping the control
+    /// plane connected. Network connections, control readers, and pollers stay
+    /// live so the node remains online to peers and keeps receiving roster/blob
+    /// updates. Connections are dropped only on leave/nuke/shutdown. Idempotent.
     async fn deactivate(&self) -> IpcMessage {
         if !self.active.swap(false, Ordering::SeqCst) {
             return IpcMessage::Ok {
                 message: "already on standby".into(),
             };
-        }
-
-        let names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
-        for name in &names {
-            self.teardown_network_runtime(name).await;
         }
 
         if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
@@ -3221,7 +3218,7 @@ impl DaemonState {
 
         tracing::info!("VPN on standby");
         IpcMessage::Ok {
-            message: "VPN down (daemon still running)".into(),
+            message: "VPN on standby (still connected to peers)".into(),
         }
     }
 

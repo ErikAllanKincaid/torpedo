@@ -35,50 +35,50 @@ Out of scope (YAGNI): per-network overrides; live re-bind of the endpoint for
 relay/discovery changes (restart instead); a single bundled "provider" switch
 (settings are independent); disabling relay entirely.
 
-## iroh integration (authoritative)
+## iroh integration (verified against iroh 1.0.0)
 
-The current `transport.rs::bind_endpoint()` uses the `presets::N0` convenience,
-which bundles relay + discovery. To support custom servers we move to the
-explicit builder form **only when an override is configured**; with no override,
-the existing `presets::N0` path is preserved unchanged.
+This codebase pins **iroh 1.0.0** and binds with `Endpoint::builder(presets::N0)`
+in `transport.rs::bind_endpoint()`. The API verified from the unpacked crate
+source (NOT the older `.discovery()` / `DnsResolver::new(url)` shape, which does
+not exist in 1.0.0):
 
-Reference shape (one discovery URL drives three mechanisms):
+- Builder takes a preset: `Endpoint::builder(presets::N0)`. The `N0` preset
+  already stacks `PkarrPublisher::n0_dns()` + `DnsAddressLookup::n0_dns()` and
+  sets `relay_mode(default_relay_mode())`.
+- Relay override: `.relay_mode(RelayMode::custom(urls: impl IntoIterator<Item =
+  RelayUrl>))`. The last `relay_mode` call wins, so this overrides the preset.
+- Discovery override: `.address_lookup(PkarrPublisher::builder(url))` and
+  `.address_lookup(PkarrResolver::builder(url))`. `address_lookup` **stacks**
+  (additive); `.clear_address_lookup()` drops all currently-registered services.
+  There is no `.discovery()` method in 1.0.0.
+- n0 default relay URLs (for augment): `RelayMode::Default.relay_map()
+  .urls::<Vec<RelayUrl>>()`.
 
-```rust
-let dns_origin: Url = "http://dns.iroh.rayfish.xyz:8080".parse()?;
-let relay: RelayMode = RelayMode::Custom("http://relay.iroh.rayfish.xyz:3340".parse()?);
-
-let ep = Endpoint::builder()
-    .secret_key(secret)
-    .relay_mode(relay)
-    .dns_resolver(DnsResolver::new(dns_origin.clone()))            // DNS resolve
-    .discovery(PkarrResolver::new(dns_origin.clone()).into())     // pkarr resolve
-    .discovery(iroh::discovery::pkarr::PkarrPublisher::new(dns_origin).into()) // pkarr publish
-    .bind()
-    .await?;
-```
+We keep `Endpoint::builder(presets::N0)` as the base and override only when a
+setting is configured; with everything unset, the bind path is byte-for-byte
+today's behavior.
 
 Mode semantics:
 
-- `relay` replace: `RelayMode::Custom(<custom>)`. `relay` augment: build a
-  `RelayMap` of n0's default relay nodes plus the custom node(s). (`RelayMode`
-  has no built-in "default + custom"; the plan builds the combined map and
-  confirms the exact iroh API against the installed version.)
-- `discovery-dns` replace: register only the custom `DnsResolver` +
-  `PkarrResolver` + `PkarrPublisher`. augment: also stack n0's default discovery
-  (pkarr resolve/publish stack via repeated `.discovery(...)`; `.dns_resolver()`
-  is singular, so under augment it is set to the custom origin while the n0
-  discovery services remain stacked — the plan confirms this stacking behavior).
-- The `dht.rs` `PkarrRelayClient` (currently `https://dns.iroh.link/pkarr`)
-  must also follow `discovery-dns` so blob/contact publish+resolve use the same
-  server. The plan confirms whether the one deployed DNS server covers both the
-  endpoint-builder discovery and the `dht.rs` pkarr-relay path, or whether they
-  need separate URLs.
+- `relay` replace: `.relay_mode(RelayMode::custom(custom_urls))`. `relay`
+  augment: `.relay_mode(RelayMode::custom(custom_urls ++
+  RelayMode::Default.relay_map().urls()))`.
+- `discovery-dns` replace: `.clear_address_lookup()` then
+  `.address_lookup(PkarrPublisher::builder(url))
+  .address_lookup(PkarrResolver::builder(url))`. augment: skip the clear (the
+  custom services stack on top of N0's).
+- The `dht.rs` `PkarrRelayClient` (currently `https://dns.iroh.link/pkarr`,
+  `PKARR_RELAY_URL`) is a single client with one URL: it follows the first
+  configured `discovery-dns` URL when set, else the n0 default. So setting a
+  `discovery-dns` server also points network/contact-record publish+resolve at
+  it. (Augment does not split publishing across two pkarr relays — one client,
+  one URL; documented nuance.)
 
 `dns-upstreams` is unrelated to the endpoint. It is applied at the Magic DNS
-resolver (`daemon.rs` `set_upstreams`, ~line 3065): final list =
-`replace ? custom : custom + captured_upstreams()`. This is the only setting
-that applies live (no restart).
+resolver: `set_upstreams(servers: Vec<Ipv4Addr>)` at `daemon.rs:3154`, fed from
+`captured_upstreams() -> Vec<Ipv4Addr>` at `daemon.rs:3149`. Final list =
+`replace ? custom : custom ++ captured`. IPv4 only (the resolver's upstream type),
+no ports.
 
 ## Config schema (`config.rs` → `settings.toml`)
 
@@ -120,7 +120,14 @@ Preset table (constants in the resolving modules):
 - `discovery-dns`: `rayfish` → `http://dns.iroh.rayfish.xyz:8080`, `n0` → iroh default.
 - `dns-upstreams`: no presets; literal IPs only.
 
-## CLI surface (`main.rs`)
+## CLI surface (`main.rs`) — client-side config write, no IPC
+
+Follows the established `cmd_mdns` pattern: the CLI reads/writes `settings.toml`
+directly via `config::load()` / `config::save_settings()` and prints "restart
+the daemon to apply." No new IPC messages. This matches `ray mdns on|off` and
+`ray status` (both work by reading/writing config directly). On Linux the config
+tree is under `/etc/rayfish` root-owned, so a write naturally requires root/sudo
+— same as `ray mdns`; reads are world-readable for non-secret settings.
 
 ```
 ray config                      # list all settings (alias: ray config get)
@@ -133,72 +140,86 @@ ray config unset <key>          # revert key to default
 - Default mode is **augment**; `--replace` opts into replacement. `--replace`
   help text notes the connectivity risk (a bad custom server with no fallback
   can isolate the node).
-- Validation: `relay` / `discovery-dns` entries must be a known preset keyword
-  or an `http`/`https` URL (`Url::parse`, scheme check); `dns-upstreams`
-  entries must be an IP or `IP:port`; unknown preset keywords rejected.
-- Setting `relay` or `discovery-dns` prints `run 'sudo ray restart' to apply`.
-  Setting `dns-upstreams` applies live and says so.
+- Validation at set time: `relay` / `discovery-dns` entries must be a known
+  preset keyword (`rayfish` / `n0`) or an `http`/`https` URL (`url::Url::parse`
+  + scheme check); `dns-upstreams` entries must parse as `Ipv4Addr`; unknown
+  preset keywords rejected with a clear message.
+- All three print `run 'sudo ray restart' for changes to take effect.` (same as
+  `cmd_mdns`). The daemon applies relay/discovery at endpoint bind and
+  dns-upstreams at activate, both on next start.
 - `--json` honored for `get` (machine-readable key/value list).
 
 Short aliases follow existing conventions (`get`→`ls`/`show` where it fits,
 `unset`→`rm`); finalized in the plan to stay unique within the subcommand enum.
 
-## IPC (`ipc.rs`) + privilege
+## How the daemon consumes the settings (no IPC)
 
-The daemon owns `/etc/rayfish` and is root, so `set`/`unset` go over IPC like
-other mutating commands (operator model). New messages:
-
-- `ConfigGet { key: Option<String> }` → `ConfigValues(Vec<(String, String)>)`.
-  Read; open to any local user (matches `status`/`show`).
-- `ConfigSet { key: String, value: String, replace: bool }` →
-  `ConfigResult { needs_restart: bool }` / error. Mutating; requires
-  root/operator via `check_authorized()`.
-- `ConfigUnset { key: String }` → same response.
-
-Daemon handlers: parse + validate the key/value, update the in-memory
-`AppConfig`, persist via `save_settings()`, then: for `dns-upstreams`,
-re-resolve and call `set_upstreams` live (`needs_restart = false`); for
-`relay` / `discovery-dns`, set `needs_restart = true` and apply on next bind.
+`build_daemon` already does `config::load()` and calls
+`create_endpoint_with_alpns`. Thread `app_config.relay` and
+`app_config.discovery_dns` into that call so `bind_endpoint` applies the relay /
+address-lookup overrides. The `dht.rs` pkarr client reads the resolved
+`discovery-dns` URL (via a small accessor) instead of the hardcoded constant.
+For `dns-upstreams`, the `activate()` path (`daemon.rs:3149-3154`) merges the
+configured upstreams with `captured_upstreams()` before `set_upstreams`.
 
 ## Resolution module
 
-A focused resolver (new `src/serverconfig.rs` or a section of `config.rs`) turns
-a `ServerOverride` into concrete iroh inputs, with one function per target:
+Pure helpers on `config.rs` (or a small `src/serverconfig.rs`) turn a
+`ServerOverride` into validated primitives, keeping `config` iroh-light (only
+`url::Url` / `std::net::Ipv4Addr`, no iroh types):
 
-- `resolve_relay(&ServerOverride) -> RelayMode` (Custom or combined RelayMap).
-- `resolve_discovery(&ServerOverride) -> Vec<Url>` + builder wiring helper.
-- `resolve_upstreams(&ServerOverride, captured: &[..]) -> Vec<SocketAddr>`.
+- `relay_urls(&ServerOverride) -> Result<Vec<String>>` — resolve presets
+  (`rayfish`/`n0`) to URL strings + validate; empty when unset.
+- `discovery_urls(&ServerOverride) -> Result<Vec<String>>` — same for the
+  discovery server(s).
+- `resolve_upstreams(&ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr>`
+  — `replace ? custom : custom ++ captured`.
 
-Keeps preset→URL mapping, mode logic, and validation in one testable place;
-`transport.rs` / `dht.rs` / `daemon.rs` call it at their bind/apply points.
+The iroh-typed conversion lives at the call site: `transport.rs` parses relay
+strings to `RelayUrl` and discovery strings to `url::Url` and applies the
+builder methods; `daemon.rs` merges upstreams. This keeps the iroh API surface
+in `transport.rs` where it already lives.
 
 ## Testing
 
 Unit:
 
 - Preset resolution (`rayfish`/`n0`/unknown) for relay and discovery-dns.
-- Entry parsing/validation: good and bad URLs, good and bad IPs, `IP:port`,
+- Entry parsing/validation: good and bad URLs, good and bad IPv4s,
   unknown preset rejected.
 - Mode list-building for all three (augment vs replace), including dns-upstreams
   augment merging with a sample captured list.
 - `settings.toml` round-trip with serde defaults: an old file (no new sections)
   loads as fully unset.
 
-Manual:
+Manual (all require `sudo ray restart` to take effect):
 
-- `ray config set dns-upstreams 1.1.1.1` then resolve a non-`.ray` name live.
-- `ray config set relay rayfish` + `sudo ray restart`, confirm the endpoint
-  binds against the rayfish relay; `ray config set discovery-dns rayfish` +
-  restart, confirm publish/resolve via `dns.iroh.rayfish.xyz`.
-- `ray config unset relay` restores n0.
+- `ray config set dns-upstreams 1.1.1.1` + restart, then resolve a non-`.ray`
+  name.
+- `ray config set relay rayfish` + restart, confirm the endpoint binds against
+  the rayfish relay; `ray config set discovery-dns rayfish` + restart, confirm
+  publish/resolve via `dns.iroh.rayfish.xyz`.
+- `ray config unset relay` + restart restores n0.
 
-## Risks / open items for the plan
+## Resolved during planning (was: open items)
 
-1. Exact iroh API to combine n0 default relay nodes with a custom relay for the
-   `relay` augment mode (vs. plain `RelayMode::Custom` for replace).
-2. Whether one `discovery-dns` URL covers both the endpoint-builder discovery
-   and the `dht.rs` pkarr-relay client, or they need distinct URLs.
-3. Augment stacking semantics for `.dns_resolver()` (singular) vs `.discovery()`
-   (stackable) — confirm the combined behavior matches "fall back to n0".
-4. Restructuring `bind_endpoint()` to keep the `presets::N0` fast path when no
-   override is set, switching to the explicit builder only when one is.
+1. Relay augment uses `RelayMode::custom(custom ++
+   RelayMode::Default.relay_map().urls::<Vec<RelayUrl>>())`; replace uses
+   `RelayMode::custom(custom)`. Verified in iroh 1.0.0.
+2. One `discovery-dns` URL drives both the endpoint `address_lookup`
+   (PkarrPublisher + PkarrResolver) and the `dht.rs` `PkarrRelayClient`. The
+   deployed `dns.iroh.rayfish.xyz` serves both roles.
+3. iroh 1.0.0 has no `.discovery()` / `DnsResolver::new(url)`; discovery is
+   `.address_lookup(...)` which stacks. Augment = stack on N0; replace =
+   `.clear_address_lookup()` then add custom.
+4. `bind_endpoint()` keeps `Endpoint::builder(presets::N0)` and conditionally
+   chains `.relay_mode(...)` / `.clear_address_lookup()` / `.address_lookup(...)`
+   only when a setting is configured — no separate "explicit builder" branch.
+
+## Deliberate change from the brainstorm
+
+The brainstorm sketched an IPC-based `ray config` with live DNS apply. Planning
+against the codebase showed the `cmd_mdns` precedent (client-side config write +
+"restart to apply") is simpler and consistent, and relay/discovery need a
+restart regardless. So `ray config` writes config directly and all three
+settings apply on daemon restart. No new IPC surface; one fewer moving part.

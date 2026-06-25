@@ -212,13 +212,17 @@ const UDP_FLOW_TIMEOUT: Duration = Duration::from_secs(30);
 /// A normalized connection flow, keyed by protocol + the local and peer
 /// (ip, port) endpoints. Direction-agnostic: both directions of one connection
 /// map to the same `Flow`, so return traffic matches the outbound entry.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct Flow {
     proto: u8,
     local_ip: IpAddr,
     local_port: u16,
     peer_ip: IpAddr,
     peer_port: u16,
+    /// ICMP echo identifier (0 for TCP/UDP and non-echo ICMP). ICMP has no
+    /// ports, so this is what distinguishes one ping session's flow from
+    /// another's; an echo-request and its reply share it, so the reply matches.
+    icmp_id: u16,
 }
 
 #[derive(Clone)]
@@ -332,6 +336,7 @@ impl SharedFirewall {
             local_port,
             peer_ip,
             peer_port,
+            icmp_id: info.icmp_id,
         };
 
         // 1. Explicit rules always win.
@@ -354,7 +359,17 @@ impl SharedFirewall {
                 // No explicit inbound rule. Allow established return traffic so
                 // the inbound default deny (or targeted inbound denies) don't
                 // sever this device's own outbound connections.
-                if self.flow_active(&flow) {
+                //
+                // ICMP is the exception: an echo-*request* is always new inbound
+                // (someone pinging us), never return traffic — only an
+                // echo-*reply* answers a ping we sent. So conntrack may rescue an
+                // inbound ICMP packet only when it's a reply; a request must face
+                // the rules/default. Without this, a request and reply share a
+                // flow (ICMP has no ports) and a recent outbound ping would
+                // wrongly whitelist the peer's inbound pings.
+                let conntrack_eligible =
+                    !is_icmp(proto) || is_icmp_echo_reply(proto, info.icmp_type);
+                if conntrack_eligible && self.flow_active(&flow) {
                     self.conntrack.insert(flow, Instant::now());
                     Action::Allow
                 } else {
@@ -375,7 +390,13 @@ impl SharedFirewall {
                 return;
             }
         }
-        self.conntrack.insert(flow.clone(), Instant::now());
+        // ICMP: only an echo-request *we* send opens a flow whose reply we then
+        // expect back. An outbound echo-reply (we answered someone's ping) or
+        // any other ICMP type must not whitelist the peer's inbound traffic.
+        if is_icmp(flow.proto) && !is_icmp_echo_request(flow.proto, info.icmp_type) {
+            return;
+        }
+        self.conntrack.insert(*flow, Instant::now());
     }
 
     /// True if `flow` is a tracked, non-expired outbound-initiated connection.
@@ -454,6 +475,34 @@ pub struct PacketInfo {
     /// stateful tracker to detect SYN/FIN/RST. Bits: FIN 0x01, SYN 0x02,
     /// RST 0x04, ACK 0x10.
     pub tcp_flags: u8,
+    /// ICMP/ICMPv6 type byte (offset 0 of the ICMP header). 0 for non-ICMP.
+    /// Lets conntrack distinguish an echo-request (new inbound) from an
+    /// echo-reply (return traffic) — ICMP has no ports, so without the type a
+    /// request and a reply collapse to the same flow.
+    pub icmp_type: u8,
+    /// ICMP echo identifier (offset 4..6 of the ICMP header) for echo
+    /// request/reply, else 0. Keys the conntrack flow so unrelated ping sessions
+    /// (and spoofed replies for ids we never sent) don't share an entry.
+    pub icmp_id: u16,
+}
+
+/// ICMP (v4) and ICMPv6 protocol numbers.
+fn is_icmp(proto: u8) -> bool {
+    proto == 1 || proto == 58
+}
+
+/// True for an ICMP echo-*request* (ICMPv4 type 8 / ICMPv6 type 128) — the
+/// packet `ping` sends. Only an echo-request *we* initiate establishes a
+/// trackable flow.
+fn is_icmp_echo_request(proto: u8, icmp_type: u8) -> bool {
+    (proto == 1 && icmp_type == 8) || (proto == 58 && icmp_type == 128)
+}
+
+/// True for an ICMP echo-*reply* (ICMPv4 type 0 / ICMPv6 type 129) — the answer
+/// to a ping. Only an echo-reply can be conntrack return traffic for an
+/// outbound echo-request.
+fn is_icmp_echo_reply(proto: u8, icmp_type: u8) -> bool {
+    (proto == 1 && icmp_type == 0) || (proto == 58 && icmp_type == 129)
 }
 
 pub fn parse_packet_info(packet: &[u8]) -> Option<PacketInfo> {
@@ -487,6 +536,7 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
 
     let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
     let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
+    let (icmp_type, icmp_id) = extract_icmp(protocol, packet, header_len);
 
     Some(PacketInfo {
         src_ip,
@@ -495,6 +545,8 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
         src_port,
         dst_port,
         tcp_flags,
+        icmp_type,
+        icmp_id,
     })
 }
 
@@ -513,6 +565,7 @@ fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
     let header_len = 40; // fixed IPv6 header (extension headers not yet supported)
     let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
     let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
+    let (icmp_type, icmp_id) = extract_icmp(protocol, packet, header_len);
 
     Some(PacketInfo {
         src_ip,
@@ -521,6 +574,8 @@ fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
         src_port,
         dst_port,
         tcp_flags,
+        icmp_type,
+        icmp_id,
     })
 }
 
@@ -541,6 +596,26 @@ fn extract_tcp_flags(protocol: u8, packet: &[u8], header_len: usize) -> u8 {
     } else {
         0
     }
+}
+
+/// Extract the ICMP/ICMPv6 (type, echo-identifier) from a packet. The type byte
+/// is the first byte of the ICMP header; the identifier (bytes 4..6) is only
+/// meaningful for echo request/reply, so it is 0 for every other ICMP type.
+/// Returns (0, 0) for non-ICMP packets.
+fn extract_icmp(protocol: u8, packet: &[u8], header_len: usize) -> (u8, u16) {
+    if !is_icmp(protocol) || packet.len() < header_len + 1 {
+        return (0, 0);
+    }
+    let icmp_type = packet[header_len];
+    let id = if (is_icmp_echo_request(protocol, icmp_type)
+        || is_icmp_echo_reply(protocol, icmp_type))
+        && packet.len() >= header_len + 6
+    {
+        u16::from_be_bytes([packet[header_len + 4], packet[header_len + 5]])
+    } else {
+        0
+    };
+    (icmp_type, id)
 }
 
 pub fn firewall_path() -> Result<PathBuf> {
@@ -1072,6 +1147,8 @@ mod tests {
             src_port: 40000,
             dst_port: 22,
             tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
         };
         let peer = test_id(1);
         // Arrives via db -> rule matches -> denied.
@@ -1551,6 +1628,176 @@ mod tests {
         assert_eq!(
             fw.evaluate_packet(Direction::In, &after, &peer_id, None),
             Action::Deny
+        );
+    }
+
+    // -- ICMP connection tracking ---------------------------------------------
+
+    const ECHO_REQUEST_V4: u8 = 8;
+    const ECHO_REPLY_V4: u8 = 0;
+    const ECHO_REQUEST_V6: u8 = 128;
+    const ECHO_REPLY_V6: u8 = 129;
+
+    /// Builds a 28-byte IPv4/ICMP packet with the given type + echo identifier.
+    fn icmp_pkt(src: Ipv4Addr, dst: Ipv4Addr, icmp_type: u8, id: u16) -> PacketInfo {
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45; // IPv4, IHL=5
+        p[9] = 1; // ICMP
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20] = icmp_type; // ICMP type (offset 0 of the ICMP header)
+        p[24] = (id >> 8) as u8; // identifier (offset 4..6)
+        p[25] = id as u8;
+        parse_packet_info(&p).unwrap()
+    }
+
+    /// Builds a 48-byte IPv6/ICMPv6 packet with the given type + echo identifier.
+    fn icmp6_pkt(src: Ipv6Addr, dst: Ipv6Addr, icmp_type: u8, id: u16) -> PacketInfo {
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60; // IPv6
+        p[6] = 58; // ICMPv6 next header
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        p[40] = icmp_type; // ICMPv6 type (offset 0 of the ICMPv6 header)
+        p[44] = (id >> 8) as u8; // identifier
+        p[45] = id as u8;
+        parse_packet_info(&p).unwrap()
+    }
+
+    #[test]
+    fn inbound_echo_request_not_masked_by_prior_outbound_ping() {
+        // The conntrack ICMP leak: with the allow-icmp rule removed and a
+        // deny-inbound default, a recent *outbound* ping to a peer must NOT let
+        // that peer ping us back in. An inbound echo-request is always new
+        // inbound traffic, never "return traffic" — even with the same echo id.
+        let fw = SharedFirewall::new(FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            rules: vec![], // seeded allow-icmp removed
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+
+        // We ping the peer: outbound echo-request, allowed (default) + tracked.
+        let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            Action::Allow
+        );
+
+        // Peer pings us: inbound echo-request (same echo id). Must be denied by
+        // the default, not masked by the tracked outbound flow.
+        let in_req = icmp_pkt(peer, me, ECHO_REQUEST_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn inbound_echo_reply_allowed_for_our_outbound_ping() {
+        // The legitimate case the tracking exists for: under deny-inbound, the
+        // reply to a ping *we* sent must come back in. Matched by echo id.
+        let fw = SharedFirewall::new(FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            rules: vec![],
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+
+        let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            Action::Allow
+        );
+        // Inbound echo-reply with the matching id -> allowed return traffic.
+        let in_reply = icmp_pkt(peer, me, ECHO_REPLY_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn inbound_echo_reply_for_unrelated_id_is_not_return_traffic() {
+        // A reply whose echo id we never sent isn't return traffic for any flow
+        // we initiated -> denied under deny-inbound (spoofed-reply hardening).
+        let fw = SharedFirewall::new(FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            rules: vec![],
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+
+        let out_req = icmp_pkt(me, peer, ECHO_REQUEST_V4, 0x1111);
+        fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None);
+        let in_reply = icmp_pkt(peer, me, ECHO_REPLY_V4, 0x2222);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn replying_to_a_ping_does_not_whitelist_the_pinger() {
+        // Sending an outbound echo-*reply* (because someone pinged us) must NOT
+        // create a flow that lets that peer's next echo-request in. Only
+        // echo-requests we initiate are trackable.
+        let fw = SharedFirewall::new(FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            rules: vec![],
+        });
+        let me = Ipv4Addr::new(100, 64, 0, 2);
+        let peer = Ipv4Addr::new(100, 64, 0, 3);
+        let peer_id = test_id(1);
+
+        // We emit an outbound echo-reply (id chosen by the original requester).
+        let out_reply = icmp_pkt(me, peer, ECHO_REPLY_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out_reply, &peer_id, None),
+            Action::Allow
+        );
+        // The peer's subsequent unsolicited echo-request stays denied.
+        let in_req = icmp_pkt(peer, me, ECHO_REQUEST_V4, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn icmpv6_echo_request_not_masked_by_prior_outbound_ping() {
+        // Same leak, ICMPv6 (types 128/129).
+        let fw = SharedFirewall::new(FirewallConfig {
+            default_inbound: Action::Deny,
+            default_outbound: Action::Allow,
+            rules: vec![],
+        });
+        let me = Ipv6Addr::new(0x2, 0, 0, 0, 0, 0, 0, 2);
+        let peer = Ipv6Addr::new(0x2, 0, 0, 0, 0, 0, 0, 3);
+        let peer_id = test_id(1);
+
+        let out_req = icmp6_pkt(me, peer, ECHO_REQUEST_V6, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &out_req, &peer_id, None),
+            Action::Allow
+        );
+        let in_req = icmp6_pkt(peer, me, ECHO_REQUEST_V6, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_req, &peer_id, None),
+            Action::Deny
+        );
+        // The matching reply still gets in.
+        let in_reply = icmp6_pkt(peer, me, ECHO_REPLY_V6, 0x1234);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &in_reply, &peer_id, None),
+            Action::Allow
         );
     }
 

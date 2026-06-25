@@ -389,8 +389,9 @@ impl DnsConfigurator for SystemdResolvedDBus {
             .context("failed to connect to system D-Bus")?;
 
         // SetLinkDNS(ifindex, [(family, address)])
-        // AF_INET = 2, address = [127, 0, 0, 1]
-        let dns_addrs: Vec<(i32, Vec<u8>)> = vec![(2i32, vec![127, 0, 0, 1])];
+        // AF_INET = 2; the address is the magic resolver IP, routed into the TUN.
+        let dns_addrs: Vec<(i32, Vec<u8>)> =
+            vec![(2i32, crate::dns::MAGIC_DNS_V4.octets().to_vec())];
         conn.call_method(
             Some("org.freedesktop.resolve1"),
             "/org/freedesktop/resolve1",

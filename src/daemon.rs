@@ -5400,17 +5400,23 @@ async fn build_daemon(
     let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
     forward::spawn_tun_writer(tun_writer, tun_rx);
     let device_user_map = peers::DeviceUserMap::new();
+
+    // --- Magic DNS resolver + optional mDNS local discovery ---
+    let hostname_table = dns::new_hostname_table();
+    let reverse_table = dns::new_reverse_table();
+    let dns_resolver = std::sync::Arc::new(crate::dns_resolver::Resolver::new(
+        hostname_table.clone(),
+        reverse_table.clone(),
+    ));
     tokio::spawn(forward::run_mesh(
         tun_reader,
         peers.clone(),
         shared_firewall.clone(),
         token.clone(),
         stats.clone(),
+        dns_resolver.clone(),
+        tun_tx.clone(),
     ));
-
-    // --- Magic DNS resolver + optional mDNS local discovery ---
-    let hostname_table = dns::new_hostname_table();
-    let reverse_table = dns::new_reverse_table();
     spawn_dns_resolver(hostname_table.clone(), reverse_table.clone(), token.clone());
 
     let mdns_enabled = app_config.mdns_enabled;

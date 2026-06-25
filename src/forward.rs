@@ -87,6 +87,11 @@ pub struct DisconnectEvent {
     pub intentional: bool,
 }
 
+/// True when a parsed packet is a DNS query addressed to the magic resolver IP.
+pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
+    info.dst_port == 53 && info.dst_ip == IpAddr::V4(crate::dns::MAGIC_DNS_V4)
+}
+
 /// Main TUN read loop. Reads packets from the TUN device, extracts the destination IP,
 /// looks up the peer in [`PeerTable`], and sends the packet as a QUIC datagram.
 /// Packets with no matching peer are silently dropped.
@@ -97,6 +102,8 @@ pub async fn run_mesh(
     firewall: SharedFirewall,
     token: CancellationToken,
     stats: Arc<ForwardMetrics>,
+    resolver: Arc<crate::dns_resolver::Resolver>,
+    tun_tx: mpsc::Sender<Bytes>,
 ) -> Result<()> {
     let mut pool = BytesMut::with_capacity(TX_POOL_CHUNK);
     loop {
@@ -124,6 +131,10 @@ pub async fn run_mesh(
             tracing::debug!(len = n, "not IP, dropping");
             continue;
         };
+        if is_magic_dns(&info) {
+            resolver.handle_tun_query(&pkt, &info, &tun_tx).await;
+            continue; // do not fall through to peer routing
+        }
         let lookup = match info.dst_ip {
             IpAddr::V4(v4) => peers.lookup_v4(&v4),
             IpAddr::V6(v6) => peers.lookup_v6(&v6),
@@ -375,6 +386,29 @@ mod tests {
             evaluate_inbound(&pkt, &fw, &peer, "test-net"),
             InboundDecision::Accept
         ));
+    }
+
+    #[test]
+    fn magic_dns_predicate_matches_only_magic_ip_port_53() {
+        let mk = |ip: std::net::IpAddr, port: u16| firewall::PacketInfo {
+            src_ip: "100.64.0.5".parse().unwrap(),
+            dst_ip: ip,
+            protocol: 17,
+            src_port: 50000,
+            dst_port: port,
+            tcp_flags: 0,
+            icmp_type: 0,
+            icmp_id: 0,
+        };
+        assert!(is_magic_dns(&mk(
+            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            53
+        )));
+        assert!(!is_magic_dns(&mk(
+            std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            80
+        )));
+        assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
     }
 
     #[test]

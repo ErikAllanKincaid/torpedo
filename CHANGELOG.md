@@ -33,6 +33,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Richer daemon log files** — the rolling daily logs (bundled by `ray report`)
+  now capture `debug`-level detail for Rayfish itself while the console stays at
+  `info`, so diagnostics like hostname propagation are traceable in a report
+  without re-running with `RUST_LOG`. Dependency logs stay at `info`; `RUST_LOG`
+  still overrides everything.
 - **Additive firewall suggestions** — each suggested token becomes one allow/deny
   rule with no synthesized catch-all (allow-list relies on the node's own inbound
   default-deny; denies-only = blacklist). `ray status` ends with a `pending`
@@ -40,6 +45,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ray hostname` rename now reliably propagates.** A member's rename is kept as
+  a durable pending intent and re-delivered to a coordinator on every reconnect
+  and reconverge until the signed roster confirms it, so the new name reaches the
+  coordinator and all peers instead of sticking only on the renamed node. The
+  renamed node keeps showing its new name across reconverges rather than briefly
+  reverting to the old one.
+- **`ray status` no longer shows `?` for a live connection's path.** A connection
+  that is up but whose path iroh hasn't marked "selected" yet (during holepunch or
+  migration) now reports its actual `direct`/`relay`/`tor` path instead of `?`.
+- **`ray status` no longer glues a network's `join <room-id>` onto the last peer
+  row.** The room-id line now prints on its own line.
 - Publish the contact record regardless of data-plane state, so `ray connect`
   resolves a peer that is on standby (`ray down`).
 

@@ -1730,6 +1730,7 @@ impl DaemonState {
             group_mode: mode,
             my_ip: Some(my_ip),
             my_hostname: Some(my_hostname.clone()),
+            pending_hostname: None,
             members: member_entries,
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
@@ -2562,6 +2563,9 @@ impl DaemonState {
         disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
         cancel: CancellationToken,
     ) {
+        // Announce the current name (a pending rename or the confirmed one),
+        // read fresh from config, rather than a value captured before a rename.
+        let my_hostname = outgoing_hostname(network_name).or(my_hostname);
         for m in members {
             if m.identity == my_identity {
                 continue;
@@ -2784,6 +2788,9 @@ impl DaemonState {
             group_mode: mode,
             my_ip: Some(my_ip),
             my_hostname: persisted_hostname.clone(),
+            // Coordinators publish renames directly, so they never carry a
+            // pending intent.
+            pending_hostname: None,
             members: member_entries,
             approved: approved_entries,
             network_secret_key: Some(net_secret_key.clone()),
@@ -3524,11 +3531,17 @@ impl DaemonState {
 
     fn gather_conn_info(conn: &iroh::endpoint::Connection) -> ipc::ConnectionInfo {
         let paths = conn.paths();
-        let selected = paths.iter().find(|p| p.is_selected());
-
-        let (conn_type, remote_addr, rtt_ms) = match selected {
-            Some(path) => {
-                let addr = path.remote_addr();
+        // Classify every path, then pick which one to report. iroh only marks a
+        // path `is_selected()` once its path-selector has promoted a winner;
+        // during establishment, holepunch, or migration no path is selected even
+        // though the connection is live and carrying traffic. Reporting only the
+        // selected path then renders a working connection as `?`. `choose_path`
+        // falls back to the best available (Direct > Relay > Tor) so a live
+        // connection always reports a concrete path.
+        let classes: Vec<(ipc::ConnType, bool)> = paths
+            .iter()
+            .map(|p| {
+                let addr = p.remote_addr();
                 let ct = if addr.is_relay() {
                     ipc::ConnType::Relay
                 } else if addr.is_custom() {
@@ -3536,8 +3549,20 @@ impl DaemonState {
                 } else {
                     ipc::ConnType::Direct
                 };
+                (ct, p.is_selected())
+            })
+            .collect();
+
+        let (conn_type, remote_addr, rtt_ms) = match choose_path_index(&classes)
+            .and_then(|idx| paths.iter().nth(idx).map(|p| (idx, p)))
+        {
+            Some((idx, path)) => {
                 let rtt = path.rtt().as_secs_f64() * 1000.0;
-                (ct, Some(addr.to_string()), Some(rtt))
+                (
+                    classes[idx].0.clone(),
+                    Some(path.remote_addr().to_string()),
+                    Some(rtt),
+                )
             }
             None => (ipc::ConnType::Unknown, None, None),
         };
@@ -3622,15 +3647,28 @@ impl DaemonState {
         )
         .await;
 
-        // Persist to config.
+        // Persist to config. A member also records the rename as a durable
+        // pending intent so it keeps being delivered to a coordinator across
+        // reconnects/restarts until the signed blob confirms it; a coordinator
+        // publishes authoritatively, so it clears any pending intent.
         if let Ok(Some(mut net)) = config::load_network(network) {
             net.my_hostname = Some(new_hostname.clone());
+            net.pending_hostname = if is_coord {
+                None
+            } else {
+                Some(new_hostname.clone())
+            };
             let _ = config::save_network(&net);
         }
 
         if is_coord {
             // Authoritative: republish the group blob and push the new roster to
             // every peer immediately.
+            tracing::info!(
+                network = %network,
+                hostname = %new_hostname,
+                "coordinator renamed self; republishing blob + broadcasting MemberSync"
+            );
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
             broadcast_member_sync(&self.peers, None).await;
         } else {
@@ -3638,6 +3676,13 @@ impl DaemonState {
             // only the coordinator's continuous control reader acts on it). It
             // resolves collisions and broadcasts the authoritative MemberSync.
             let peers = self.peers.peers_for_network_with_conn(network);
+            tracing::info!(
+                network = %network,
+                hostname = %new_hostname,
+                connected_peers = peers.len(),
+                "member rename queued as pending intent; sending MeshHello to connected peers"
+            );
+            let mut sent = 0usize;
             for (_peer_id, _peer_ip, conn) in &peers {
                 if let Ok((mut send, _recv)) = conn.open_bi().await {
                     let msg = ControlMsg::MeshHello {
@@ -3646,9 +3691,18 @@ impl DaemonState {
                         hostname: Some(new_hostname.clone()),
                         device_cert: self.device_cert.clone(),
                     };
-                    let _ = control::send_msg(&mut send, &msg).await;
+                    if control::send_msg(&mut send, &msg).await.is_ok() {
+                        sent += 1;
+                    }
                 }
             }
+            tracing::debug!(
+                network = %network,
+                hostname = %new_hostname,
+                sent,
+                connected_peers = peers.len(),
+                "fast-path rename MeshHello delivered; drain backstop covers the rest"
+            );
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
@@ -5969,6 +6023,9 @@ async fn reconverge_and_apply(
     hostname_table: &dns::HostnameTable,
     reverse_table: &dns::ReverseLookupTable,
     firewall: &SharedFirewall,
+    alpn: &[u8],
+    my_ip: Ipv4Addr,
+    device_cert: &Option<control::DeviceCert>,
 ) {
     let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
     let Some((signed, seeds)) = resolve_signed(endpoint, net_pubkey).await else {
@@ -5976,7 +6033,29 @@ async fn reconverge_and_apply(
         return;
     };
     if crate::membership::trusted_reconverge_hash(current, signed).is_none() {
-        return; // already converged on the signed hash
+        // Already converged on the signed hash — but a local rename can still be
+        // unconfirmed precisely *because* the coordinator hasn't republished, so
+        // the hash never changes. Keep driving the rename to the coordinator
+        // (the drain no-ops unless `pending_hostname` is set).
+        let roster = state
+            .read()
+            .unwrap()
+            .members
+            .all()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<Member>>();
+        drain_pending_rename(
+            endpoint,
+            &roster,
+            alpn,
+            network_name,
+            my_identity,
+            my_ip,
+            device_cert,
+        )
+        .await;
+        return;
     }
     let Some(data) =
         fetch_verified_blob(endpoint, blob_store, peers, signed, network_name, &seeds).await
@@ -6013,6 +6092,18 @@ async fn reconverge_and_apply(
     )
     .await;
     apply_suggested_firewall(firewall, my_identity, network_name, state);
+    // If a local rename is still unconfirmed by this just-applied blob, keep
+    // delivering it to the coordinator set until it lands.
+    drain_pending_rename(
+        endpoint,
+        &roster,
+        alpn,
+        network_name,
+        my_identity,
+        my_ip,
+        device_cert,
+    )
+    .await;
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
@@ -6434,6 +6525,12 @@ fn spawn_coordinator_control_reader(
             }
 
             let Some(desired) = hostname else { continue };
+            tracing::info!(
+                network = %network_name,
+                peer = %remote_id.fmt_short(),
+                desired = %desired,
+                "coordinator received MeshHello hostname"
+            );
 
             // Resolve collisions authoritatively against the rest of the roster,
             // then detect whether this is a genuine change for this member.
@@ -6481,9 +6578,11 @@ fn spawn_coordinator_control_reader(
             .await;
 
             if changed {
-                tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname changed; propagating");
+                tracing::info!(peer = %remote_id.fmt_short(), network = %network_name, hostname = %final_hostname, "peer hostname changed; republishing blob + broadcasting MemberSync");
                 update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
                 broadcast_member_sync(&peers, None).await;
+            } else {
+                tracing::debug!(peer = %remote_id.fmt_short(), network = %network_name, hostname = %final_hostname, "peer hostname unchanged; no republish (idempotent MeshHello)");
             }
         }
     });
@@ -6493,6 +6592,141 @@ fn spawn_coordinator_control_reader(
 /// truth) and persist our own — possibly coordinator-corrected — hostname. Called
 /// whenever a roster update arrives so renames, joins, and departures all reflect
 /// in `*.ray` resolution immediately.
+/// Pick which connection path to report in `ray status`. Prefers the path iroh
+/// has selected; otherwise falls back to the best concrete path so a live
+/// connection never renders as `Unknown` (`?`). Priority Direct > Relay > Tor.
+/// Returns the index into `classes`, or `None` only when there are no paths.
+fn choose_path_index(classes: &[(ipc::ConnType, bool)]) -> Option<usize> {
+    if let Some(i) = classes.iter().position(|(_, selected)| *selected) {
+        return Some(i);
+    }
+    for want in [
+        ipc::ConnType::Direct,
+        ipc::ConnType::Relay,
+        ipc::ConnType::Tor,
+    ] {
+        if let Some(i) = classes.iter().position(|(ct, _)| *ct == want) {
+            return Some(i);
+        }
+    }
+    // A path with no IP/relay/custom classification (none today) or, really,
+    // only reached when `classes` is empty.
+    (!classes.is_empty()).then_some(0)
+}
+
+/// Decide whether a locally-requested rename has been confirmed by the signed
+/// blob. Satisfied when the blob's self-name equals the requested name or its
+/// coordinator-assigned collision form `{pending}-{digits}` (e.g. a request for
+/// `alice` that the coordinator seated as `alice-1`). Used to clear the pending
+/// intent so we stop resending.
+fn rename_satisfied(pending: &str, blob: Option<&str>) -> bool {
+    match blob {
+        Some(name) if name == pending => true,
+        Some(name) => name
+            .strip_prefix(pending)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
+}
+
+/// Drive a queued rename to completion. If `pending_hostname` is still set after
+/// a reconverge (i.e. the freshly-applied blob doesn't yet reflect it), dial
+/// every coordinator in the roster and re-send `MeshHello(pending)`. A dialed
+/// connection is one the coordinator *accepts*, so its control reader always
+/// reads the hello regardless of which side first established the mesh link.
+/// Runs only while a rename is in flight, so steady state does no extra dialing.
+async fn drain_pending_rename(
+    endpoint: &Endpoint,
+    roster: &[Member],
+    alpn: &[u8],
+    network_name: &str,
+    my_identity: EndpointId,
+    my_ip: Ipv4Addr,
+    device_cert: &Option<control::DeviceCert>,
+) {
+    // `apply_roster_to_dns` already cleared the intent if the blob confirmed it,
+    // so a value here means it's genuinely still outstanding.
+    let Some(pending) = (match config::load_network(network_name) {
+        Ok(Some(net)) => net.pending_hostname,
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let coordinators: Vec<&Member> = roster
+        .iter()
+        .filter(|m| m.is_coordinator && m.identity != my_identity)
+        .collect();
+    tracing::info!(
+        network = %network_name,
+        hostname = %pending,
+        coordinators = coordinators.len(),
+        "pending rename outstanding; delivering MeshHello to coordinator set"
+    );
+    if coordinators.is_empty() {
+        tracing::warn!(
+            network = %network_name,
+            hostname = %pending,
+            "no other coordinator in roster to deliver pending rename to; will retry on next reconverge/backstop"
+        );
+    }
+
+    for m in coordinators {
+        match transport::connect_to_peer_with_alpn(endpoint, m.identity, alpn).await {
+            Ok(conn) => {
+                if let Ok((mut send, _recv)) = conn.open_bi().await {
+                    let _ = control::send_msg(
+                        &mut send,
+                        &ControlMsg::MeshHello {
+                            identity: my_identity,
+                            ip: my_ip,
+                            hostname: Some(pending.clone()),
+                            device_cert: device_cert.clone(),
+                        },
+                    )
+                    .await;
+                    tracing::info!(
+                        network = %network_name,
+                        coordinator = %m.identity.fmt_short(),
+                        hostname = %pending,
+                        "re-sent pending rename to coordinator"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    network = %network_name,
+                    coordinator = %m.identity.fmt_short(),
+                    error = %e,
+                    "could not reach coordinator to deliver pending rename; will retry"
+                );
+            }
+        }
+    }
+}
+
+/// Whether this node has an unconfirmed rename queued for `network_name`.
+/// Gates the reconverge worker's periodic backstop so it idles unless there's
+/// a rename to keep delivering.
+fn has_pending_hostname(network_name: &str) -> bool {
+    matches!(
+        config::load_network(network_name),
+        Ok(Some(net)) if net.pending_hostname.is_some()
+    )
+}
+
+/// The hostname this node should announce to peers: a not-yet-confirmed rename
+/// intent (`pending_hostname`) if one is queued, otherwise the confirmed name.
+/// Read fresh from config at every announce so a rename done mid-session is
+/// advertised on the next (re)connect — not a value captured at daemon start.
+fn outgoing_hostname(network_name: &str) -> Option<String> {
+    match config::load_network(network_name) {
+        Ok(Some(net)) => net.pending_hostname.or(net.my_hostname),
+        _ => None,
+    }
+}
+
 async fn apply_roster_to_dns(
     members: &[Member],
     network_name: &str,
@@ -6500,7 +6734,7 @@ async fn apply_roster_to_dns(
     hostname_table: &dns::HostnameTable,
     reverse_table: &dns::ReverseLookupTable,
 ) {
-    let entries: Vec<(String, Ipv4Addr, std::net::Ipv6Addr)> = members
+    let mut entries: Vec<(String, Ipv4Addr, std::net::Ipv6Addr)> = members
         .iter()
         .filter_map(|m| {
             m.hostname
@@ -6508,19 +6742,65 @@ async fn apply_roster_to_dns(
                 .map(|h| (h.clone(), m.ip, derive_ipv6(&m.identity)))
         })
         .collect();
-    dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 
-    // Persist our own name if the coordinator adjusted it (e.g. collision → -1).
-    if let Some(mine) = members
+    // Our own name in the freshly-fetched (authoritative) blob.
+    let blob_self = members
         .iter()
         .find(|m| m.identity == my_identity)
-        .and_then(|m| m.hostname.clone())
-        && let Ok(Some(mut net)) = config::load_network(network_name)
-        && net.my_hostname.as_deref() != Some(mine.as_str())
-    {
-        net.my_hostname = Some(mine);
-        let _ = config::save_network(&net);
+        .and_then(|m| m.hostname.clone());
+
+    if let Ok(Some(mut net)) = config::load_network(network_name) {
+        match net.pending_hostname.clone() {
+            // A locally-requested rename is in flight. Until the blob confirms
+            // it, keep showing/persisting the requested name and don't let a
+            // stale blob clobber it back to the old one.
+            Some(pending) if !rename_satisfied(&pending, blob_self.as_deref()) => {
+                tracing::info!(
+                    network = %network_name,
+                    pending = %pending,
+                    blob = blob_self.as_deref().unwrap_or("<none>"),
+                    "rename still unconfirmed by signed blob; holding local name and keeping it queued for delivery"
+                );
+                if let Some(me) = members.iter().find(|m| m.identity == my_identity) {
+                    // Override our own DNS entry so `.ray` resolution and
+                    // `ray status` reflect the pending name immediately.
+                    let v6 = derive_ipv6(&my_identity);
+                    entries.retain(|(_, v4, _)| *v4 != me.ip);
+                    entries.push((pending.clone(), me.ip, v6));
+                }
+                if net.my_hostname.as_deref() != Some(pending.as_str()) {
+                    net.my_hostname = Some(pending);
+                    let _ = config::save_network(&net);
+                }
+            }
+            // Either the rename landed, or there was none: follow the blob and
+            // clear any (now-confirmed) pending intent.
+            pending => {
+                let mut dirty = false;
+                if let Some(p) = &pending {
+                    tracing::info!(
+                        network = %network_name,
+                        requested = %p,
+                        confirmed = blob_self.as_deref().unwrap_or("<none>"),
+                        "rename confirmed by signed blob; clearing pending intent"
+                    );
+                    net.pending_hostname = None;
+                    dirty = true;
+                }
+                if let Some(mine) = blob_self.clone()
+                    && net.my_hostname.as_deref() != Some(mine.as_str())
+                {
+                    net.my_hostname = Some(mine);
+                    dirty = true;
+                }
+                if dirty {
+                    let _ = config::save_network(&net);
+                }
+            }
+        }
     }
+
+    dns::sync_network_hostnames(hostname_table, reverse_table, network_name, &entries).await;
 }
 
 /// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the
@@ -6730,14 +7010,18 @@ async fn join_mesh_shared(
     // Preserve the direct-connection flag across reconnects (a member joining a
     // 2-peer `ray connect` network). On the first join the flag is set by the
     // `connect` handler after this returns.
-    let direct = config::load_network(network_name)?
-        .map(|n| n.direct)
-        .unwrap_or(false);
+    // Preserve a queued rename intent across reconnects/restores: the blob we
+    // just fetched won't carry it yet, so persisting it here keeps the drain
+    // alive until a coordinator confirms the new name.
+    let (direct, pending_hostname) = config::load_network(network_name)?
+        .map(|n| (n.direct, n.pending_hostname))
+        .unwrap_or((false, None));
     config::save_network(&config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
         my_ip: Some(my_ip),
         my_hostname: persisted_hostname,
+        pending_hostname,
         members: member_entries,
         approved: approved_config,
         network_secret_key: None,
@@ -6757,7 +7041,10 @@ async fn join_mesh_shared(
             &ControlMsg::MeshHello {
                 identity: my_identity,
                 ip: my_ip,
-                hostname: my_hostname.clone(),
+                // Read fresh so a rename done since startup (a pending intent or
+                // the confirmed name) is announced on this reconnect, not a name
+                // captured when the daemon launched.
+                hostname: outgoing_hostname(network_name),
                 device_cert: device_cert.clone(),
             },
         )
@@ -6803,7 +7090,7 @@ async fn join_mesh_shared(
                     &ControlMsg::MeshHello {
                         identity: my_identity,
                         ip: my_ip,
-                        hostname: my_hostname.clone(),
+                        hostname: outgoing_hostname(network_name),
                         device_cert: device_cert.clone(),
                     },
                 )
@@ -6882,11 +7169,31 @@ async fn join_mesh_shared(
         let firewall_w = firewall.clone();
         let my_identity_w = my_identity;
         let net_pubkey_w = net_pubkey;
+        let alpn_w = alpn.to_vec();
+        let my_ip_w = my_ip;
+        let device_cert_w = device_cert.clone();
         async move {
+            // Backstop tick so a queued rename is retried even on a quiet
+            // network that sends no `MemberSync`/`BlobUpdated` triggers. It does
+            // a reconverge only while a rename is outstanding, so steady state
+            // stays trigger-driven (no extra pkarr traffic).
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
                     _ = notify.notified() => {}
+                    _ = tick.tick() => {
+                        // Only the pending-rename backstop wants the periodic
+                        // wake; otherwise idle until the next real trigger.
+                        if !has_pending_hostname(&network_name) {
+                            continue;
+                        }
+                        tracing::debug!(
+                            network = %network_name,
+                            "backstop tick: pending rename outstanding, reconverging to retry delivery"
+                        );
+                    }
                 }
                 // Debounce: absorb a burst of triggers into a single reconverge.
                 // A trigger that arrives during the sleep or the reconverge is
@@ -6899,6 +7206,7 @@ async fn join_mesh_shared(
                     &endpoint_w, &blob_store, &peers_w, net_pubkey_w,
                     &network_name, &live_state, my_identity_w,
                     &hostname_table_w, &reverse_table_w, &firewall_w,
+                    &alpn_w, my_ip_w, &device_cert_w,
                 ).await;
             }
         }
@@ -7084,7 +7392,10 @@ fn spawn_reconnect_loop(
     network_name: String,
     my_identity: EndpointId,
     my_ip: Ipv4Addr,
-    my_hostname: Option<String>,
+    // The reconnect MeshHello reads the current hostname fresh from config
+    // (`outgoing_hostname`) rather than a captured value, so this is no longer
+    // threaded through. Kept for call-site symmetry with the other spawn paths.
+    _my_hostname: Option<String>,
     peers: PeerTable,
     tun_tx: mpsc::Sender<Bytes>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
@@ -7131,7 +7442,6 @@ fn spawn_reconnect_loop(
             let token = token.clone();
             let stats = stats.clone();
             let firewall = firewall.clone();
-            let my_hostname = my_hostname.clone();
             let device_cert = device_cert.clone();
             let device_user_map = device_user_map.clone();
 
@@ -7162,7 +7472,7 @@ fn spawn_reconnect_loop(
                                 &ControlMsg::MeshHello {
                                     identity: my_identity,
                                     ip: my_ip,
-                                    hostname: my_hostname.clone(),
+                                    hostname: outgoing_hostname(&network_name),
                                     device_cert: device_cert.clone(),
                                 },
                             )
@@ -7353,6 +7663,48 @@ mod accept_handler_tests {
     fn holds_key_implies_coordinator_role() {
         assert_eq!(role_for_key_holder(true), NetworkRole::Coordinator);
         assert_eq!(role_for_key_holder(false), NetworkRole::Member);
+    }
+
+    #[test]
+    fn choose_path_prefers_selected() {
+        use ipc::ConnType::*;
+        // The selected path wins even when it isn't the "best" type.
+        let classes = [(Relay, false), (Direct, true)];
+        assert_eq!(super::choose_path_index(&classes), Some(1));
+    }
+
+    #[test]
+    fn choose_path_falls_back_to_best_unselected() {
+        use ipc::ConnType::*;
+        // No path selected: report a concrete path (Direct > Relay > Tor)
+        // instead of Unknown, so a live connection never shows `?`.
+        let classes = [(Relay, false), (Direct, false), (Tor, false)];
+        assert_eq!(super::choose_path_index(&classes), Some(1));
+
+        let only_relay = [(Relay, false)];
+        assert_eq!(super::choose_path_index(&only_relay), Some(0));
+    }
+
+    #[test]
+    fn choose_path_empty_is_none() {
+        assert_eq!(super::choose_path_index(&[]), None);
+    }
+
+    #[test]
+    fn rename_satisfied_exact_and_collision_forms() {
+        // Exact match confirms the rename.
+        assert!(super::rename_satisfied("scw-iroh", Some("scw-iroh")));
+        // Coordinator-assigned collision suffix still confirms it.
+        assert!(super::rename_satisfied("alice", Some("alice-1")));
+        assert!(super::rename_satisfied("alice", Some("alice-42")));
+        // A different name (still the old one, or someone else's) does not.
+        assert!(!super::rename_satisfied("scw-iroh", Some("bell")));
+        // A look-alike that isn't `name-<digits>` does not.
+        assert!(!super::rename_satisfied("alice", Some("alice-bob")));
+        assert!(!super::rename_satisfied("alice", Some("alicex")));
+        assert!(!super::rename_satisfied("alice", Some("alice-")));
+        // No blob entry yet: not satisfied.
+        assert!(!super::rename_satisfied("alice", None));
     }
 
     #[test]

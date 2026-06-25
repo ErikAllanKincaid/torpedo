@@ -550,11 +550,19 @@ impl Drop for LogGuard {
 fn init_tracing(to_file: bool) -> LogGuard {
     use tracing_subscriber::prelude::*;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    // The global gate must be permissive enough for the most verbose layer (the
+    // file), or events are dropped before any layer sees them. Default it to our
+    // crate at `debug` (dependencies stay at `info` so iroh/quinn don't flood the
+    // file), then keep the console quieter with a per-layer `info` filter below.
+    // `RUST_LOG` overrides both, so an operator can still dial either up or down.
+    let global_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rayfish=debug"));
+    let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    // Console layer — unchanged behavior (human text on stdout).
-    let console_layer = tracing_subscriber::fmt::layer();
+    // Console layer — human text on stdout, held at `info` so CLI output and the
+    // daemon console stay readable while the file keeps the `debug` detail.
+    let console_layer = tracing_subscriber::fmt::layer().with_filter(console_filter);
 
     // File layer — daemon only, human text with ANSI stripped, rotated daily.
     let (file_layer, appender_guard) = if to_file {
@@ -607,7 +615,7 @@ fn init_tracing(to_file: bool) -> LogGuard {
     let otel_layer = build_otel_layer(&mut guard);
 
     tracing_subscriber::registry()
-        .with(filter)
+        .with(global_filter)
         .with(console_layer)
         .with(file_layer)
         .with(otel_layer)
@@ -1390,7 +1398,11 @@ async fn ipc_status() -> Result<()> {
                     if rows.is_empty() {
                         println!("    {}", style::faint("(no other members)"));
                     } else {
-                        print!("{}", indent(&layout::columns(&rows, 3), 4));
+                        // `indent` strips the block's trailing newline, so use
+                        // `println!` to terminate the last peer row — otherwise
+                        // the network's `join <room-id>` line below gets glued
+                        // onto it.
+                        println!("{}", indent(&layout::columns(&rows, 3), 4));
                     }
 
                     // join code. Direct (`ray connect`) networks have no shareable

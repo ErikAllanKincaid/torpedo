@@ -446,7 +446,7 @@ pub struct ConnectionInfo {
     pub lost_packets: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, derive_more::IsVariant)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, derive_more::IsVariant)]
 pub enum ConnType {
     Direct,
     Relay,

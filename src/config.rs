@@ -102,6 +102,14 @@ pub struct NetworkConfig {
     /// Our hostname in this network (persisted so it survives daemon restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
+    /// A locally-requested rename not yet confirmed by the signed blob. Set by
+    /// `ray hostname` on a member; the durable "deliver this rename to the
+    /// coordinator" intent. Survives daemon restarts and is *not* clobbered when
+    /// a reconverge applies a stale blob (unlike `my_hostname`), so the rename
+    /// keeps being re-sent until the coordinator publishes it. Cleared once the
+    /// blob reflects the new name (`rename_satisfied`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_hostname: Option<String>,
     /// Known members in this network.
     #[serde(default)]
     pub members: Vec<MemberEntry>,
@@ -798,6 +806,7 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
+            pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
@@ -812,6 +821,7 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
+            pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
@@ -847,6 +857,7 @@ mod tests {
             network_secret_key: None,
             network_public_key: None,
             my_hostname: None,
+            pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
             admins: vec![],
@@ -870,6 +881,7 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
+            pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
@@ -886,6 +898,7 @@ mod tests {
             network_secret_key: None,
             network_public_key: None,
             my_hostname: None,
+            pending_hostname: None,
             transport: None,
             auto_accept_firewall: false,
             admins: vec![],
@@ -913,6 +926,7 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
+            pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
@@ -927,6 +941,7 @@ mod tests {
                     network_secret_key: None,
                     network_public_key: None,
                     my_hostname: None,
+            pending_hostname: None,
                     transport: None,
                     auto_accept_firewall: false,
                     admins: vec![],
@@ -969,6 +984,7 @@ mod tests {
                 network_secret_key: None,
                 network_public_key: None,
                 my_hostname: None,
+            pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
@@ -996,6 +1012,7 @@ mod tests {
                 network_secret_key: Some(secret.clone()),
                 network_public_key: Some(public),
                 my_hostname: None,
+            pending_hostname: None,
                 transport: None,
                 auto_accept_firewall: false,
                 admins: vec![],
@@ -1061,6 +1078,7 @@ name = "test"
             group_mode: GroupMode::Restricted,
             my_ip: None,
             my_hostname: None,
+            pending_hostname: None,
             members: vec![],
             approved: vec![],
             network_secret_key: Some(iroh::SecretKey::generate()),

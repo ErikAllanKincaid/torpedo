@@ -135,4 +135,5 @@ One iroh Endpoint and TUN device are shared across all networks. Each network ge
 - TUN MTU 1280 (IPv6 minimum link MTU, RFC 8200 §5; matches WireGuard/Tailscale). Wire format (control + IPC): 4-byte BE length + msgpack body.
 - Room id = per-network public key string (discovery only). On a closed network, joining needs a one-time invite or operator approval; on an open network the room id alone admits. Invite code = `bs58(pubkey || coordinator || secret)`. Local aliases (adjective-noun-noun) are display-only.
 - Config under `~/.config/rayfish/`: `secret_key`, `device_cert`, `networks.toml`, `firewall.toml`, `invites/<network>.toml` (coordinator-only).
+- Keep commit subjects conventional (`feat`/`fix`/`docs`/`style`/`ci`/…): release notes are generated from them by git-cliff (`cliff.toml`). `release.yml` renders the tag's grouped changelog + a `prev...new` compare link; `nightly.yml` lists commits since the last stable tag.
 - Always update docs (CLAUDE.md, README.md) after finishing a feature or significant change.

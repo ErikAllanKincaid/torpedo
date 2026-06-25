@@ -26,6 +26,9 @@ jobs:
       tag: ${{ steps.extract_version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags so git-cliff can diff against the previous tag.
+          fetch-depth: 0
 
       - name: Extract version
         id: extract_version
@@ -50,6 +53,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Grouped changelog for this tag (since the previous vX.Y.Z) + a compare
+      # link, rendered from the conventional commit messages by cliff.toml.
+      - name: Generate release notes
+        id: notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --current --strip all
+        env:
+          OUTPUT: CHANGELOG.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         env:
@@ -57,6 +71,7 @@ jobs:
         with:
           tag_name: ${{ steps.extract_version.outputs.tag }}
           name: ${{ steps.extract_version.outputs.tag }}
+          body: ${{ steps.notes.outputs.content }}
           draft: false
           prerelease: ${{ contains(steps.extract_version.outputs.tag, '-') }}
 

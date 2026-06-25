@@ -54,6 +54,27 @@ impl Resolver {
         self.forward(query).await
     }
 
+    /// Answer a DNS query that arrived addressed to the magic IP via the TUN.
+    /// UDP only; TCP is dropped (no userspace TCP handler yet).
+    pub async fn handle_tun_query(
+        &self,
+        pkt: &[u8],
+        info: &crate::firewall::PacketInfo,
+        tun_tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) {
+        if info.protocol != 17 {
+            return; // TCP/other: drop cleanly.
+        }
+        // UDP payload begins after the IPv4 header (IHL*4) + 8-byte UDP header.
+        let ihl = ((pkt.first().copied().unwrap_or(0) & 0x0f) as usize) * 4;
+        let payload_start = ihl + 8;
+        let Some(dns_query) = pkt.get(payload_start..) else { return };
+        let Some(resp) = self.resolve(dns_query).await else { return };
+        if let Some(reply) = crate::dns_packet::build_udp_reply(info, &resp) {
+            let _ = tun_tx.send(reply).await;
+        }
+    }
+
     async fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
         let upstreams = self.upstreams.load();
         for up in upstreams.iter() {
@@ -116,6 +137,57 @@ mod tests {
                 false
             }
         })
+    }
+
+    #[tokio::test]
+    async fn handle_tun_query_injects_reply_for_ray_name() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let table = crate::dns::new_hostname_table();
+        let reverse = crate::dns::new_reverse_table();
+        crate::dns::update_hostname(&table, &reverse, "homelab", "dario",
+            Ipv4Addr::new(100, 64, 0, 7), "200::7".parse().unwrap()).await;
+        let r = Resolver::new(table, reverse);
+
+        // Build a full IPv4/UDP query packet to MAGIC_IP:53 (use build_udp_reply
+        // in reverse: synthesize a query with src=app, dst=magic).
+        let dns_query = build_a_query("dario.homelab.ray");
+        let app = crate::firewall::PacketInfo {
+            src_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
+            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            protocol: 17, src_port: 50000, dst_port: 53,
+            tcp_flags: 0, icmp_type: 0, icmp_id: 0,
+        };
+        let query_pkt = crate::dns_packet::build_udp_reply(
+            &crate::firewall::PacketInfo { // reuse builder: swap so the produced packet is app->magic
+                src_ip: app.dst_ip, dst_ip: app.src_ip,
+                src_port: app.dst_port, dst_port: app.src_port, ..app
+            },
+            &dns_query,
+        ).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = crate::firewall::parse_packet_info(&query_pkt).unwrap();
+        r.handle_tun_query(&query_pkt, &info, &tx).await;
+
+        let reply = rx.try_recv().expect("a reply was injected");
+        let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
+        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.dst_port, 50000);
+        assert!(response_has_a(&reply[28..], Ipv4Addr::new(100, 64, 0, 7)));
+    }
+
+    #[tokio::test]
+    async fn handle_tun_query_drops_tcp() {
+        let r = Resolver::new(crate::dns::new_hostname_table(), crate::dns::new_reverse_table());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = crate::firewall::PacketInfo {
+            src_ip: "100.64.0.5".parse().unwrap(),
+            dst_ip: std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            protocol: 6, src_port: 50000, dst_port: 53,
+            tcp_flags: 0x02, icmp_type: 0, icmp_id: 0,
+        };
+        r.handle_tun_query(&[0u8; 40], &info, &tx).await;
+        assert!(rx.try_recv().is_err(), "TCP must be dropped, no reply");
     }
 
     #[tokio::test]

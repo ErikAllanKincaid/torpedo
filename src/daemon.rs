@@ -3146,7 +3146,11 @@ impl DaemonState {
         dns_config::restore_stale_backups();
         match dns_config::detect_and_configure(&self.tun_name).await {
             Ok(c) => {
-                let upstreams = c.captured_upstreams();
+                let captured = c.captured_upstreams();
+                // Merge any user-configured DNS upstreams over the system-captured
+                // set (replace drops the captured ones; augment tries custom first).
+                let dns_override = config::load().map(|c| c.dns_upstreams).unwrap_or_default();
+                let upstreams = config::resolve_upstreams(&dns_override, captured);
                 let is_direct = c.name() == "direct-resolv.conf";
                 #[cfg(target_os = "linux")]
                 let search = c.search_domains();
@@ -5387,6 +5391,9 @@ async fn build_daemon(
 
     // --- iroh endpoint (one ALPN per saved network + the blobs ALPN) ---
     let mut app_config = config::load()?;
+    // Point the pkarr client at the configured discovery-DNS server (if any)
+    // before any record publish/resolve happens.
+    dht::set_discovery_override(&app_config.discovery_dns);
     // Lazily generate + persist this node's contact key (`ray connect`). The
     // secret stays in config; only its public id is held in `DaemonState`.
     let contact_public = config::contact_secret(&mut app_config).public();
@@ -5412,7 +5419,14 @@ async fn build_daemon(
         .networks
         .iter()
         .any(|net| net.transport.as_ref().is_some_and(|t| t.is_tor()));
-    let ep = transport::create_endpoint_with_alpns(key.clone(), alpns, use_tor).await?;
+    let ep = transport::create_endpoint_with_alpns(
+        key.clone(),
+        alpns,
+        use_tor,
+        &app_config.relay,
+        &app_config.discovery_dns,
+    )
+    .await?;
 
     // --- Content-addressed blob store (membership/file transfer) ---
     let blobs_dir = config::config_dir()?.join("blobs");

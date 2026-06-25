@@ -6,8 +6,14 @@
 
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection, endpoint::presets,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
+    address_lookup::{PkarrPublisher, PkarrResolver},
+    endpoint::Builder,
+    endpoint::Connection,
+    endpoint::presets,
 };
+
+use crate::config::ServerOverride;
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
@@ -55,13 +61,15 @@ pub async fn create_endpoint_with_alpns(
     secret_key: SecretKey,
     alpns: Vec<Vec<u8>>,
     tor: bool,
+    relay: &ServerOverride,
+    discovery: &ServerOverride,
 ) -> Result<Endpoint> {
     // Bind the fixed port so the daemon is reachable on a known, forwardable UDP
     // port across restarts. The builder is consumed by `.bind()`, so we rebuild
     // it for the ephemeral fallback. Falling back keeps the `0.0.0.0:0` guarantee
     // that the daemon always starts even if the fixed port is already in use.
     let fixed = format!("0.0.0.0:{RAYFISH_LISTEN_PORT}");
-    let ep = match bind_endpoint(&secret_key, &alpns, tor, &fixed).await {
+    let ep = match bind_endpoint(&secret_key, &alpns, tor, &fixed, relay, discovery).await {
         Ok(ep) => ep,
         Err(e) => {
             tracing::warn!(
@@ -69,7 +77,7 @@ pub async fn create_endpoint_with_alpns(
                 error = %e,
                 "fixed UDP port unavailable; falling back to an ephemeral port"
             );
-            bind_endpoint(&secret_key, &alpns, tor, "0.0.0.0:0")
+            bind_endpoint(&secret_key, &alpns, tor, "0.0.0.0:0", relay, discovery)
                 .await
                 .context("failed to bind iroh endpoint")?
         }
@@ -88,6 +96,8 @@ async fn bind_endpoint(
     alpns: &[Vec<u8>],
     tor: bool,
     bind: &str,
+    relay: &ServerOverride,
+    discovery: &ServerOverride,
 ) -> Result<Endpoint> {
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -96,6 +106,12 @@ async fn bind_endpoint(
         .clear_ip_transports()
         .bind_addr(bind)
         .context("invalid bind address")?;
+
+    // Override the N0 preset's relay / discovery defaults when configured.
+    if let Some(mode) = build_relay_mode(relay)? {
+        builder = builder.relay_mode(mode);
+    }
+    builder = apply_discovery(builder, discovery)?;
 
     #[cfg(feature = "tor")]
     if tor {
@@ -117,6 +133,47 @@ async fn bind_endpoint(
     }
 
     builder.bind().await.context("failed to bind iroh endpoint")
+}
+
+/// Build a custom [`RelayMode`] from a relay override, or `None` when unset (in
+/// which case the N0 preset's default relays are kept). Replace mode uses only
+/// the configured relays; augment mode appends n0's default relay URLs so the
+/// node keeps the n0 fallback.
+pub fn build_relay_mode(o: &ServerOverride) -> Result<Option<RelayMode>> {
+    let urls = crate::config::relay_urls(o)?;
+    if urls.is_empty() {
+        return Ok(None);
+    }
+    let mut parsed: Vec<RelayUrl> = urls
+        .iter()
+        .map(|u| u.parse().with_context(|| format!("invalid relay URL: {u}")))
+        .collect::<Result<_>>()?;
+    if !o.replace {
+        parsed.extend(RelayMode::Default.relay_map().urls::<Vec<RelayUrl>>());
+    }
+    Ok(Some(RelayMode::custom(parsed)))
+}
+
+/// Apply a discovery-DNS override to the endpoint builder. Each configured URL
+/// is registered as a pkarr publisher + resolver. Replace mode first clears the
+/// preset's address-lookup services (n0 pkarr/DNS); augment mode stacks on top.
+fn apply_discovery(mut builder: Builder, o: &ServerOverride) -> Result<Builder> {
+    let urls = crate::config::discovery_urls(o)?;
+    if urls.is_empty() {
+        return Ok(builder);
+    }
+    if o.replace {
+        builder = builder.clear_address_lookup();
+    }
+    for u in urls {
+        let url: url::Url = u
+            .parse()
+            .with_context(|| format!("invalid discovery URL: {u}"))?;
+        builder = builder
+            .address_lookup(PkarrPublisher::builder(url.clone()))
+            .address_lookup(PkarrResolver::builder(url));
+    }
+    Ok(builder)
 }
 
 #[allow(dead_code)]
@@ -182,6 +239,25 @@ mod tests {
         let key_str = key.to_string();
         let expected = format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{}", &key_str[..16]);
         assert_eq!(alpn, expected.as_bytes());
+    }
+
+    #[test]
+    fn relay_mode_augment_vs_replace() {
+        // Unset: keep the preset default (None).
+        assert!(build_relay_mode(&ServerOverride::default()).unwrap().is_none());
+
+        // A parseable relay URL (iroh RelayUrl requires a host).
+        let custom = "https://relay.example.com".to_string();
+
+        // Replace: only the custom relay.
+        let rep = ServerOverride { servers: vec![custom.clone()], replace: true };
+        let mode = build_relay_mode(&rep).unwrap().expect("some mode");
+        assert_eq!(mode.relay_map().urls::<Vec<RelayUrl>>().len(), 1);
+
+        // Augment: custom + n0 defaults (more than one).
+        let aug = ServerOverride { servers: vec![custom], replace: false };
+        let mode = build_relay_mode(&aug).unwrap().expect("some mode");
+        assert!(mode.relay_map().urls::<Vec<RelayUrl>>().len() > 1);
     }
 
     #[test]

@@ -158,6 +158,28 @@ sudo ray start | stop                    # start / stop the service. stop = full
 sudo ray set-operator <user>              # let a user run ray without sudo
 ```
 
+## Custom relay & DNS
+
+By default rayfish uses iroh's public infrastructure for relay fallback and peer
+discovery. You can point it at your own servers (or the rayfish-operated ones)
+with `ray config`:
+
+```bash
+ray config                                   # show current settings
+ray config set relay rayfish                 # use the rayfish relay (keeps n0 as fallback)
+ray config set relay https://r1,https://r2   # multiple custom relays
+ray config set discovery-dns rayfish         # custom discovery / pkarr server
+ray config set dns-upstreams 1.1.1.1,8.8.8.8 # forwarders for non-.ray names
+ray config set relay https://r1 --replace    # drop the n0 defaults entirely
+ray config unset relay                        # back to defaults
+```
+
+Keys: `relay`, `discovery-dns`, `dns-upstreams`. Values are a comma list of
+presets (`rayfish`, `n0`), URLs, or IPv4 addresses. By default custom servers are
+added alongside the defaults; `--replace` swaps them out (a bad custom server
+with no fallback can isolate the node). Settings are saved to `settings.toml` and
+take effect on `sudo ray restart`.
+
 ## Troubleshooting
 
 ```bash

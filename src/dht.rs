@@ -16,6 +16,30 @@ const RECORD_VERSION: &str = "v1";
 const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
 
+/// Process-wide pkarr relay URL, set once at daemon startup from the
+/// `discovery-dns` config. The discovery server is a set-once constant for the
+/// daemon's lifetime, so a `OnceLock` avoids threading it through every
+/// `create_pkarr_client` caller.
+static PKARR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Point the pkarr client at the configured `discovery-dns` server (first URL
+/// wins). No-op when unset, keeping the n0 default. Called once in build_daemon.
+pub fn set_discovery_override(o: &crate::config::ServerOverride) {
+    if let Ok(urls) = crate::config::discovery_urls(o)
+        && let Some(first) = urls.into_iter().next()
+    {
+        let _ = PKARR_OVERRIDE.set(first);
+    }
+}
+
+/// The pkarr relay URL in effect: the configured override, else the n0 default.
+pub fn effective_pkarr_url() -> String {
+    PKARR_OVERRIDE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PKARR_RELAY_URL.to_string())
+}
+
 /// pkarr record name for a user's contact key (`ray connect`). Published under
 /// the contact key, it maps the contact id to the user's current transport
 /// EndpointId so a peer can dial them without knowing the transport id.
@@ -31,7 +55,7 @@ pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
         .dns_resolver()
         .context("endpoint has no DNS resolver")?
         .clone();
-    let relay_url: Url = PKARR_RELAY_URL.parse().expect("relay URL is valid");
+    let relay_url: Url = effective_pkarr_url().parse().expect("relay URL is valid");
     Ok(PkarrRelayClient::new(relay_url, tls_config, dns_resolver))
 }
 
@@ -213,6 +237,14 @@ pub async fn resolve_contact(
 mod tests {
     use super::*;
     use iroh::SecretKey;
+
+    #[test]
+    fn effective_url_defaults_when_unset() {
+        // The OnceLock is process-global; this binary never sets it, so the
+        // default holds. (We avoid asserting the set path here to keep tests
+        // order-independent.)
+        assert_eq!(effective_pkarr_url(), PKARR_RELAY_URL);
+    }
 
     #[test]
     fn network_record_roundtrip() {

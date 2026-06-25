@@ -221,6 +221,11 @@ enum Command {
         /// "on" or "off"
         state: String,
     },
+    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// Authorize a user to run ray without sudo (requires root)
     SetOperator {
         /// Username or numeric UID to grant operator access
@@ -362,6 +367,32 @@ enum ConnectionsAction {
     Approve {
         /// Short id of the requester (from `ray connections`)
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show settings (all, or one key)
+    #[command(visible_alias = "ls")]
+    Get {
+        /// relay, discovery-dns, or dns-upstreams (omit for all)
+        key: Option<String>,
+    },
+    /// Set a key. Value is a comma list of presets (rayfish/n0), URLs, or IPs.
+    Set {
+        /// relay, discovery-dns, or dns-upstreams
+        key: String,
+        /// Comma list of presets / URLs / IPv4s (use "n0" or empty to reset)
+        value: String,
+        /// Replace the defaults instead of augmenting them (can isolate the node)
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Reset a key to its default (iroh n0)
+    #[command(visible_alias = "rm")]
+    Unset {
+        /// relay, discovery-dns, or dns-upstreams
+        key: String,
     },
 }
 
@@ -799,6 +830,7 @@ async fn main() -> Result<()> {
         } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Mdns { state } => cmd_mdns(&state),
+        Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
         Command::Send { file, peer } => ipc_send_file(&file, &peer).await,
         Command::Files { action } => ipc_files(action).await,
@@ -837,6 +869,43 @@ fn cmd_mdns(state: &str) -> Result<()> {
         "mDNS discovery {}. Restart the daemon for changes to take effect.",
         if enabled { "enabled" } else { "disabled" }
     );
+    Ok(())
+}
+
+/// `ray config get/set/unset`: view or change global daemon settings. Writes
+/// `settings.toml` directly (like `cmd_mdns`); relay/discovery/dns-upstreams all
+/// take effect on the next daemon restart. On Linux the config tree is root-
+/// owned, so a write naturally requires sudo.
+fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
+    match action.unwrap_or(ConfigAction::Get { key: None }) {
+        ConfigAction::Get { key } => {
+            let cfg = config::load()?;
+            let rows = config::config_get(&cfg, key.as_deref())?;
+            if json {
+                let map: serde_json::Map<String, serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect();
+                print_json(&serde_json::Value::Object(map));
+            } else {
+                for (k, v) in rows {
+                    println!("{k} = {v}");
+                }
+            }
+        }
+        ConfigAction::Set { key, value, replace } => {
+            let mut cfg = config::load()?;
+            config::config_set(&mut cfg, &key, &value, replace)?;
+            config::save_settings(&cfg)?;
+            println!("Set {key}. Run 'sudo ray restart' for changes to take effect.");
+        }
+        ConfigAction::Unset { key } => {
+            let mut cfg = config::load()?;
+            config::config_set(&mut cfg, &key, "", false)?;
+            config::save_settings(&cfg)?;
+            println!("Reset {key} to default. Run 'sudo ray restart' for changes to take effect.");
+        }
+    }
     Ok(())
 }
 
@@ -3212,6 +3281,77 @@ struct GhRelease {
     /// used to annotate `ray update --list`.
     #[serde(default)]
     prerelease: bool,
+    /// The release notes (git-cliff renders these from conventional commits in
+    /// `release.yml`). Printed by `ray update` so the user sees what each pending
+    /// version changes; `None`/empty for releases without notes.
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// Print one release's notes, indented under its tag. A blank or missing body
+/// prints just the tag line.
+fn print_release_notes(tag: &str, body: Option<&str>) {
+    println!("\n  {tag}");
+    if let Some(b) = body.map(str::trim).filter(|b| !b.is_empty()) {
+        for line in b.lines() {
+            println!("    {line}");
+        }
+    }
+}
+
+/// Print the release notes the user would gain by updating. For the stable
+/// channel this walks every published release in `(current, latest]`, newest
+/// first; for `--nightly` or a pinned `--version` it prints the single resolved
+/// release's body. Best-effort: any failure (network, missing notes) prints
+/// nothing rather than blocking the update.
+async fn print_pending_changelog(
+    client: &reqwest::Client,
+    token: &Option<String>,
+    current: &str,
+    latest: &str,
+    release: &GhRelease,
+    nightly: bool,
+    pinned: bool,
+) {
+    // Nightly and pinned resolve to a single release we already fetched — just
+    // surface its body. (A semver walk doesn't apply: nightlies share a version,
+    // and a pinned target may be a downgrade.)
+    if nightly || pinned {
+        if release.body.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return;
+        }
+        println!("\nRelease notes for {}:", release.tag_name);
+        print_release_notes(&release.tag_name, release.body.as_deref());
+        println!();
+        return;
+    }
+
+    // Stable: fetch the recent releases and keep the stable ones strictly newer
+    // than what we run, up to and including the target.
+    let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=100");
+    let releases: Vec<GhRelease> = match authed(client.get(&api), token).send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => resp.json().await.unwrap_or_default(),
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let relevant: Vec<&GhRelease> = releases
+        .iter()
+        .filter(|r| !r.prerelease)
+        .filter(|r| {
+            let v = normalize_version(&r.tag_name);
+            version_is_newer(v, current) && !version_is_newer(v, latest)
+        })
+        .collect();
+    if relevant.is_empty() {
+        return;
+    }
+    println!("\nChanges in v{current} → v{latest}:");
+    for r in relevant {
+        print_release_notes(&r.tag_name, r.body.as_deref());
+    }
+    println!();
 }
 
 /// SHA-256 of a byte slice as lowercase hex — used both to verify a download
@@ -3437,6 +3577,16 @@ async fn cmd_update(
         if up_to_date {
             println!("rayfish is up to date");
         } else {
+            print_pending_changelog(
+                &client,
+                &token,
+                current,
+                latest,
+                &release,
+                nightly,
+                pinned_tag.is_some(),
+            )
+            .await;
             let flag = if nightly {
                 " --nightly".to_string()
             } else if let Some(v) = &version {
@@ -3453,6 +3603,18 @@ async fn cmd_update(
         println!("rayfish is already up to date ({remote_label})");
         return Ok(());
     }
+
+    // Show what this update brings before touching the binary.
+    print_pending_changelog(
+        &client,
+        &token,
+        current,
+        latest,
+        &release,
+        nightly,
+        pinned_tag.is_some(),
+    )
+    .await;
 
     // Replacing the installed binary (typically root-owned) and restarting the
     // service both need root. Decide up front so we exit with a clean sudo hint

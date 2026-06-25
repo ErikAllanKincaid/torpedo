@@ -140,6 +140,169 @@ fn default_true() -> bool {
 /// `settings.toml` (globals) + one `networks/<name>.toml` per network; writes
 /// are targeted (`save_settings` / `save_network` / `delete_network`) so a write
 /// to one network can never clobber another. See the storage section below.
+/// A global server override (relay / discovery-DNS / DNS-upstreams). `servers`
+/// holds preset keywords (`rayfish`, `n0`) or literal URLs/IPs as the user typed
+/// them; an empty list means unset (use the iroh n0 defaults). `replace` swaps
+/// the defaults out instead of augmenting them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerOverride {
+    #[serde(default)]
+    pub servers: Vec<String>,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+impl ServerOverride {
+    pub fn is_unset(&self) -> bool {
+        self.servers.is_empty()
+    }
+}
+
+/// Preset URL for the rayfish-operated iroh transport relay.
+pub const RELAY_PRESET_RAYFISH: &str = "http://relay.iroh.rayfish.xyz:3340";
+/// Preset URL for the rayfish-operated discovery-DNS / pkarr server.
+pub const DISCOVERY_PRESET_RAYFISH: &str = "http://dns.iroh.rayfish.xyz:8080";
+
+fn validate_http_url(s: &str) -> Result<()> {
+    let u = url::Url::parse(s).with_context(|| format!("invalid URL: {s}"))?;
+    anyhow::ensure!(
+        matches!(u.scheme(), "http" | "https"),
+        "URL must be http or https: {s}"
+    );
+    Ok(())
+}
+
+/// Resolve one relay/discovery entry: the `rayfish` keyword maps to `preset`,
+/// anything else must be a valid http(s) URL (returned as-is).
+fn resolve_url_entry(entry: &str, preset: &str) -> Result<String> {
+    match entry {
+        "rayfish" => Ok(preset.to_string()),
+        other => {
+            validate_http_url(other)?;
+            Ok(other.to_string())
+        }
+    }
+}
+
+/// Resolve the relay override to concrete URL strings (presets expanded,
+/// validated). Empty when unset.
+pub fn relay_urls(o: &ServerOverride) -> Result<Vec<String>> {
+    o.servers
+        .iter()
+        .map(|e| resolve_url_entry(e, RELAY_PRESET_RAYFISH))
+        .collect()
+}
+
+/// Resolve the discovery-DNS override to concrete URL strings. Empty when unset.
+pub fn discovery_urls(o: &ServerOverride) -> Result<Vec<String>> {
+    o.servers
+        .iter()
+        .map(|e| resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH))
+        .collect()
+}
+
+/// Merge configured DNS upstreams with the system-captured ones. `replace`
+/// drops the captured set; otherwise custom upstreams are tried first, then the
+/// captured ones. Unset returns the captured set unchanged.
+pub fn resolve_upstreams(o: &ServerOverride, captured: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    if o.servers.is_empty() {
+        return captured;
+    }
+    let custom: Vec<Ipv4Addr> = o.servers.iter().filter_map(|s| s.parse().ok()).collect();
+    if o.replace {
+        custom
+    } else {
+        custom.into_iter().chain(captured).collect()
+    }
+}
+
+/// Parse a comma list of entries (trimmed, empties dropped).
+fn parse_entries(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Apply a `ray config set`/`unset` to the in-memory config. An empty value or
+/// the lone keyword `n0` resets the key to its default (iroh n0). Validates
+/// every entry, so a bad URL/IP or unknown preset is rejected before persist.
+pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) -> Result<()> {
+    let entries = parse_entries(value);
+    let reset = entries.is_empty() || entries == ["n0"];
+    match key {
+        "relay" => {
+            if reset {
+                cfg.relay = ServerOverride::default();
+            } else {
+                for e in &entries {
+                    resolve_url_entry(e, RELAY_PRESET_RAYFISH)?;
+                }
+                cfg.relay = ServerOverride { servers: entries, replace };
+            }
+        }
+        "discovery-dns" => {
+            if reset {
+                cfg.discovery_dns = ServerOverride::default();
+            } else {
+                for e in &entries {
+                    resolve_url_entry(e, DISCOVERY_PRESET_RAYFISH)?;
+                }
+                cfg.discovery_dns = ServerOverride { servers: entries, replace };
+            }
+        }
+        "dns-upstreams" => {
+            if entries.is_empty() {
+                cfg.dns_upstreams = ServerOverride::default();
+            } else {
+                for e in &entries {
+                    e.parse::<Ipv4Addr>()
+                        .with_context(|| format!("invalid IPv4 address: {e}"))?;
+                }
+                cfg.dns_upstreams = ServerOverride { servers: entries, replace };
+            }
+        }
+        other => anyhow::bail!(
+            "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
+        ),
+    }
+    Ok(())
+}
+
+fn render_override(o: &ServerOverride) -> String {
+    if o.is_unset() {
+        "<default>".to_string()
+    } else {
+        let mode = if o.replace { "replace" } else { "augment" };
+        format!("{} ({mode})", o.servers.join(","))
+    }
+}
+
+/// Render config settings as `(key, value)` rows for `ray config get`. With a
+/// key, returns just that one (error on unknown key); without, all three.
+pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
+    let row = |k: &str| -> Result<(String, String)> {
+        let o = match k {
+            "relay" => &cfg.relay,
+            "discovery-dns" => &cfg.discovery_dns,
+            "dns-upstreams" => &cfg.dns_upstreams,
+            other => anyhow::bail!(
+                "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
+            ),
+        };
+        Ok((k.to_string(), render_override(o)))
+    };
+    match key {
+        Some(k) => Ok(vec![row(k)?]),
+        None => Ok(vec![
+            row("relay")?,
+            row("discovery-dns")?,
+            row("dns-upstreams")?,
+        ]),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -159,6 +322,16 @@ pub struct AppConfig {
     /// invite code. Lazily generated on first use via [`contact_secret`].
     #[serde(default, with = "option_secret_key_hex")]
     pub contact_secret_key: Option<SecretKey>,
+    /// Custom iroh transport relay servers (NAT-traversal fallback).
+    #[serde(default)]
+    pub relay: ServerOverride,
+    /// Custom iroh discovery-DNS / pkarr server (endpoint resolution + record
+    /// publish). Also redirects the `dht.rs` pkarr client.
+    #[serde(default)]
+    pub discovery_dns: ServerOverride,
+    /// Custom Magic DNS upstream forwarders for non-`.ray` queries (IPv4 only).
+    #[serde(default)]
+    pub dns_upstreams: ServerOverride,
     #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
@@ -170,6 +343,9 @@ impl Default for AppConfig {
             operator_uid: None,
             default_hostname: None,
             contact_secret_key: None,
+            relay: ServerOverride::default(),
+            discovery_dns: ServerOverride::default(),
+            dns_upstreams: ServerOverride::default(),
             networks: Vec::new(),
         }
     }
@@ -229,6 +405,12 @@ struct Settings {
     default_hostname: Option<String>,
     #[serde(default, with = "option_secret_key_hex")]
     contact_secret_key: Option<SecretKey>,
+    #[serde(default)]
+    relay: ServerOverride,
+    #[serde(default)]
+    discovery_dns: ServerOverride,
+    #[serde(default)]
+    dns_upstreams: ServerOverride,
 }
 
 /// Look up the `rayfish` group's gid (Linux), if the group exists.
@@ -451,6 +633,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             operator_uid: None,
             default_hostname: None,
             contact_secret_key: None,
+            relay: ServerOverride::default(),
+            discovery_dns: ServerOverride::default(),
+            dns_upstreams: ServerOverride::default(),
         }
     };
 
@@ -483,6 +668,9 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         operator_uid: settings.operator_uid,
         default_hostname: settings.default_hostname,
         contact_secret_key: settings.contact_secret_key,
+        relay: settings.relay,
+        discovery_dns: settings.discovery_dns,
+        dns_upstreams: settings.dns_upstreams,
         networks,
     })
 }
@@ -498,6 +686,9 @@ fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
         operator_uid: config.operator_uid,
         default_hostname: config.default_hostname.clone(),
         contact_secret_key: config.contact_secret_key.clone(),
+        relay: config.relay.clone(),
+        discovery_dns: config.discovery_dns.clone(),
+        dns_upstreams: config.dns_upstreams.clone(),
     };
     let path = dir.join(SETTINGS_FILE);
     let contents = toml::to_string_pretty(&settings).context("serializing settings")?;
@@ -911,6 +1102,95 @@ name = "test"
         let after = load_in(dir).unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].name, "genesis");
+    }
+
+    #[test]
+    fn settings_roundtrip_server_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // A fresh dir (no settings.toml) loads all three overrides as unset.
+        let fresh = load_in(dir).unwrap();
+        assert!(fresh.relay.is_unset());
+        assert!(fresh.discovery_dns.is_unset());
+        assert!(fresh.dns_upstreams.is_unset());
+
+        let cfg = AppConfig {
+            relay: ServerOverride {
+                servers: vec!["http://r:1".into()],
+                replace: true,
+            },
+            dns_upstreams: ServerOverride {
+                servers: vec!["1.1.1.1".into()],
+                replace: false,
+            },
+            ..Default::default()
+        };
+        save_settings_in(dir, &cfg).unwrap();
+
+        let loaded = load_in(dir).unwrap();
+        assert_eq!(loaded.relay, cfg.relay);
+        assert_eq!(loaded.dns_upstreams, cfg.dns_upstreams);
+        assert!(loaded.discovery_dns.is_unset());
+    }
+
+    #[test]
+    fn relay_urls_expands_rayfish_preset() {
+        let o = ServerOverride { servers: vec!["rayfish".into()], replace: false };
+        assert_eq!(relay_urls(&o).unwrap(), vec![RELAY_PRESET_RAYFISH.to_string()]);
+        let d = ServerOverride { servers: vec!["rayfish".into()], replace: false };
+        assert_eq!(discovery_urls(&d).unwrap(), vec![DISCOVERY_PRESET_RAYFISH.to_string()]);
+    }
+
+    #[test]
+    fn url_entry_rejects_bad() {
+        assert!(relay_urls(&ServerOverride { servers: vec!["ftp://x".into()], replace: false }).is_err());
+        assert!(relay_urls(&ServerOverride { servers: vec!["not a url".into()], replace: false }).is_err());
+        // A real http URL passes through unchanged.
+        let ok = ServerOverride { servers: vec!["http://r:1".into()], replace: false };
+        assert_eq!(relay_urls(&ok).unwrap(), vec!["http://r:1".to_string()]);
+    }
+
+    #[test]
+    fn resolve_upstreams_augment_and_replace() {
+        let captured = vec![Ipv4Addr::new(192, 168, 1, 1)];
+        let one = Ipv4Addr::new(1, 1, 1, 1);
+
+        // Unset: captured unchanged.
+        assert_eq!(resolve_upstreams(&ServerOverride::default(), captured.clone()), captured);
+
+        // Augment: custom first, then captured.
+        let aug = ServerOverride { servers: vec!["1.1.1.1".into()], replace: false };
+        assert_eq!(resolve_upstreams(&aug, captured.clone()), vec![one, captured[0]]);
+
+        // Replace: custom only.
+        let rep = ServerOverride { servers: vec!["1.1.1.1".into()], replace: true };
+        assert_eq!(resolve_upstreams(&rep, captured.clone()), vec![one]);
+    }
+
+    #[test]
+    fn config_set_unknown_key_errors() {
+        let mut cfg = AppConfig::default();
+        assert!(config_set(&mut cfg, "bogus", "rayfish", false).is_err());
+        assert!(config_get(&cfg, Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn config_set_n0_resets() {
+        let mut cfg = AppConfig::default();
+        config_set(&mut cfg, "relay", "rayfish", true).unwrap();
+        assert!(!cfg.relay.is_unset());
+        config_set(&mut cfg, "relay", "n0", false).unwrap();
+        assert!(cfg.relay.is_unset());
+    }
+
+    #[test]
+    fn config_set_dns_upstreams_rejects_non_ip() {
+        let mut cfg = AppConfig::default();
+        assert!(config_set(&mut cfg, "dns-upstreams", "1.1.1.1", false).is_ok());
+        assert!(config_set(&mut cfg, "dns-upstreams", "not-an-ip", false).is_err());
+        // rayfish is not a valid upstream keyword.
+        assert!(config_set(&mut cfg, "dns-upstreams", "rayfish", false).is_err());
     }
 
     // Regression for the bug that prompted this change: concurrent saves of

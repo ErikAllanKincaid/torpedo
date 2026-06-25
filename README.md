@@ -111,7 +111,7 @@ ping 100.64.23.142       # or just the IP
 ```bash
 ray leave gaming         # leave a network
 ray down                 # standby: data plane (TUN + DNS) off, still connected to peers
-ray up                   # reactivate (no root needed, near-instant — connections were kept)
+ray up                   # reactivate (no root needed, near-instant: connections were kept)
 sudo ray stop            # fully offline: daemon exits, peer connections close
 sudo ray start           # back online: daemon restarts with both planes on
 ```

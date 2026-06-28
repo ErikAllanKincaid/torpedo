@@ -35,9 +35,10 @@ B="$(server_ip "$SERVERS" srv-b || true)"
 # hanging the test.
 ssh_try(){ # <from-ip> <dst-mesh-ip> <remote-cmd>
   local from="$1" dst="$2" cmd="$3"
+  local user="${4:-root}"
   on "$from" "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o BatchMode=yes -o ConnectTimeout=8 -o PreferredAuthentications=none,publickey \
-    root@$dst $cmd 2>&1 || true"
+    $user@$dst $cmd 2>&1 || true"
 }
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,36 @@ OUT="$(ssh_try "$B" "$A_IP" 'echo ray-ssh-ok-$((6*7))')"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -q 'ray-ssh-ok-42' && pass "exec command runs over mesh SSH" \
   || fail "exec command did not run: $OUT"
+
+# ---------------------------------------------------------------------------
+step "5b. privilege drop — login as a non-root user sheds the daemon's groups"
+# The daemon runs as root (groups include 0/root). A correct privilege drop calls
+# initgroups so the spawned shell gets ONLY the target user's groups. Create a
+# plain user on srv-a and log in as it; `id` must not show root's group.
+on "$A" 'id meshtest >/dev/null 2>&1 || useradd -m -s /bin/bash meshtest' >/dev/null 2>&1
+IDOUT="$(ssh_try "$B" "$A_IP" id "meshtest")"
+echo "$IDOUT" | sed 's/^/   b| /'
+if echo "$IDOUT" | grep -q 'uid=[0-9]*(meshtest)'; then
+  if echo "$IDOUT" | grep -qE '\(root\)|groups=.*\b0\('; then
+    fail "login shell leaked the root daemon's supplementary groups: $IDOUT"
+  else
+    pass "non-root login has only its own groups (no root/0 leaked)"
+  fi
+else
+  fail "could not log in as meshtest: $IDOUT"
+fi
+
+# ---------------------------------------------------------------------------
+step "5c. piped exec output is untranslated (no PTY CRLF)"
+# `ssh host cmd` without -t must use pipes, so a bare LF is NOT turned into CRLF
+# (which would corrupt piped/binary output). Count carriage returns in the output
+# of a command that prints one newline: pipe path = 0, PTY path = 1.
+CR="$(on "$B" "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o BatchMode=yes -o ConnectTimeout=8 -o PreferredAuthentications=none,publickey \
+  root@$A_IP echo hi 2>/dev/null | tr -cd '\r' | wc -c | tr -d ' '")"
+echo "   b| carriage-returns in output: ${CR:-?}"
+[[ "${CR:-1}" == "0" ]] && pass "non-PTY exec output is byte-clean (no CRLF translation)" \
+  || fail "non-PTY exec output was CRLF-translated (CR count=${CR:-?})"
 
 # ---------------------------------------------------------------------------
 step "6. ray firewall ssh deny ssh srv-b — access revoked"

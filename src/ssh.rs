@@ -15,14 +15,17 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use iroh::EndpointId;
+use russh::CryptoVec;
 use russh::keys::PrivateKey;
-use russh::server::{Auth, Handler, Msg, Session};
+use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use smol_str::SmolStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,9 +46,11 @@ use crate::peers::{DeviceUserMap, PeerTable};
 pub const SSH_PORT: u16 = 22;
 
 /// Internal port the embedded SSH server binds (all platforms). Mesh `:22` is
-/// translated to/from this port by the userspace NAT in `forward.rs`. Distinct
-/// from the iroh listen port (41383).
-pub const SSH_LISTEN_PORT: u16 = 41384;
+/// translated to/from this port by the userspace NAT in `forward.rs`. Chosen
+/// *below* the ephemeral source-port ranges (Linux 32768-60999, macOS
+/// 49152-65535) so the outbound NAT (which matches `src_port == this`) can never
+/// collide with a kernel-assigned ephemeral port on an unrelated local flow.
+pub const SSH_LISTEN_PORT: u16 = 30022;
 
 /// Per-network SSH authorization snapshot: network name -> allow list, where
 /// each entry is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any peer
@@ -247,7 +252,19 @@ impl SshHandler {
         self.resize_tx = Some(resize_tx);
 
         tokio::spawn(async move {
-            let code = match run_pty_session(channel, &login_user, command, pty, resize_rx).await {
+            // A PTY was requested -> interactive terminal. Otherwise (`ssh host
+            // cmd` with no -t) use plain pipes so stdout/stderr aren't merged or
+            // CRLF-translated, matching a conventional sshd.
+            let result = match pty {
+                Some(pty_req) => {
+                    run_pty_session(channel, &login_user, command, pty_req, resize_rx).await
+                }
+                None => {
+                    run_pipe_session(channel, handle.clone(), channel_id, &login_user, command)
+                        .await
+                }
+            };
+            let code = match result {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(peer = %peer.fmt_short(), user = %login_user, error = %e, "mesh SSH session failed");
@@ -343,6 +360,76 @@ impl Handler for SshHandler {
     }
 }
 
+/// The resolved local account a session logs in as.
+struct LoginInfo {
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
+    shell: PathBuf,
+    name: String,
+}
+
+/// Resolve the requested unix user via `getpwnam`.
+fn resolve_login(login_user: &str) -> Result<LoginInfo> {
+    use uzers::os::unix::UserExt;
+    let pw = uzers::get_user_by_name(login_user)
+        .with_context(|| format!("no such local user: {login_user}"))?;
+    Ok(LoginInfo {
+        uid: pw.uid(),
+        gid: pw.primary_group_id(),
+        home: pw.home_dir().to_path_buf(),
+        shell: pw.shell().to_path_buf(),
+        name: pw.name().to_string_lossy().to_string(),
+    })
+}
+
+/// Build a `pre_exec` closure that drops the root daemon's privileges to the
+/// target user **completely** — supplementary groups first (`initgroups`, so the
+/// child does NOT inherit root's groups like gid 0/wheel), then `setgid`, then
+/// `setuid`, in that order. It runs as root in the forked child just before
+/// `exec`. **Fails closed:** if any step errors, the closure returns an error so
+/// `exec` never happens and the shell never runs with leftover privileges.
+fn drop_privs(
+    uid: u32,
+    gid: u32,
+    name: &str,
+) -> Result<impl FnMut() -> std::io::Result<()> + Send + Sync + 'static> {
+    let cname = std::ffi::CString::new(name).context("user name contains NUL")?;
+    Ok(move || {
+        // SAFETY: only direct syscalls, in the child after fork, before exec.
+        unsafe {
+            #[cfg(target_os = "macos")]
+            let basegroup = gid as libc::c_int;
+            #[cfg(not(target_os = "macos"))]
+            let basegroup = gid as libc::gid_t;
+            if libc::initgroups(cname.as_ptr(), basegroup) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(gid as libc::gid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid as libc::uid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Apply the common login environment to a command builder.
+fn login_env<'a>(home: &PathBuf, shell: &PathBuf, name: &str) -> [(&'a str, std::ffi::OsString); 5] {
+    [
+        ("HOME", home.into()),
+        ("USER", name.into()),
+        ("LOGNAME", name.into()),
+        ("SHELL", shell.into()),
+        (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        ),
+    ]
+}
+
 /// Allocate a PTY, spawn the login shell (or `exec` command) as the requested
 /// unix user, and pump bytes between the SSH channel and the PTY until the child
 /// exits. Returns the child's exit code.
@@ -350,51 +437,29 @@ async fn run_pty_session(
     channel: Channel<Msg>,
     login_user: &str,
     command: Option<String>,
-    pty_req: Option<PtyReq>,
+    pty_req: PtyReq,
     mut resize_rx: mpsc::UnboundedReceiver<pty_process::Size>,
 ) -> Result<u32> {
-    use uzers::os::unix::UserExt;
-
-    let pw = uzers::get_user_by_name(login_user)
-        .with_context(|| format!("no such local user: {login_user}"))?;
-    let uid = pw.uid();
-    let gid = pw.primary_group_id();
-    let home = pw.home_dir().to_path_buf();
-    let shell = pw.shell().to_path_buf();
-    let user_name = pw.name().to_string_lossy().to_string();
+    let info = resolve_login(login_user)?;
+    let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let (pty, pts) = pty_process::open().context("opening pty")?;
-    if let Some(p) = &pty_req {
-        let _ = pty.resize(pty_process::Size::new(p.row, p.col));
-    }
+    let _ = pty.resize(pty_process::Size::new(pty_req.row, pty_req.col));
 
-    let mut cmd = pty_process::Command::new(&shell);
+    let mut cmd = pty_process::Command::new(&info.shell);
     match &command {
-        // `exec`: run the command through the login shell.
-        Some(c) => {
-            cmd = cmd.arg("-c").arg(c);
-        }
-        // Interactive: a login shell.
-        None => {
-            cmd = cmd.arg("-l");
-        }
+        Some(c) => cmd = cmd.arg("-c").arg(c),
+        None => cmd = cmd.arg("-l"),
     }
     cmd = cmd
-        .uid(uid)
-        .gid(gid)
-        .current_dir(&home)
+        .current_dir(&info.home)
         .env_clear()
-        .env("HOME", &home)
-        .env("USER", &user_name)
-        .env("LOGNAME", &user_name)
-        .env("SHELL", &shell)
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-    if let Some(p) = &pty_req {
-        cmd = cmd.env("TERM", &p.term);
-    }
+        .envs(login_env(&info.home, &info.shell, &info.name))
+        .env("TERM", &pty_req.term);
+    // SAFETY: drops privileges (initgroups+setgid+setuid) before exec; we do NOT
+    // use `.uid()/.gid()` because std applies those *after* pre_exec, too late to
+    // also drop supplementary groups.
+    cmd = unsafe { cmd.pre_exec(drop) };
     let mut child = cmd.spawn(pts).context("spawning login shell")?;
 
     let stream = channel.into_stream();
@@ -430,6 +495,98 @@ async fn run_pty_session(
     let status = child.wait().await.context("waiting on child")?;
     let _ = p2c.await;
     c2p.abort();
+    Ok(status.code().unwrap_or(0) as u32)
+}
+
+/// Run a command (or shell) with **pipes** instead of a PTY, for a non-`-t`
+/// `ssh host cmd`. stdout goes to the channel's data stream and stderr to the
+/// extended-data (code 1) stream — kept separate and untranslated, as a
+/// conventional sshd delivers them — so piped/binary output isn't corrupted.
+async fn run_pipe_session(
+    channel: Channel<Msg>,
+    handle: Handle,
+    channel_id: ChannelId,
+    login_user: &str,
+    command: Option<String>,
+) -> Result<u32> {
+    let info = resolve_login(login_user)?;
+    let drop = drop_privs(info.uid, info.gid, &info.name)?;
+
+    let mut cmd = tokio::process::Command::new(&info.shell);
+    match &command {
+        Some(c) => {
+            cmd.arg("-c").arg(c);
+        }
+        None => {
+            cmd.arg("-l");
+        }
+    }
+    cmd.current_dir(&info.home)
+        .env_clear()
+        .envs(login_env(&info.home, &info.shell, &info.name))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: drops privileges (initgroups+setgid+setuid) before exec.
+    unsafe {
+        cmd.pre_exec(drop);
+    }
+    let mut child = cmd.spawn().context("spawning command")?;
+    let mut stdin = child.stdin.take().context("child stdin")?;
+    let mut stdout = child.stdout.take().context("child stdout")?;
+    let mut stderr = child.stderr.take().context("child stderr")?;
+
+    let stream = channel.into_stream();
+    let (mut chan_read, _chan_write) = tokio::io::split(stream);
+
+    // client stdin -> child
+    let stdin_task = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut chan_read, &mut stdin).await;
+        // drop closes the child's stdin so commands reading to EOF finish.
+    });
+    // child stdout -> channel data
+    let h_out = handle.clone();
+    let out_task = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if h_out
+                        .data(channel_id, CryptoVec::from(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    // child stderr -> channel extended data (code 1 = stderr)
+    let h_err = handle.clone();
+    let err_task = tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if h_err
+                        .extended_data(channel_id, 1, CryptoVec::from(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let status = child.wait().await.context("waiting on child")?;
+    let _ = out_task.await;
+    let _ = err_task.await;
+    stdin_task.abort();
     Ok(status.code().unwrap_or(0) as u32)
 }
 

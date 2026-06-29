@@ -158,6 +158,30 @@ echo "$OUT" | grep -qi '^root' && pass "root login allowed once '*' is granted" 
   || fail "root login should be allowed with --user '*': $OUT"
 
 # ---------------------------------------------------------------------------
+step "5e. --user deploy restricts to a single named account"
+# Setting the rule to a single user replaces the prior '*'. Only `deploy` may log
+# in: the named user works, but root AND any other non-root user are denied.
+on "$A" 'id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash deploy' >/dev/null 2>&1
+on "$A" "ray firewall ssh allow $NET srv-b --user deploy" | strip | sed 's/^/   a| /'
+# the named user is admitted
+OUT="$(ssh_try "$B" "$A_IP" whoami deploy)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qi '^deploy' && pass "named user 'deploy' admitted" \
+  || fail "named user 'deploy' could not log in: $OUT"
+# a different non-root user is denied (the single-user list replaced '*')
+OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
+  && pass "other non-root user 'meshtest' denied when restricted to 'deploy'" \
+  || fail "meshtest should be denied when only 'deploy' is allowed: $OUT"
+# root is denied
+OUT="$(ssh_try "$B" "$A_IP" whoami root)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
+  && pass "root denied when restricted to 'deploy'" \
+  || fail "root should be denied when only 'deploy' is allowed: $OUT"
+
+# ---------------------------------------------------------------------------
 step "6. ray firewall ssh deny srv-b — access revoked"
 on "$A" "ray firewall ssh deny $NET srv-b" | strip | sed 's/^/   a| /'
 OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"

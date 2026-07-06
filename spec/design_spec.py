@@ -376,3 +376,117 @@ class DefaultSubnetDocsAccurate(Requirement):
     project, not here.
     """
     req_id = "SUBNET-013"
+
+
+# --------------------------------------------------------------------------
+# Thorough-fork round: purge residual `rayfish` identity from host-visible
+# artifacts and cosmetics (RENAME-006..009 / CON-007). Distinct from the
+# KEEP-ON-PURPOSE names (upstream relay/discovery presets, REPO_SLUG, the
+# `.ray` TLD, the internal Cargo crate name `rayfish`), which CON-001 and the
+# honesty rationale explicitly protect and which this round must NOT touch.
+# --------------------------------------------------------------------------
+
+class HostDnsArtifactsRenamed(Requirement):
+    """REQUIREMENT-ID: RENAME-006
+
+    The host-filesystem artifacts the DNS layer writes (src/dns_config.rs) carry
+    the `torpedo` identity, not `rayfish`, so torpedo and a genuine rayfish
+    daemon on the same host never read or clobber each other's files — the
+    coexistence guarantee RENAME-004/005 established for the wire and ports,
+    extended to disk. Rename, consistently across writers, marker-guards, backup
+    /restore, the panic-time emergency restore, and tests:
+    - NetworkManager drop-in `/etc/NetworkManager/conf.d/rayfish-dns.conf` ->
+      `torpedo-dns.conf` (NM_DROPIN).
+    - resolv.conf takeover marker `# Added by rayfish - do not edit` ->
+      `# Added by torpedo - do not edit` (HEADER_COMMENT); the "ours?" marker
+      check and re-assert log follow the new marker.
+    - resolv.conf backup suffix `.before-rayfish` -> `.before-torpedo`
+      (BACKUP_SUFFIX) and the macOS `/etc/resolver/<tld>.before-rayfish` backup.
+    - resolvconf interface tags `tun-rayfish`/`tun-rayfish.inet` ->
+      `tun-torpedo`/`tun-torpedo.inet`.
+    - macOS SCDynamicStore service key `State:/Network/Service/rayfish/DNS` and
+      the `SCDynamicStoreBuilder::new("rayfish")` client name -> `torpedo`.
+    Because the marker guard keys on our own marker, only a file torpedo itself
+    wrote is ever modified; the fork is pre-deployment so there is no old-marker
+    migration to carry. The upstream `relay.iroh.rayfish.xyz` /
+    `dns.iroh.rayfish.xyz` preset URLs are NOT touched (CON-001) — those name
+    upstream's servers, not a host artifact.
+    """
+    req_id = "RENAME-006"
+
+
+class UserIdentifiersRenamed(Requirement):
+    """REQUIREMENT-ID: RENAME-007
+
+    The remaining user-typed / user-visible identifiers carry the `torpedo`
+    identity:
+    - Deep-link URI scheme `rayfish://<verb>/<code>` -> `torpedo://<verb>/<code>`
+      (src/deeplink.rs), including the module's public symbols `RayfishLink` ->
+      `TorpedoLink` and `parse_rayfish_uri` -> `parse_torpedo_uri` and every
+      caller, so a scanned/pasted invite link is unambiguously this fork's.
+    - Config-dir override env var `RAYFISH_CONFIG_DIR` -> `TORPEDO_CONFIG_DIR`
+      (src/config.rs and the test-serialization lock doc/callers), so it cannot
+      collide with a genuine rayfish process's own override on the same host.
+    """
+    req_id = "RENAME-007"
+
+
+class MacosServiceIdentityRenamed(Requirement):
+    """REQUIREMENT-ID: RENAME-008
+
+    The macOS service identity is rebranded and a stale binary-path bug is fixed
+    (src/cli/service.rs and contrib/):
+    - launchd label / plist `com.rayfish.vpn` -> `com.torpedo.vpn`
+      (contrib/com.rayfish.vpn.plist renamed to contrib/com.torpedo.vpn.plist;
+      the include_str! path, the /Library/LaunchDaemons plist path, and the
+      launchctl load/unload/kickstart invocations follow).
+    - BUG FIX: the plist install currently replaces `/usr/local/bin/ray` (the
+      pre-fork binary name) instead of `/usr/local/bin/torpedo`, so the macOS
+      ExecStart never points at the real binary; corrected to `torpedo`.
+    NOTE: the macOS platform's ultimate fate (fully implement vs. rip out, see
+    SUBNET-013 deferrals) is still undecided; this change keeps the macOS path
+    internally consistent and collision-free in the meantime so that decision is
+    not pre-empted by leftover `rayfish` identifiers.
+    """
+    req_id = "RENAME-008"
+
+
+class CosmeticIdentitySweep(Requirement):
+    """REQUIREMENT-ID: RENAME-009
+
+    Non-functional cosmetic cleanup (Bucket 3): source comments, doc-strings, and
+    local variable names that still say "rayfish" but describe THIS fork are
+    reworded to "torpedo" (e.g. dns_config.rs `rayfish_domains` locals, "routes
+    queries to rayfish" comments). Also the crate metadata that describes THIS
+    package: Cargo.toml + ray-proto/Cargo.toml `repository`/`homepage` point at
+    the fork (github.com/ErikAllanKincaid/torpedo) and the ray-proto
+    `description` says torpedo. No behavioral effect; done opportunistically in
+    files already edited by RENAME-006..008.
+
+    Deliberately EXCLUDED (KEEP-ON-PURPOSE, not cosmetic churn): the internal
+    Cargo crate/lib name `rayfish` and all `use rayfish::` references (renaming is
+    large internal churn with no user-visible or coexistence benefit); the
+    `authors = Dario <dario@rayfish.xyz>` attribution (honest credit);
+    `REPO_SLUG = rayfish/rayfish` (names upstream's real release repo, only used
+    by the now-disabled self-updater); the `"rayfish"` relay/discovery preset
+    keyword and URLs (CON-001); and the `.ray` Magic-DNS TLD.
+    """
+    req_id = "RENAME-009"
+
+
+class NoResidualHostIdentityLeak(Constraint):
+    """CONSTRAINT-ID: CON-007
+
+    After RENAME-006..008, none of the collision-prone `rayfish` host-artifact /
+    user-identifier tokens remain in src/: the curated set is `rayfish-dns.conf`,
+    `.before-rayfish`, `# Added by rayfish`, `tun-rayfish`, `com.rayfish.vpn`,
+    `rayfish://`, `RAYFISH_CONFIG_DIR`, and the SCDynamicStore `rayfish` service
+    key/client name. This is a completeness + anti-regression gate; it targets
+    those specific tokens only, so it never trips on the KEEP-ON-PURPOSE
+    `rayfish` names (relay/discovery preset URLs, REPO_SLUG, crate name, author
+    attribution), which are allowed to remain.
+
+    ENFORCEMENT (reconcile.py): host_identity.leak_count equals 0.
+    """
+    constraint_id = "CON-007"
+    enforcement_logic = "{{ host_identity.leak_count == 0 }}"

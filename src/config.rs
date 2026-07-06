@@ -322,8 +322,21 @@ pub fn config_set(cfg: &mut AppConfig, key: &str, value: &str, replace: bool) ->
                 };
             }
         }
+        "subnet" => {
+            // A single CIDR overlay subnet, not a URL list. Empty (or `n0`)
+            // resets to the built-in default; `replace` is ignored here.
+            if reset {
+                cfg.subnet = None;
+            } else {
+                anyhow::ensure!(
+                    entries.len() == 1,
+                    "subnet takes a single CIDR, e.g. 10.88.0.0/16"
+                );
+                cfg.subnet = Some(crate::membership::parse_cidr(&entries[0])?);
+            }
+        }
         other => anyhow::bail!(
-            "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
+            "unknown config key: {other} (expected relay, discovery-dns, dns-upstreams, or subnet)"
         ),
     }
     Ok(())
@@ -342,12 +355,19 @@ fn render_override(o: &ServerOverride) -> String {
 /// key, returns just that one (error on unknown key); without, all three.
 pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, String)>> {
     let row = |k: &str| -> Result<(String, String)> {
+        if k == "subnet" {
+            let val = cfg
+                .subnet
+                .map(|(b, p)| format!("{b}/{p}"))
+                .unwrap_or_else(|| "<default>".to_string());
+            return Ok((k.to_string(), val));
+        }
         let o = match k {
             "relay" => &cfg.relay,
             "discovery-dns" => &cfg.discovery_dns,
             "dns-upstreams" => &cfg.dns_upstreams,
             other => anyhow::bail!(
-                "unknown config key: {other} (expected relay, discovery-dns, or dns-upstreams)"
+                "unknown config key: {other} (expected relay, discovery-dns, dns-upstreams, or subnet)"
             ),
         };
         Ok((k.to_string(), render_override(o)))
@@ -358,6 +378,7 @@ pub fn config_get(cfg: &AppConfig, key: Option<&str>) -> Result<Vec<(String, Str
             row("relay")?,
             row("discovery-dns")?,
             row("dns-upstreams")?,
+            row("subnet")?,
         ]),
     }
 }
@@ -900,11 +921,10 @@ pub fn node_subnet() -> crate::membership::Subnet {
 /// it at the next bootstrap. Stores `None` for the default subnet.
 pub fn set_node_subnet(subnet: crate::membership::Subnet) -> Result<()> {
     let mut cfg = load()?;
-    cfg.subnet = if subnet == crate::membership::default_subnet() {
-        None
-    } else {
-        Some(subnet)
-    };
+    // Store the raw value (even if it equals the default) so an explicitly-chosen
+    // subnet is distinguishable from "unset" (None) — SUBNET-010 relies on this to
+    // reject a `create --subnet` that disagrees with the persisted node subnet.
+    cfg.subnet = Some(subnet);
     save_settings(&cfg)
 }
 
@@ -1631,6 +1651,24 @@ name = "test"
         assert!(config_set(&mut cfg, "dns-upstreams", "not-an-ip", false).is_err());
         // rayfish is not a valid upstream keyword.
         assert!(config_set(&mut cfg, "dns-upstreams", "rayfish", false).is_err());
+    }
+
+    #[test]
+    fn config_set_get_subnet() {
+        use std::net::Ipv4Addr;
+        let mut cfg = AppConfig::default();
+        // Unset renders as <default>.
+        assert_eq!(config_get(&cfg, Some("subnet")).unwrap()[0].1, "<default>");
+        // Set a CIDR (stored raw, even distinct from default).
+        config_set(&mut cfg, "subnet", "10.99.0.0/16", false).unwrap();
+        assert_eq!(cfg.subnet, Some((Ipv4Addr::new(10, 99, 0, 0), 16)));
+        assert_eq!(config_get(&cfg, Some("subnet")).unwrap()[0].1, "10.99.0.0/16");
+        // Empty resets to default (None).
+        config_set(&mut cfg, "subnet", "", false).unwrap();
+        assert_eq!(cfg.subnet, None);
+        // Garbage / bad prefix is rejected.
+        assert!(config_set(&mut cfg, "subnet", "not-a-cidr", false).is_err());
+        assert!(config_set(&mut cfg, "subnet", "10.0.0.0/33", false).is_err());
     }
 
     // Regression for the bug that prompted this change: concurrent saves of

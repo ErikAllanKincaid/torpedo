@@ -300,7 +300,7 @@ pub(crate) enum Command {
         /// "on" or "off"
         state: String,
     },
-    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams)
+    /// View or change global daemon settings (relay, discovery-dns, dns-upstreams, subnet)
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -489,23 +489,24 @@ pub(crate) enum ConfigAction {
     /// Show settings (all, or one key)
     #[command(visible_alias = "ls")]
     Get {
-        /// relay, discovery-dns, or dns-upstreams (omit for all)
+        /// relay, discovery-dns, dns-upstreams, or subnet (omit for all)
         key: Option<String>,
     },
-    /// Set a key. Value is a comma list of presets (rayfish/n0), URLs, or IPs.
+    /// Set a key. Server keys take a comma list of presets (rayfish/n0)/URLs/IPs;
+    /// `subnet` takes a single CIDR (e.g. 10.88.0.0/16). Applies on restart.
     Set {
-        /// relay, discovery-dns, or dns-upstreams
+        /// relay, discovery-dns, dns-upstreams, or subnet
         key: String,
-        /// Comma list of presets / URLs / IPv4s (use "n0" or empty to reset)
+        /// Comma list of presets / URLs / IPv4s, or a CIDR for subnet (empty resets)
         value: String,
-        /// Replace the defaults instead of augmenting them (can isolate the node)
+        /// Replace the defaults instead of augmenting them (server keys only)
         #[arg(long)]
         replace: bool,
     },
-    /// Reset a key to its default (iroh n0)
+    /// Reset a key to its default (server keys -> iroh n0; subnet -> 10.88.0.0/16)
     #[command(visible_alias = "rm")]
     Unset {
-        /// relay, discovery-dns, or dns-upstreams
+        /// relay, discovery-dns, dns-upstreams, or subnet
         key: String,
     },
 }

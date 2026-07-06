@@ -260,20 +260,37 @@ impl MeshManager {
             });
         }
 
-        let subnet = crate::membership::resolve_subnet(subnet);
-        // The creator's own IP must land in the chosen subnet. When it matches
-        // the provider's (node) subnet the cached local_ip is correct; a custom
-        // subnet differing from it is re-derived at collision index 0 (matching
-        // the self-member the roster adds). Persist the choice so the next
-        // bootstrap builds the TUN/identity in this subnet (single-TUN node).
+        // SUBNET-010: keep the node's single TUN coherent. Default to the
+        // persisted node subnet; an explicit --subnet sets it on a node that has
+        // none yet, but is rejected if it disagrees with one already persisted.
+        let persisted = config::load().ok().and_then(|c| c.subnet);
+        let subnet = match subnet {
+            Some(requested) => {
+                if let Some(existing) = persisted
+                    && existing != requested
+                {
+                    let (eb, ep) = existing;
+                    return Ok(IpcMessage::Error {
+                        message: format!(
+                            "node subnet is {eb}/{ep}; change it with `torpedo config set subnet <cidr>` and restart before creating a network on a different subnet"
+                        ),
+                    });
+                }
+                if let Err(e) = config::set_node_subnet(requested) {
+                    tracing::warn!(error = %e, "failed to persist node subnet");
+                }
+                requested
+            }
+            None => persisted.unwrap_or_else(crate::membership::default_subnet),
+        };
+        // The creator's own IP must land in the chosen subnet. When it matches the
+        // provider's (node) subnet the cached local_ip is correct; otherwise it is
+        // re-derived at collision index 0 (matching the self-member the roster adds).
         let my_ip = if subnet == self.identity.subnet() {
             self.identity.local_ip()
         } else {
             crate::membership::derive_ip(&self.identity.local_identity(), subnet)
         };
-        if let Err(e) = config::set_node_subnet(subnet) {
-            tracing::warn!(error = %e, "failed to persist node subnet");
-        }
 
         let my_hostname = match hostname {
             Some(h) => {

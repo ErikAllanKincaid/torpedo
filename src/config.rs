@@ -651,9 +651,9 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// Linux: `/etc/torpedo` (system service location, root:torpedo). macOS: the
 /// daemon's `~/.config/torpedo` (root-only under `/var/root`).
 pub fn config_dir() -> Result<PathBuf> {
-    // An explicit `TORPEDO_CONFIG_DIR` override (renamed from RAYFISH_CONFIG_DIR,
-    // RENAME-007, so it cannot collide with a genuine rayfish process's own
-    // override on the same host) is honored only on Android
+    // An explicit `TORPEDO_CONFIG_DIR` override (renamed from the pre-fork
+    // rayfish-prefixed name, RENAME-007, so it cannot collide with a genuine
+    // rayfish process's own override on the same host) is honored only on Android
     // (`ray-mobile`'s `Node::new` points it at the app's `Context.getFilesDir()`)
     // and in `cfg(test)` (headless/test harnesses run against an isolated config
     // tree). Desktop/service production builds never check this var, so their

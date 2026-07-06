@@ -457,11 +457,13 @@ class CosmeticIdentitySweep(Requirement):
     Non-functional cosmetic cleanup (Bucket 3): source comments, doc-strings, and
     local variable names that still say "rayfish" but describe THIS fork are
     reworded to "torpedo" (e.g. dns_config.rs `rayfish_domains` locals, "routes
-    queries to rayfish" comments). Also the crate metadata that describes THIS
-    package: Cargo.toml + ray-proto/Cargo.toml `repository`/`homepage` point at
-    the fork (github.com/ErikAllanKincaid/torpedo) and the ray-proto
-    `description` says torpedo. No behavioral effect; done opportunistically in
-    files already edited by RENAME-006..008.
+    queries to rayfish" comments; main.rs `/usr/local/bin/ray` test fixtures).
+    Also the crate/bug-report metadata that describes THIS package points at the
+    fork (github.com/ErikAllanKincaid/torpedo): Cargo.toml +
+    ray-proto/Cargo.toml `repository`/`homepage`, the ray-proto `description`,
+    and REPORT_REPO_URL (src/cli/status.rs) so `torpedo report` opens an issue on
+    the fork's tracker, not upstream's. No behavioral effect on the mesh; done
+    opportunistically in files already edited by RENAME-006..008.
 
     Deliberately EXCLUDED (KEEP-ON-PURPOSE, not cosmetic churn): the internal
     Cargo crate/lib name `rayfish` and all `use rayfish::` references (renaming is

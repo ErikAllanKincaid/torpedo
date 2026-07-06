@@ -1212,18 +1212,18 @@ mod tests {
         // `/proc/self/exe` with a trailing " (deleted)". The service unit must
         // not inherit it, or the daemon crash-loops on `torpedo (deleted) daemon`.
         assert_eq!(
-            strip_deleted_suffix("/usr/local/bin/ray (deleted)"),
-            "/usr/local/bin/ray"
+            strip_deleted_suffix("/usr/local/bin/torpedo (deleted)"),
+            "/usr/local/bin/torpedo"
         );
         // A normal path is untouched.
         assert_eq!(
-            strip_deleted_suffix("/usr/local/bin/ray"),
-            "/usr/local/bin/ray"
+            strip_deleted_suffix("/usr/local/bin/torpedo"),
+            "/usr/local/bin/torpedo"
         );
         // Only an exact trailing marker is stripped, not the substring mid-path.
         assert_eq!(
-            strip_deleted_suffix("/opt/ray (deleted)/ray"),
-            "/opt/ray (deleted)/ray"
+            strip_deleted_suffix("/opt/torpedo (deleted)/torpedo"),
+            "/opt/torpedo (deleted)/torpedo"
         );
     }
 

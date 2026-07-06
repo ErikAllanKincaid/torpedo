@@ -38,7 +38,7 @@ pub trait DnsConfigurator: Send + Sync {
     async fn apply(&self) -> Result<()>;
     async fn revert(&self) -> Result<()>;
     fn name(&self) -> &'static str;
-    /// Return the upstream DNS servers captured from the system before rayfish
+    /// Return the upstream DNS servers captured from the system before torpedo
     /// overwrote resolv.conf. Used by the resolver forwarder (Task 11).
     /// Default: empty (all other configurators use split-DNS and don't capture).
     fn captured_upstreams(&self) -> Vec<Ipv4Addr> {
@@ -151,7 +151,7 @@ pub fn restore_stale_backups() {
 
 /// Update system DNS routing so bare hostnames and `<host>.<network>` resolve.
 /// Configures search domains (`<network>.ray`, `pi`) and supplemental match
-/// domains (each network name + `pi`) so the OS routes queries to rayfish.
+/// domains (each network name + `pi`) so the OS routes queries to torpedo.
 /// Call whenever networks are joined or left.
 pub async fn update_search_domains(network_names: &[String], tun_name: &str) {
     let mut search: Vec<String> = network_names
@@ -167,7 +167,7 @@ pub async fn update_search_domains(network_names: &[String], tun_name: &str) {
     }
 }
 
-/// Remove all rayfish search domains (called on daemon shutdown).
+/// Remove all torpedo search domains (called on daemon shutdown).
 pub async fn clear_search_domains(tun_name: &str) {
     if let Err(e) = set_search_domains(&[], &[], tun_name).await {
         tracing::warn!(error = %e, "failed to clear search domains");
@@ -175,22 +175,22 @@ pub async fn clear_search_domains(tun_name: &str) {
 }
 
 async fn set_search_domains(
-    rayfish_domains: &[String],
+    torpedo_domains: &[String],
     network_names: &[String],
     tun_name: &str,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
-        write_dns_config_macos(rayfish_domains, network_names)
+        write_dns_config_macos(torpedo_domains, network_names)
     }
     #[cfg(target_os = "linux")]
     {
-        set_search_domains_linux(rayfish_domains, network_names, tun_name).await
+        set_search_domains_linux(torpedo_domains, network_names, tun_name).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (rayfish_domains, network_names, tun_name);
+        let _ = (torpedo_domains, network_names, tun_name);
         Ok(())
     }
 }
@@ -324,7 +324,7 @@ fn write_dns_config_macos(search_domains: &[String], network_names: &[String]) -
 
 #[cfg(target_os = "linux")]
 async fn set_search_domains_linux(
-    rayfish_domains: &[String],
+    torpedo_domains: &[String],
     network_names: &[String],
     tun_name: &str,
 ) -> Result<()> {
@@ -339,7 +339,7 @@ async fn set_search_domains_linux(
         for name in network_names {
             domains.push((name.clone(), true));
         }
-        for d in rayfish_domains {
+        for d in torpedo_domains {
             domains.push((d.clone(), false));
         }
         let reply = conn
@@ -368,7 +368,7 @@ async fn set_search_domains_linux(
         for name in network_names {
             args.push(format!("~{name}"));
         }
-        args.extend(rayfish_domains.iter().cloned());
+        args.extend(torpedo_domains.iter().cloned());
         let status = Command::new("resolvectl")
             .args(&args)
             .status()

@@ -2,7 +2,7 @@
 //! iOS URL handling, and the desktop `torpedo open` subcommand all route through
 //! it. The scheme carries this fork's identity (RENAME-007) so a scanned or
 //! pasted link is unambiguously torpedo's, never confused with a genuine
-//! rayfish `rayfish://` link on the same host.
+//! rayfish deep link on the same host.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorpedoLink {

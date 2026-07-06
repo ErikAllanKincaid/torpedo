@@ -509,9 +509,11 @@ pub(crate) async fn ipc_down() -> Result<()> {
     Ok(())
 }
 
-/// Base repository for `ray report`. Swap this for a managed upload endpoint
-/// once the diagnostics service exists; the rest of the flow stays the same.
-pub(crate) const REPORT_REPO_URL: &str = "https://github.com/rayfish/rayfish";
+/// Base repository for `torpedo report` (RENAME-009): the fork's own tracker, so
+/// diagnostics bundles open an issue here rather than on upstream rayfish. Swap
+/// this for a managed upload endpoint once the diagnostics service exists; the
+/// rest of the flow stays the same.
+pub(crate) const REPORT_REPO_URL: &str = "https://github.com/ErikAllanKincaid/torpedo";
 
 /// Ask the daemon to build a diagnostic bundle, then open a pre-filled GitHub
 /// issue so the user can attach it. The bundle is built daemon-side (logs are

@@ -2,7 +2,7 @@
 # reconcile.py -- run from ~/code/torpedo
 # Usage: python3 reconcile.py
 #
-# Checks the automatable constraints (CON-001..CON-005) from spec/design_spec.py.
+# Checks the automatable constraints (CON-001..CON-007) from spec/design_spec.py.
 # It does NOT check the Requirement classes (SUBNET-*/RENAME-*); those are
 # structural/design requirements verified by reading the diff and code directly.
 import json
@@ -68,6 +68,32 @@ def check_self_update() -> dict:
     return {"enabled": not disabled}
 
 
+def check_host_identity() -> dict:
+    """CON-007: none of the collision-prone rayfish host-artifact / user-identifier
+    tokens may remain anywhere under src/. This is a curated token set (NOT a bare
+    `rayfish` grep), so it never trips on the KEEP-ON-PURPOSE rayfish names — the
+    relay/discovery preset URLs (relay.iroh.rayfish.xyz, dns.iroh.rayfish.xyz),
+    REPO_SLUG (rayfish/rayfish), the internal crate name, or the author
+    attribution — which are all allowed to remain."""
+    tokens = [
+        "rayfish-dns.conf",  # NetworkManager drop-in (RENAME-006)
+        ".before-rayfish",  # resolv.conf backup suffix (RENAME-006)
+        "# Added by rayfish",  # resolv.conf takeover marker (RENAME-006)
+        "tun-rayfish",  # resolvconf interface tag (RENAME-006)
+        "Network/Service/rayfish",  # macOS SCDynamicStore key (RENAME-006)
+        'new("rayfish")',  # macOS SCDynamicStore client name (RENAME-006)
+        "com.rayfish.vpn",  # macOS launchd label / plist (RENAME-008)
+        "rayfish://",  # deep-link URI scheme (RENAME-007)
+        "RAYFISH_CONFIG_DIR",  # config-dir override env var (RENAME-007)
+    ]
+    leaks = 0
+    for p in Path("src").rglob("*.rs"):
+        text = p.read_text()
+        for t in tokens:
+            leaks += text.count(t)
+    return {"leak_count": leaks}
+
+
 if __name__ == "__main__":
     ctx = {
         "build": check_build(),
@@ -76,6 +102,7 @@ if __name__ == "__main__":
         "grep_hardcoded_cgnat": check_hardcoded_cgnat(),
         "relay_preset_untouched": check_relay_preset(),
         "self_update": check_self_update(),
+        "host_identity": check_host_identity(),
     }
     print(json.dumps(ctx, indent=2))
     ok = (
@@ -85,5 +112,6 @@ if __name__ == "__main__":
         and ctx["grep_hardcoded_cgnat"]["unexpected_count"] == 0
         and ctx["relay_preset_untouched"]["value"] == "rayfish"
         and ctx["self_update"]["enabled"] is False
+        and ctx["host_identity"]["leak_count"] == 0
     )
     sys.exit(0 if ok else 1)

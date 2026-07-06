@@ -57,7 +57,8 @@ class SubnetCliFlag(Requirement):
     """REQUIREMENT-ID: SUBNET-002
 
     `torpedo create` gains `--subnet <CIDR>` (parsed to Ipv4Addr + prefix len).
-    Omitting it falls back to 100.64.0.0/10, unchanged from today's behavior.
+    Omitting it falls back to the built-in default subnet (see SUBNET-011). The
+    no-flag path keeps working; only the default value changes.
     """
     req_id = "SUBNET-002"
 
@@ -178,8 +179,8 @@ class AlpnRenamed(Requirement):
 class RelayPresetUntouched(Constraint):
     """CONSTRAINT-ID: CON-001
 
-    The "rayfish" relay preset name in src/config.rs (used by `ray config set
-    relay rayfish`) must NOT be renamed. It refers to upstream's own hosted
+    The "rayfish" relay preset name in src/config.rs (used by `torpedo config
+    set relay rayfish`) must NOT be renamed. It refers to upstream's own hosted
     relay infrastructure, an external service name, not this fork's identity.
     Renaming it would silently break that feature.
 
@@ -234,3 +235,120 @@ class TestsPass(Constraint):
     """
     constraint_id = "CON-005"
     enforcement_logic = "{{ test.pass }}"
+
+
+# --------------------------------------------------------------------------
+# Follow-up round: node subnet at boot (SUBNET-009/010) and self-update
+# neutralization (UPGRADE-001 / CON-006).
+# --------------------------------------------------------------------------
+
+class ConfigSetSubnet(Requirement):
+    """REQUIREMENT-ID: SUBNET-009
+
+    `torpedo config set subnet <CIDR>` (plus `config get subnet` / `config unset
+    subnet`) persists the node's operative overlay subnet in AppConfig.subnet,
+    mirroring the existing relay / discovery-dns / dns-upstreams config keys. The
+    value is validated as a CIDR (via membership::parse_cidr) before persisting;
+    `unset` (or empty) restores the built-in default subnet (SUBNET-011). Like
+    the other config keys it takes effect at the next daemon restart (`sudo
+    torpedo restart`),
+    when the daemon builds its single TUN device and identity in that subnet.
+    This removes the need to hand-edit settings.toml or rely on a create-time
+    value to move the node's TUN off 100.64.0.0/10.
+    """
+    req_id = "SUBNET-009"
+
+
+class CreateUsesNodeSubnet(Requirement):
+    """REQUIREMENT-ID: SUBNET-010
+
+    `torpedo create` with no `--subnet` uses the persisted node subnet
+    (AppConfig.subnet) as the new network's GroupBlob.subnet, so the node's TUN
+    and the network agree without specifying the subnet twice. `create --subnet
+    <CIDR>` still works and also persists the node subnet, keeping a single
+    source of truth for the node's one TUN. On a node with no persisted subnet
+    yet, `create --subnet` sets it. If `--subnet` disagrees with an
+    already-persisted node subnet it is rejected with a clear error ("node
+    subnet is <Y>; change it with `torpedo config set subnet` + restart first"),
+    never silently producing a network the node's single TUN cannot carry.
+    """
+    req_id = "SUBNET-010"
+
+
+class SelfUpdateNeutralized(Requirement):
+    """REQUIREMENT-ID: UPGRADE-001
+
+    The self-update path is neutralized, not deleted (keeps the diff small and
+    reversible for upstream rebases). Gated on a single switch
+    `update::SELF_UPDATE_ENABLED = false`: the daemon never spawns the
+    auto-update task, and `torpedo update`, `torpedo auto-update on`, and
+    `torpedo install --auto-update` refuse with a message pointing at manual
+    binary replacement — the refusal happens before any network call, so no
+    binary is ever fetched from the (upstream) REPO_SLUG. `torpedo version`
+    stays fully functional (offline). Upgrades are done by replacing
+    /usr/local/bin/torpedo and running `sudo torpedo restart`.
+    """
+    req_id = "UPGRADE-001"
+
+
+class SelfUpdateDisabled(Constraint):
+    """CONSTRAINT-ID: CON-006
+
+    The self-update kill switch stays off: update::SELF_UPDATE_ENABLED is
+    false, so no code path fetches or installs a binary from the upstream
+    release repo. Prevents an accidental re-enable that would overwrite the
+    torpedo binary with an upstream rayfish build.
+
+    ENFORCEMENT (reconcile.py): self_update.enabled is false.
+    """
+    constraint_id = "CON-006"
+    enforcement_logic = "{{ self_update.enabled == false }}"
+
+
+class DefaultSubnetSafe(Requirement):
+    """REQUIREMENT-ID: SUBNET-011
+
+    The built-in default overlay subnet (membership::default_subnet, used when a
+    GroupBlob's / config's subnet is None) changes from 100.64.0.0/10 to
+    10.88.0.0/16 — an uncommon 10.x slice deliberately chosen NOT to collide
+    with Tailscale's 100.64.0.0/10, so a no-flag `torpedo create` coexists with
+    Tailscale out of the box. `--subnet` / `config set subnet` still override it.
+    A /16 gives ample host space (~65k). reconcile.py's CON-002 allowed-default
+    substring is updated accordingly, and the membership Magic-DNS test that
+    checked the historical 100.100.100.53 address is re-pinned to an explicit
+    100.64.0.0/10 subnet (that back-compat property holds for the /10 range
+    regardless of what the default is).
+    """
+    req_id = "SUBNET-011"
+
+
+class SubnetOverlapGuard(Requirement):
+    """REQUIREMENT-ID: SUBNET-012
+
+    At daemon startup the node rejects (refuses to start the data plane) if its
+    configured overlay subnet overlaps an existing local interface / route, with
+    a clear error telling the user to pick another via `torpedo config set
+    subnet`. This is a NEW, subnet-aware guard — NOT a revival of the removed
+    hardcoded check_cgnat_conflict (SUBNET-006): that one refused whenever any
+    100.64.0.0/10 address was present (i.e. whenever Tailscale ran); this one
+    only refuses on a genuine overlap between the *chosen* overlay subnet and a
+    real local network, so it protects the host's routing without blocking the
+    Tailscale-coexistence case (10.88.0.0/16 vs Tailscale's 100.64.0.0/10 do not
+    overlap). Pairs with SUBNET-011: the safe default plus this guard mean a
+    bad range fails loudly instead of hijacking the host's routes.
+    """
+    req_id = "SUBNET-012"
+
+
+class ListenPortDistinct(Requirement):
+    """REQUIREMENT-ID: RENAME-005
+
+    The fixed UDP listen port constant is renamed RAYFISH_LISTEN_PORT ->
+    TORPEDO_LISTEN_PORT (src/transport.rs) and its value changed 41383 -> 43737,
+    so torpedo and a genuine rayfish daemon can bind their forwardable ports on
+    the same host without collision (completes the wire/host isolation of
+    RENAME-004). The port is a per-node local bind (peers discover each other's
+    actual endpoint), so no cross-machine coordination is needed; 43737 avoids
+    Tailscale (41641) and WireGuard (51820).
+    """
+    req_id = "RENAME-005"

@@ -463,7 +463,7 @@ pub(crate) fn cmd_uninstall_service() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
+        let path = Path::new("/Library/LaunchDaemons/com.torpedo.vpn.plist");
         if path.exists() {
             run_cmd("launchctl", &["unload", "-w", &path.to_string_lossy()]);
             std::fs::remove_file(path)?;

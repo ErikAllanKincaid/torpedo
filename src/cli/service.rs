@@ -65,9 +65,12 @@ pub(crate) fn ensure_service_installed() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
-        let plist =
-            include_str!("../../contrib/com.rayfish.vpn.plist").replace("/usr/local/bin/ray", &exe);
+        let path = Path::new("/Library/LaunchDaemons/com.torpedo.vpn.plist");
+        // RENAME-008: match the plist's /usr/local/bin/torpedo placeholder (was
+        // the stale pre-fork /usr/local/bin/ray, which the plist no longer
+        // contains — leaving the real exe path unsubstituted). Mirrors Linux.
+        let plist = include_str!("../../contrib/com.torpedo.vpn.plist")
+            .replace("/usr/local/bin/torpedo", &exe);
         std::fs::write(path, plist)
             .with_context(|| format!("failed to write {}", path.display()))?;
         return Ok(());
@@ -126,7 +129,7 @@ pub(crate) async fn install_and_start_service(hostname: Option<String>) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        let path = "/Library/LaunchDaemons/com.rayfish.vpn.plist";
+        let path = "/Library/LaunchDaemons/com.torpedo.vpn.plist";
         // Tear down any previously loaded job (e.g. one pointing at a stale
         // binary path) before loading the freshly written plist.
         run_cmd_quiet("launchctl", &["unload", path]);
@@ -237,7 +240,7 @@ pub(crate) fn service_unit_exists() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        return Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist").exists();
+        return Path::new("/Library/LaunchDaemons/com.torpedo.vpn.plist").exists();
     }
     #[allow(unreachable_code)]
     false
@@ -252,7 +255,7 @@ pub(crate) async fn restart_service_and_wait() -> Result<()> {
     run_cmd("systemctl", &["restart", "torpedo"]);
 
     #[cfg(target_os = "macos")]
-    run_cmd("launchctl", &["kickstart", "-k", "system/com.rayfish.vpn"]);
+    run_cmd("launchctl", &["kickstart", "-k", "system/com.torpedo.vpn"]);
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("system service not supported on this platform");
@@ -299,7 +302,7 @@ pub(crate) async fn cmd_stop() -> Result<()> {
     #[cfg(target_os = "macos")]
     run_cmd(
         "launchctl",
-        &["unload", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
+        &["unload", "/Library/LaunchDaemons/com.torpedo.vpn.plist"],
     );
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -326,7 +329,7 @@ pub(crate) async fn cmd_start() -> Result<()> {
     #[cfg(target_os = "macos")]
     run_cmd(
         "launchctl",
-        &["load", "-w", "/Library/LaunchDaemons/com.rayfish.vpn.plist"],
+        &["load", "-w", "/Library/LaunchDaemons/com.torpedo.vpn.plist"],
     );
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

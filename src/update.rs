@@ -264,7 +264,7 @@ pub fn trigger_detached_restart() {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = Command::new("launchctl");
-        c.args(["kickstart", "-k", "system/com.rayfish.vpn"]);
+        c.args(["kickstart", "-k", "system/com.torpedo.vpn"]);
         c
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

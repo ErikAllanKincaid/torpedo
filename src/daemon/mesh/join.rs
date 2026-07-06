@@ -338,6 +338,9 @@ async fn build_member_state(
         network_name: Some(network_name.to_string()),
         mode: GroupMode::Restricted,
         suggested_firewall,
+        // Single-TUN node: the operative subnet is the persisted node cache
+        // (set when this network was joined; default until then). See DESIGN.md.
+        subnet: crate::config::node_subnet(),
         reusable_keys,
         pending_suggestions: Vec::new(),
         pending: HashMap::new(),

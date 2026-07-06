@@ -310,7 +310,7 @@ impl MeshManager {
             let mut s = handle.state.write().unwrap();
             // Assign authoritatively from the current roster so two coordinators
             // accepting concurrently can be reconciled by the reconverge tiebreak.
-            let (ip, collision_index) = crate::membership::assign_ip(&s.members, &identity);
+            let (ip, collision_index) = crate::membership::assign_ip(&s.members, &identity, s.subnet);
             let members = s.members.clone();
             let _ = s.approved.approve(
                 ApprovedEntry {

@@ -145,9 +145,10 @@ impl MeshManager {
         mode: GroupMode,
         name: Option<String>,
         hostname: Option<String>,
+        subnet: Option<crate::membership::Subnet>,
     ) -> IpcMessage {
         match self
-            .create_network_inner(mode, name, hostname, false, None)
+            .create_network_inner(mode, name, hostname, subnet, false, None)
             .await
         {
             Ok(resp) => resp,
@@ -168,6 +169,7 @@ impl MeshManager {
     /// requester) admitted up front so the published blob already carries the
     /// approval and the peer is welcomed on its join without a separate
     /// `ray accept`.
+    #[allow(clippy::too_many_arguments)]
     fn build_initial_roster(
         &self,
         name: &str,
@@ -175,6 +177,7 @@ impl MeshManager {
         my_hostname: &str,
         mode: GroupMode,
         net_secret_key: &SecretKey,
+        subnet: crate::membership::Subnet,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<NetworkState> {
         let mut member_list = MemberList::new();
@@ -193,7 +196,9 @@ impl MeshManager {
 
         let mut approved = ApprovedList::new();
         if let Some((peer_id, peer_hostname)) = pre_approve {
-            let peer_ip = self.identity.derive_ip(&peer_id);
+            // Derive in the network's chosen subnet, which may differ from the
+            // provider's cached (node) subnet on a fresh `create --subnet`.
+            let peer_ip = crate::membership::derive_ip(&peer_id, subnet);
             approved
                 .approve(
                     ApprovedEntry {
@@ -218,6 +223,7 @@ impl MeshManager {
             network_name: Some(name.to_string()),
             mode,
             suggested_firewall: SuggestedFirewall::default(),
+            subnet,
             reusable_keys: BTreeMap::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
@@ -229,6 +235,7 @@ impl MeshManager {
         mode: GroupMode,
         custom_name: Option<String>,
         hostname: Option<String>,
+        subnet: Option<crate::membership::Subnet>,
         direct: bool,
         pre_approve: Option<(EndpointId, Option<String>)>,
     ) -> Result<IpcMessage> {
@@ -253,7 +260,20 @@ impl MeshManager {
             });
         }
 
-        let my_ip = self.identity.local_ip();
+        let subnet = crate::membership::resolve_subnet(subnet);
+        // The creator's own IP must land in the chosen subnet. When it matches
+        // the provider's (node) subnet the cached local_ip is correct; a custom
+        // subnet differing from it is re-derived at collision index 0 (matching
+        // the self-member the roster adds). Persist the choice so the next
+        // bootstrap builds the TUN/identity in this subnet (single-TUN node).
+        let my_ip = if subnet == self.identity.subnet() {
+            self.identity.local_ip()
+        } else {
+            crate::membership::derive_ip(&self.identity.local_identity(), subnet)
+        };
+        if let Err(e) = config::set_node_subnet(subnet) {
+            tracing::warn!(error = %e, "failed to persist node subnet");
+        }
 
         let my_hostname = match hostname {
             Some(h) => {
@@ -275,6 +295,7 @@ impl MeshManager {
             &my_hostname,
             mode,
             &net_secret_key,
+            subnet,
             pre_approve,
         )?;
 
@@ -710,6 +731,7 @@ impl MeshManager {
                 network_name: Some(ctx.display_name.to_string()),
                 mode: GroupMode::Restricted,
                 suggested_firewall: data.suggested_firewall.clone(),
+                subnet: crate::membership::resolve_subnet(data.subnet),
                 reusable_keys: data.reusable_keys.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
@@ -1174,6 +1196,12 @@ impl MeshManager {
             )
             .await;
 
+            // Persist the joined network's subnet so this node's TUN/identity are
+            // rebuilt in it at the next bootstrap (single-TUN node).
+            let joined_subnet = crate::membership::resolve_subnet(data.subnet);
+            if let Err(e) = config::set_node_subnet(joined_subnet) {
+                tracing::warn!(error = %e, "failed to persist node subnet on join");
+            }
             let mut ns = NetworkState {
                 members: MemberList::from_members(data.members),
                 approved: ApprovedList::from_entries(data.approved),
@@ -1183,6 +1211,7 @@ impl MeshManager {
                 network_name: data.name.clone(),
                 mode: GroupMode::Restricted,
                 suggested_firewall: SuggestedFirewall::default(),
+                subnet: joined_subnet,
                 reusable_keys: data.reusable_keys.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),

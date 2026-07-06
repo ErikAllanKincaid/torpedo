@@ -72,17 +72,18 @@ use crate::identity;
 use crate::ipc::{self, FirewallRuleView, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
+    MemberList, Subnet, canonical_group_bytes, default_subnet, derive_ipv6, group_blob_hash,
+    verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::{self, PeerTable};
 use crate::revocation::{self, RevocationCache};
 use crate::stats::ForwardMetrics;
 use crate::transport;
-// The desktop TUN device and its CGNAT pre-flight check don't exist on Android,
-// where the packet interface is a `VpnService` fd supplied from Kotlin.
+// The desktop TUN device doesn't exist on Android, where the packet interface
+// is a `VpnService` fd supplied from Kotlin.
 #[cfg(not(target_os = "android"))]
-use crate::tun::{self, check_cgnat_conflict};
+use crate::tun;
 use ray_proto::SuggestedFirewall;
 
 // `MeshManager`'s IPC operations are split by domain into the `mesh/` submodule;
@@ -234,6 +235,10 @@ pub(crate) struct NetworkState {
     /// received. Reloaded from the verified blob on every reconverge so any admin
     /// can admit and revocation propagates.
     reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
+    /// The network's resolved overlay subnet (from the signed `GroupBlob`, or the
+    /// default). Used to derive/validate member IPs and to publish the subnet
+    /// field back into the blob.
+    subnet: Subnet,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -280,12 +285,24 @@ impl NetworkState {
             &self.suggested_firewall,
             self.network_name.as_deref(),
             &self.reusable_keys,
+            self.blob_subnet(),
         );
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
             hash,
             msgpack_bytes: bytes,
         });
+    }
+
+    /// The subnet as it should appear in the published blob: `None` for the
+    /// default subnet (keeping default-range networks byte-identical), `Some`
+    /// for a custom one.
+    fn blob_subnet(&self) -> Option<Subnet> {
+        if self.subnet == default_subnet() {
+            None
+        } else {
+            Some(self.subnet)
+        }
     }
 }
 
@@ -778,7 +795,18 @@ impl MeshManager {
                 name,
                 hostname,
                 transport: _,
-            } => self.create_network(mode, name, hostname).await,
+                subnet,
+            } => {
+                let parsed = match subnet.as_deref().map(crate::membership::parse_cidr).transpose() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return IpcMessage::Error {
+                            message: format!("invalid --subnet: {e:#}"),
+                        };
+                    }
+                };
+                self.create_network(mode, name, hostname, parsed).await
+            }
             IpcMessage::Join {
                 network_key,
                 name,
@@ -1283,6 +1311,7 @@ mod accept_handler_tests {
             network_name: Some("test-net".to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall: SuggestedFirewall::default(),
+            subnet: default_subnet(),
             reusable_keys: BTreeMap::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
@@ -1315,7 +1344,10 @@ mod accept_handler_tests {
         let my_key = SecretKey::from_bytes(&[2u8; 32]);
         let my_id = my_key.public();
         AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_id, 0), blob_store),
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(my_id, 0, default_subnet()),
+                blob_store,
+            ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
@@ -1332,7 +1364,10 @@ mod accept_handler_tests {
         let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
         let my_key = SecretKey::from_bytes(&[3u8; 32]);
         AcceptHandler::Member(Arc::new(MemberAcceptState {
-            ctx: sample_mesh_ctx(IrohIdentityProvider::new(my_key.public(), 0), blob_store),
+            ctx: sample_mesh_ctx(
+                IrohIdentityProvider::new(my_key.public(), 0, default_subnet()),
+                blob_store,
+            ),
             network_name: "test-net".to_string(),
             state: make_network_state(),
             disconnect_tx,
@@ -1420,7 +1455,7 @@ mod coordinator_dial_order_tests {
         let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
@@ -1438,7 +1473,7 @@ mod coordinator_dial_order_tests {
         let (a, b, me) = (test_id(1), test_id(2), test_id(9));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
@@ -1498,7 +1533,7 @@ mod coordinator_dial_order_tests {
         let (a, b, c) = (test_id(1), test_id(2), test_id(3));
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,
@@ -1517,7 +1552,7 @@ mod coordinator_dial_order_tests {
         let me = test_id(1);
         let mk = |id, coord| Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: coord,
             hostname: None,
             user_identity: None,

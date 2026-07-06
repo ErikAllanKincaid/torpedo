@@ -11,9 +11,10 @@
 use super::super::*;
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // Bail early on a CGNAT clash (e.g. Tailscale) before touching anything.
-    #[cfg(not(target_os = "android"))]
-    check_cgnat_conflict()?;
+    // This fork deliberately runs on a configurable overlay subnet (default or a
+    // custom range chosen via `create --subnet`), so it no longer refuses to
+    // start next to a foreign VPN holding a 100.64.0.0/10 address (Tailscale).
+    // The upstream CGNAT preflight is removed for this reason (spec SUBNET-006).
 
     // Build the always-on infrastructure without a packet interface, then attach
     // the desktop OS TUN device below. The headless builder is the same one
@@ -28,9 +29,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     #[cfg(not(target_os = "android"))]
     {
         let my_ipv6 = derive_ipv6(&daemon.identity.local_identity());
-        let (tun_reader, tun_writer, tun_name) = tun::create(daemon.identity.local_ip(), my_ipv6)
-            .await
-            .context("failed to create TUN device")?;
+        let (tun_reader, tun_writer, tun_name) =
+            tun::create(daemon.identity.local_ip(), my_ipv6, daemon.identity.subnet())
+                .await
+                .context("failed to create TUN device")?;
         *daemon.tun_name.lock().unwrap() = tun_name;
         daemon.attach_tun(tun_reader, tun_writer).await;
     }
@@ -134,7 +136,12 @@ async fn build_daemon(
         tracing::info!(user = %cert.user_identity.fmt_short(), "loaded device certificate");
     }
     let collision_index = identity::load_collision_index()?;
-    let identity = IrohIdentityProvider::new(public_key, collision_index);
+    // The node runs a single overlay subnet / TUN. Read the operative subnet
+    // (cache of the active network's signed GroupBlob value) so the identity and
+    // TUN are built in the right range at bootstrap, before any network is up.
+    let node_subnet = config::node_subnet();
+    crate::dns::init_node_overlay(node_subnet);
+    let identity = IrohIdentityProvider::new(public_key, collision_index, node_subnet);
     let my_ip = identity.local_ip();
     // Register our mesh addresses for the userspace SSH port NAT (mesh `:22`
     // <-> the embedded server's listen port). Stays inactive until `ssh on`.

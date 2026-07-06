@@ -66,6 +66,11 @@ pub(crate) enum Command {
         /// Your hostname within the network (e.g. "alice" → alice.gaming.ray). Random if not set
         #[arg(long)]
         hostname: Option<String>,
+        /// Overlay IPv4 subnet in CIDR form (e.g. "10.88.0.0/16"). Lets the mesh
+        /// use a range outside 100.64.0.0/10 so it can coexist with Tailscale.
+        /// Defaults to 100.64.0.0/10 when omitted.
+        #[arg(long)]
+        subnet: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
         #[arg(long)]
         tor: bool,
@@ -961,6 +966,7 @@ async fn main() -> Result<()> {
             closed: _,
             name,
             hostname,
+            subnet,
             tor,
         } => {
             let mode = if open {
@@ -968,7 +974,7 @@ async fn main() -> Result<()> {
             } else {
                 GroupMode::Restricted
             };
-            ipc_create(mode, name, hostname, tor).await
+            ipc_create(mode, name, hostname, subnet, tor).await
         }
         Command::Join {
             network_key,

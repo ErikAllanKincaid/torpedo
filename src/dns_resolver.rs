@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use simple_dns::Packet;
 
 use crate::DNS_DOMAIN;
-use crate::dns::{HostnameTable, MAGIC_DNS_V4, ReverseLookupTable};
+use crate::dns::{HostnameTable, ReverseLookupTable, magic_dns_v4_node};
 
 pub struct Resolver {
     table: HostnameTable,
@@ -31,7 +31,7 @@ impl Resolver {
     pub fn set_upstreams(&self, servers: Vec<Ipv4Addr>) {
         let v: Vec<SocketAddr> = servers
             .into_iter()
-            .filter(|ip| *ip != MAGIC_DNS_V4)
+            .filter(|ip| *ip != magic_dns_v4_node())
             .map(|ip| SocketAddr::from((ip, 53u16)))
             .collect();
         self.upstreams.store(Arc::new(v));
@@ -165,7 +165,7 @@ mod tests {
         let dns_query = build_a_query("dario.homelab.ray");
         let app = crate::firewall::PacketInfo {
             src_ip: IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)),
-            dst_ip: IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            dst_ip: IpAddr::V4(crate::dns::magic_dns_v4_node()),
             protocol: 17,
             src_port: 50000,
             dst_port: 53,
@@ -192,7 +192,7 @@ mod tests {
 
         let reply = rx.try_recv().expect("a reply was injected");
         let rinfo = crate::firewall::parse_packet_info(&reply).unwrap();
-        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::MAGIC_DNS_V4));
+        assert_eq!(rinfo.src_ip, IpAddr::V4(crate::dns::magic_dns_v4_node()));
         assert_eq!(rinfo.dst_port, 50000);
         assert!(response_has_a(&reply[28..], Ipv4Addr::new(100, 64, 0, 7)));
     }
@@ -206,7 +206,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let info = crate::firewall::PacketInfo {
             src_ip: "100.64.0.5".parse().unwrap(),
-            dst_ip: std::net::IpAddr::V4(crate::dns::MAGIC_DNS_V4),
+            dst_ip: std::net::IpAddr::V4(crate::dns::magic_dns_v4_node()),
             protocol: 6,
             src_port: 50000,
             dst_port: 53,
@@ -244,7 +244,7 @@ mod tests {
             crate::dns::new_hostname_table(),
             crate::dns::new_reverse_table(),
         );
-        r.set_upstreams(vec![crate::dns::MAGIC_DNS_V4, Ipv4Addr::new(1, 1, 1, 1)]);
+        r.set_upstreams(vec![crate::dns::magic_dns_v4_node(), Ipv4Addr::new(1, 1, 1, 1)]);
         assert_eq!(
             r.upstreams(),
             vec!["1.1.1.1:53".parse::<SocketAddr>().unwrap()]

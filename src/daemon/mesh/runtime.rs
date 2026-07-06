@@ -161,6 +161,9 @@ impl MeshManager {
             network_name: Some(name.to_string()),
             mode,
             suggested_firewall,
+            // Single-TUN node: use the provider's operative subnet (built from the
+            // persisted node cache at bootstrap). See DESIGN.md.
+            subnet: self.identity.subnet(),
             reusable_keys,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
@@ -353,6 +356,7 @@ impl MeshManager {
                 &SuggestedFirewall::default(),
                 None,
                 &BTreeMap::new(),
+                None,
             );
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");

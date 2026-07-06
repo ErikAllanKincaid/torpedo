@@ -1,7 +1,9 @@
 //! Network membership management: identity, IP derivation, member/approved lists, and policies.
 //!
 //! Virtual IPs are deterministically derived from [`EndpointId`] via FNV-1a hashing
-//! into the 100.64.0.0/10 CGNAT range (22-bit host space, ~4M addresses).
+//! into the network's configured overlay subnet (the `GroupBlob.subnet` field),
+//! defaulting to the 100.64.0.0/10 CGNAT range when none is set. The host-bit
+//! width follows the subnet's prefix length.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -309,18 +311,110 @@ pub trait IdentityProvider: Send + Sync {
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
 }
 
+// ---------------------------------------------------------------------------
+// Overlay subnet (configurable; see spec/design_spec.py SUBNET-*)
+// ---------------------------------------------------------------------------
+
+/// The overlay subnet as `(base address, prefix length)`. `None` in a
+/// [`GroupBlob`] / config means "use [`default_subnet`]".
+pub type Subnet = (Ipv4Addr, u8);
+
+/// The default overlay subnet when none is configured: 100.64.0.0/10 (the
+/// original hardcoded CGNAT range). Written in comma form so it does not read as
+/// a dotted literal.
+pub fn default_subnet() -> Subnet {
+    (Ipv4Addr::new(100, 64, 0, 0), 10)
+}
+
+/// Resolve an optional configured subnet to a concrete one, falling back to
+/// [`default_subnet`].
+pub fn resolve_subnet(subnet: Option<Subnet>) -> Subnet {
+    subnet.unwrap_or_else(default_subnet)
+}
+
+/// Host-bit mask for a prefix length: the low `32 - prefix` bits set.
+pub fn subnet_host_mask(prefix: u8) -> u32 {
+    if prefix >= 32 {
+        0
+    } else {
+        (1u32 << (32 - prefix)) - 1
+    }
+}
+
+/// Dotted-quad netmask for a prefix length (e.g. /10 -> 255.192.0.0).
+pub fn subnet_netmask(prefix: u8) -> Ipv4Addr {
+    Ipv4Addr::from(!subnet_host_mask(prefix))
+}
+
+/// True if `ip` falls within `subnet` (network bits match). The single
+/// containment predicate shared by [`ensure_in_cgnat_range`] and the DNS
+/// PTR/reverse-lookup range check, so the two can never diverge (SUBNET-008).
+pub fn ip_in_subnet(ip: Ipv4Addr, subnet: Subnet) -> bool {
+    let (base_addr, prefix) = subnet;
+    let host_mask = subnet_host_mask(prefix);
+    let base = u32::from(base_addr) & !host_mask;
+    (u32::from(ip) & !host_mask) == base
+}
+
+/// The gateway address for a subnet: base + 1 (the `.1` the TUN takes).
+pub fn subnet_gateway(subnet: Subnet) -> Ipv4Addr {
+    let (base, _) = subnet;
+    Ipv4Addr::from(u32::from(base).wrapping_add(1))
+}
+
+/// Parse a CIDR string (e.g. `"10.88.0.0/16"`) into a [`Subnet`].
+pub fn parse_cidr(s: &str) -> Result<Subnet> {
+    let (base, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("subnet must be CIDR base/prefix, e.g. 10.88.0.0/16"))?;
+    let base: Ipv4Addr = base
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad subnet base address: {e}"))?;
+    let prefix: u8 = prefix
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad subnet prefix length: {e}"))?;
+    anyhow::ensure!(prefix <= 32, "subnet prefix must be 0..=32");
+    Ok((base, prefix))
+}
+
+/// Serde helper (de)serializing `Option<Subnet>` as an optional CIDR string
+/// (e.g. `"10.88.0.0/16"`). Keeps the on-disk (TOML) and on-wire (msgpack)
+/// forms uniform and human-readable, and sidesteps TOML's ban on heterogeneous
+/// arrays that a raw `(Ipv4Addr, u8)` tuple would trip.
+pub mod cidr_opt {
+    use super::Subnet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Subnet>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some((base, prefix)) => Some(format!("{base}/{prefix}")).serialize(s),
+            None => Option::<String>::None.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Subnet>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(cidr) => Ok(Some(super::parse_cidr(&cidr).map_err(serde::de::Error::custom)?)),
+        }
+    }
+}
+
 /// Derives a deterministic virtual IP from an [`EndpointId`] using FNV-1a.
-/// Always produces an address in the 100.64.0.0/10 range, avoiding .0 and .1
+/// Always produces an address inside `subnet`, avoiding .0 and .1
 /// (network address and TUN gateway).
-pub fn derive_ip(identity: &EndpointId) -> Ipv4Addr {
-    derive_ip_with_index(identity, 0)
+pub fn derive_ip(identity: &EndpointId, subnet: Subnet) -> Ipv4Addr {
+    derive_ip_with_index(identity, 0, subnet)
 }
 
 /// Derives a virtual IPv4 with a collision index. Index 0 produces the same
 /// result as [`derive_ip`]. Higher indices rotate the address to resolve
 /// collisions in the 22-bit space. The index is local state — each node
 /// resolves collisions independently.
-pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
+pub fn derive_ip_with_index(identity: &EndpointId, index: u32, subnet: Subnet) -> Ipv4Addr {
     let input = if index == 0 {
         identity.to_string()
     } else {
@@ -332,8 +426,12 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
         hash = hash.wrapping_mul(16_777_619); // FNV-1a prime
     }
 
-    let base: u32 = 0x6440_0000; // 100.64.0.0
-    let host_bits = hash & 0x003F_FFFF; // lower 22 bits
+    let (base_addr, prefix) = subnet;
+    // Mask the base to its network bits so a caller passing e.g. 10.88.0.5/16
+    // still anchors on the network address.
+    let host_mask = subnet_host_mask(prefix);
+    let base: u32 = u32::from(base_addr) & !host_mask;
+    let host_bits = hash & host_mask; // low (32 - prefix) bits
     // Reserve 0 (network) and 1 (TUN gateway)
     let host_bits = if host_bits <= 1 {
         host_bits + 2
@@ -344,9 +442,9 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
 }
 
 /// True if `ip` is reserved and must never be assigned to a member
-/// (currently the Magic DNS resolver address).
-fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
-    ip == crate::dns::MAGIC_DNS_V4
+/// (currently the Magic DNS resolver address, which is subnet-relative).
+fn is_reserved_ipv4(ip: Ipv4Addr, subnet: Subnet) -> bool {
+    ip == crate::dns::magic_dns_v4(subnet)
 }
 
 /// Finds the lowest collision index whose derived IPv4 is free in `members`.
@@ -354,11 +452,11 @@ fn is_reserved_ipv4(ip: Ipv4Addr) -> bool {
 /// An IP is considered free if no *different* identity holds it — a re-add of
 /// the same identity at its existing index is always accepted. Returns the
 /// `(ip, index)` pair that should be stored in `Member.ip` / `Member.collision_index`.
-pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32) {
+pub fn assign_ip(members: &MemberList, identity: &EndpointId, subnet: Subnet) -> (Ipv4Addr, u32) {
     let mut index = 0u32;
     loop {
-        let ip = derive_ip_with_index(identity, index);
-        if is_reserved_ipv4(ip) {
+        let ip = derive_ip_with_index(identity, index, subnet);
+        if is_reserved_ipv4(ip, subnet) {
             index += 1;
             continue;
         }
@@ -387,12 +485,25 @@ pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
     ip: Ipv4Addr,
+    /// The node's operative overlay subnet (from `AppConfig.subnet` at
+    /// bootstrap; [`default_subnet`] otherwise). Drives `local_ip` and every
+    /// peer IP derived through this provider.
+    subnet: Subnet,
 }
 
 impl IrohIdentityProvider {
-    pub fn new(endpoint_id: EndpointId, collision_index: u32) -> Self {
-        let ip = derive_ip_with_index(&endpoint_id, collision_index);
-        Self { endpoint_id, ip }
+    pub fn new(endpoint_id: EndpointId, collision_index: u32, subnet: Subnet) -> Self {
+        let ip = derive_ip_with_index(&endpoint_id, collision_index, subnet);
+        Self {
+            endpoint_id,
+            ip,
+            subnet,
+        }
+    }
+
+    /// The node's operative overlay subnet.
+    pub fn subnet(&self) -> Subnet {
+        self.subnet
     }
 }
 
@@ -406,7 +517,7 @@ impl IdentityProvider for IrohIdentityProvider {
     }
 
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr {
-        derive_ip(peer_identity)
+        derive_ip(peer_identity, self.subnet)
     }
 }
 
@@ -445,6 +556,12 @@ pub struct GroupBlob {
     pub suggested_firewall: SuggestedFirewall,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The network-wide overlay IPv4 subnet as `(base, prefix)`, serialized as a
+    /// CIDR string. `None` means the [`default_subnet`] (100.64.0.0/10), keeping
+    /// existing default-range networks unchanged. This is the signed, network-wide
+    /// source of truth every peer derives and validates addresses against.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "cidr_opt")]
+    pub subnet: Option<Subnet>,
     /// Reusable join keys, keyed by hex `blake3(secret)`. `BTreeMap` keeps the
     /// encoding canonical; the secret hash commits to the signed hash, so adding
     /// or revoking a key changes the blob hash and triggers reconvergence.
@@ -526,6 +643,7 @@ pub fn canonical_group_bytes(
     suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
     reusable_keys: &BTreeMap<String, ReusableKey>,
+    subnet: Option<Subnet>,
 ) -> Vec<u8> {
     let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
     sorted_members.sort_by_key(|m| m.identity.to_string());
@@ -538,6 +656,7 @@ pub fn canonical_group_bytes(
         approved: sorted_approved,
         suggested_firewall: suggested_firewall.clone(),
         name: name.map(|s| s.to_string()),
+        subnet,
         reusable_keys: reusable_keys.clone(),
     };
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
@@ -549,8 +668,16 @@ pub fn group_blob_hash(
     suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
     reusable_keys: &BTreeMap<String, ReusableKey>,
+    subnet: Option<Subnet>,
 ) -> blake3::Hash {
-    let bytes = canonical_group_bytes(members, approved, suggested_firewall, name, reusable_keys);
+    let bytes = canonical_group_bytes(
+        members,
+        approved,
+        suggested_firewall,
+        name,
+        reusable_keys,
+        subnet,
+    );
     blake3::hash(&bytes)
 }
 
@@ -563,8 +690,8 @@ pub fn group_blob_hash(
 /// the daemon trusts the `ip` field carried in those messages, which permits IP
 /// hijacking — see the security audit. This helper exists so enforcement can be
 /// added at the data layer without changing the on-wire format.
-pub fn validate_member(member: &Member) -> Result<()> {
-    let expected = derive_ip_with_index(&member.identity, member.collision_index);
+pub fn validate_member(member: &Member, subnet: Subnet) -> Result<()> {
+    let expected = derive_ip_with_index(&member.identity, member.collision_index, subnet);
     anyhow::ensure!(
         member.ip == expected,
         "member ip {} does not match identity-derived ip {}",
@@ -572,23 +699,23 @@ pub fn validate_member(member: &Member) -> Result<()> {
         expected,
     );
     anyhow::ensure!(
-        !is_reserved_ipv4(member.ip),
+        !is_reserved_ipv4(member.ip, subnet),
         "member IP {} is the reserved Magic DNS address",
         member.ip
     );
-    ensure_in_cgnat_range(member.ip)
+    ensure_in_cgnat_range(member.ip, subnet)
 }
 
 /// Like [`validate_member`] but for [`ApprovedEntry`].
-pub fn validate_approved(entry: &ApprovedEntry) -> Result<()> {
-    let expected = derive_ip_with_index(&entry.identity, entry.collision_index);
+pub fn validate_approved(entry: &ApprovedEntry, subnet: Subnet) -> Result<()> {
+    let expected = derive_ip_with_index(&entry.identity, entry.collision_index, subnet);
     anyhow::ensure!(
         entry.ip == expected,
         "approved entry ip {} does not match identity-derived ip {}",
         entry.ip,
         expected,
     );
-    ensure_in_cgnat_range(entry.ip)
+    ensure_in_cgnat_range(entry.ip, subnet)
 }
 
 /// Returns `Err` if any two members share the same IPv4 address.
@@ -611,11 +738,11 @@ pub fn validate_no_duplicate_ips(members: &[Member]) -> Result<()> {
 /// bytes and re-seating every member through [`assign_ip`] makes the resolution
 /// order independent of where the roster was assembled, so every node converges
 /// on the same address map.
-pub fn resolve_ip_tiebreak(mut members: Vec<Member>) -> Vec<Member> {
+pub fn resolve_ip_tiebreak(mut members: Vec<Member>, subnet: Subnet) -> Vec<Member> {
     members.sort_by_key(|m| m.identity.as_bytes().to_owned());
     let mut list = MemberList::new();
     for mut m in members {
-        let (ip, idx) = assign_ip(&list, &m.identity);
+        let (ip, idx) = assign_ip(&list, &m.identity, subnet);
         m.ip = ip;
         m.collision_index = idx;
         let _ = list.add(m);
@@ -623,20 +750,27 @@ pub fn resolve_ip_tiebreak(mut members: Vec<Member>) -> Vec<Member> {
     list.all().into_iter().cloned().collect()
 }
 
-fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
-    let o = ip.octets();
+/// Validates that `ip` lies inside `subnet`, excluding the reserved network
+/// (`base`) and gateway (`base + 1`) addresses.
+fn ensure_in_cgnat_range(ip: Ipv4Addr, subnet: Subnet) -> Result<()> {
+    let (base_addr, prefix) = subnet;
+    let host_mask = subnet_host_mask(prefix);
+    let base = u32::from(base_addr) & !host_mask;
+    let ip_u = u32::from(ip);
     anyhow::ensure!(
-        o[0] == 100 && (o[1] & 0xC0) == 64,
-        "ip {} is outside the 100.64.0.0/10 CGNAT range",
+        ip_in_subnet(ip, subnet),
+        "ip {} is outside the configured overlay subnet {}/{}",
         ip,
+        base_addr,
+        prefix,
     );
     anyhow::ensure!(
-        !(o[1] == 64 && o[2] == 0 && o[3] == 0),
+        ip_u != base,
         "ip {} is the reserved network address",
         ip,
     );
     anyhow::ensure!(
-        !(o[1] == 64 && o[2] == 0 && o[3] == 1),
+        ip_u != base + 1,
         "ip {} is the reserved TUN gateway address",
         ip,
     );
@@ -646,14 +780,16 @@ fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
 pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
     let blob: GroupBlob =
         rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))?;
-    // Enforce the identity<->IP binding at the decode boundary. Any blob that
-    // survives this check has self-consistent members/approved entries, so a
-    // malicious or buggy publisher cannot inject a spoofed or reserved IP.
+    // Enforce the identity<->IP binding at the decode boundary against the
+    // network's own configured subnet. Any blob that survives this check has
+    // self-consistent members/approved entries, so a malicious or buggy
+    // publisher cannot inject a spoofed or reserved IP.
+    let subnet = resolve_subnet(blob.subnet);
     for m in &blob.members {
-        validate_member(m)?;
+        validate_member(m, subnet)?;
     }
     for a in &blob.approved {
-        validate_approved(a)?;
+        validate_approved(a, subnet)?;
     }
     Ok(blob)
 }
@@ -699,15 +835,15 @@ mod tests {
     #[test]
     fn test_derive_ip_deterministic() {
         let id = test_id(1);
-        let ip1 = derive_ip(&id);
-        let ip2 = derive_ip(&id);
+        let ip1 = derive_ip(&id, default_subnet());
+        let ip2 = derive_ip(&id, default_subnet());
         assert_eq!(ip1, ip2);
     }
 
     #[test]
     fn test_derive_ip_in_cgnat_range() {
         let id = test_id(1);
-        let ip = derive_ip(&id);
+        let ip = derive_ip(&id, default_subnet());
         let octets = ip.octets();
         assert_eq!(octets[0], 100);
         assert!(octets[1] >= 64 && octets[1] <= 127);
@@ -715,8 +851,8 @@ mod tests {
 
     #[test]
     fn test_derive_ip_different_identities_differ() {
-        let ip1 = derive_ip(&test_id(1));
-        let ip2 = derive_ip(&test_id(2));
+        let ip1 = derive_ip(&test_id(1), default_subnet());
+        let ip2 = derive_ip(&test_id(2), default_subnet());
         assert_ne!(ip1, ip2);
     }
 
@@ -725,7 +861,7 @@ mod tests {
         let reserved1 = Ipv4Addr::new(100, 64, 0, 0);
         let reserved2 = Ipv4Addr::new(100, 64, 0, 1);
         for i in 0..=255u8 {
-            let ip = derive_ip(&test_id(i));
+            let ip = derive_ip(&test_id(i), default_subnet());
             assert_ne!(ip, reserved1);
             assert_ne!(ip, reserved2);
         }
@@ -735,16 +871,16 @@ mod tests {
     fn test_derive_ip_with_index_zero_matches_derive_ip() {
         for i in 0..=255u8 {
             let id = test_id(i);
-            assert_eq!(derive_ip(&id), derive_ip_with_index(&id, 0));
+            assert_eq!(derive_ip(&id, default_subnet()), derive_ip_with_index(&id, 0, default_subnet()));
         }
     }
 
     #[test]
     fn test_derive_ip_with_index_rotates() {
         let id = test_id(1);
-        let ip0 = derive_ip_with_index(&id, 0);
-        let ip1 = derive_ip_with_index(&id, 1);
-        let ip2 = derive_ip_with_index(&id, 2);
+        let ip0 = derive_ip_with_index(&id, 0, default_subnet());
+        let ip1 = derive_ip_with_index(&id, 1, default_subnet());
+        let ip2 = derive_ip_with_index(&id, 2, default_subnet());
         assert_ne!(ip0, ip1);
         assert_ne!(ip1, ip2);
     }
@@ -775,7 +911,7 @@ mod tests {
     fn test_iroh_identity_provider() {
         let key = iroh::SecretKey::generate();
         let endpoint_id = key.public();
-        let provider = IrohIdentityProvider::new(endpoint_id, 0);
+        let provider = IrohIdentityProvider::new(endpoint_id, 0, default_subnet());
 
         let ip = provider.local_ip();
         let octets = ip.octets();
@@ -1141,7 +1277,7 @@ mod tests {
             let id = test_id(seed);
             let _ = list.add(Member {
                 identity: id,
-                ip: derive_ip(&id),
+                ip: derive_ip(&id, default_subnet()),
                 is_coordinator: false,
                 hostname: None,
                 user_identity: None,
@@ -1157,7 +1293,7 @@ mod tests {
     fn resolve_peer_literal_by_ip_and_identity() {
         let device = test_id(11);
         let user = test_id(22);
-        let ip = derive_ip(&device);
+        let ip = derive_ip(&device, default_subnet());
         let mut list = MemberList::new();
         list.add(Member {
             identity: device,
@@ -1193,14 +1329,14 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let b = canonical_group_bytes(
             &members,
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         assert_eq!(a, b);
     }
@@ -1216,14 +1352,14 @@ mod tests {
                 &approved,
                 &ray_proto::SuggestedFirewall::default(),
                 None,
-                &BTreeMap::new()
+                &BTreeMap::new(), None
             ),
             canonical_group_bytes(
                 &m2,
                 &approved,
                 &ray_proto::SuggestedFirewall::default(),
                 None,
-                &BTreeMap::new()
+                &BTreeMap::new(), None
             ),
         );
     }
@@ -1237,7 +1373,7 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let members2 = make_member_list(&[1, 2, 3]);
         let h2 = group_blob_hash(
@@ -1245,7 +1381,7 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         assert_ne!(h1, h2);
     }
@@ -1259,7 +1395,7 @@ mod tests {
             .approve(
                 ApprovedEntry {
                     identity: id3,
-                    ip: derive_ip(&id3),
+                    ip: derive_ip(&id3, default_subnet()),
                     hostname: None,
                     user_identity: None,
                     device_cert: None,
@@ -1274,7 +1410,7 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
@@ -1290,14 +1426,14 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let hash = group_blob_hash(
             &members,
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
@@ -1333,7 +1469,7 @@ mod tests {
             &approved,
             &ray_proto::SuggestedFirewall::default(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
         let bad_hash = blake3::hash(b"wrong data");
         let result = verify_group_blob(&bytes, &bad_hash);
@@ -1348,7 +1484,7 @@ mod tests {
         members
             .add(Member {
                 identity: id,
-                ip: derive_ip(&id),
+                ip: derive_ip(&id, default_subnet()),
                 is_coordinator: false,
                 hostname: None,
                 user_identity: None,
@@ -1359,8 +1495,8 @@ mod tests {
             .unwrap();
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
-        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
+        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), None);
+        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), None);
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members[0].last_seen, Some(12345));
     }
@@ -1375,7 +1511,7 @@ mod tests {
         members
             .add(Member {
                 identity: id,
-                ip: derive_ip(&id),
+                ip: derive_ip(&id, default_subnet()),
                 is_coordinator: false,
                 hostname: None,
                 user_identity: None,
@@ -1386,9 +1522,9 @@ mod tests {
             .unwrap();
         let approved = ApprovedList::new();
         let sf = ray_proto::SuggestedFirewall::default();
-        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
+        let bytes = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), None);
         assert!(!String::from_utf8_lossy(&bytes).contains("last_seen"));
-        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
+        let hash = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), None);
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members[0].last_seen, None);
     }
@@ -1405,8 +1541,8 @@ mod tests {
         sf.insert("subject".to_string(), hs);
 
         // Deterministic: BTreeMap keys canonicalize regardless of insert order.
-        let a = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
-        let b = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
+        let a = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), None);
+        let b = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new(), None);
         assert_eq!(a, b);
 
         // Suggestions are part of the signed content, so they change the hash.
@@ -1415,9 +1551,9 @@ mod tests {
             &approved,
             &SuggestedFirewall::new(),
             None,
-            &BTreeMap::new(),
+            &BTreeMap::new(), None
         );
-        let h_sf = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
+        let h_sf = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new(), None);
         assert_ne!(h_empty, h_sf);
     }
 
@@ -1475,7 +1611,7 @@ mod tests {
             &approved,
             &SuggestedFirewall::default(),
             None,
-            &keys,
+            &keys, None
         );
         let blob = decode_group_blob(&bytes).unwrap();
         assert_eq!(blob.reusable_keys.len(), 1);
@@ -1493,7 +1629,7 @@ mod tests {
             &approved,
             &SuggestedFirewall::default(),
             None,
-            &empty,
+            &empty, None
         );
 
         let secret = [3u8; 16];
@@ -1505,7 +1641,7 @@ mod tests {
             &approved,
             &SuggestedFirewall::default(),
             None,
-            &keys,
+            &keys, None
         );
         assert_ne!(h0, h1, "adding a reusable key must change the signed hash");
 
@@ -1516,7 +1652,7 @@ mod tests {
             &approved,
             &SuggestedFirewall::default(),
             None,
-            &keys,
+            &keys, None
         );
         assert_ne!(
             h1, h2,
@@ -1592,6 +1728,7 @@ mod tests {
                 approved: vec![],
                 suggested_firewall: SuggestedFirewall::default(),
                 name: None,
+                subnet: None,
                 reusable_keys: keys,
             }
         };
@@ -1612,7 +1749,7 @@ mod tests {
         let id = test_id(7);
         let member = Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
@@ -1620,7 +1757,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        assert!(validate_member(&member).is_ok());
+        assert!(validate_member(&member, default_subnet()).is_ok());
     }
 
     #[test]
@@ -1638,7 +1775,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        let err = validate_member(&member).unwrap_err().to_string();
+        let err = validate_member(&member, default_subnet()).unwrap_err().to_string();
         assert!(err.contains("does not match"), "{err}");
     }
 
@@ -1655,7 +1792,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        assert!(validate_member(&member).is_err());
+        assert!(validate_member(&member, default_subnet()).is_err());
     }
 
     #[test]
@@ -1682,8 +1819,8 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        assert!(validate_member(&net).is_err());
-        assert!(validate_member(&gw).is_err());
+        assert!(validate_member(&net, default_subnet()).is_err());
+        assert!(validate_member(&gw, default_subnet()).is_err());
     }
 
     #[test]
@@ -1697,7 +1834,7 @@ mod tests {
             device_cert: None,
             collision_index: 0,
         };
-        assert!(validate_approved(&entry).is_err());
+        assert!(validate_approved(&entry, default_subnet()).is_err());
     }
 
     #[test]
@@ -1707,7 +1844,7 @@ mod tests {
             let id = test_id(seed);
             let member = Member {
                 identity: id,
-                ip: derive_ip(&id),
+                ip: derive_ip(&id, default_subnet()),
                 is_coordinator: false,
                 hostname: None,
                 user_identity: None,
@@ -1716,7 +1853,7 @@ mod tests {
                 last_seen: None,
             };
             assert!(
-                validate_member(&member).is_ok(),
+                validate_member(&member, default_subnet()).is_ok(),
                 "seed {seed} -> {}",
                 member.ip
             );
@@ -1744,6 +1881,7 @@ mod tests {
             approved: vec![],
             suggested_firewall: Default::default(),
             name: None,
+            subnet: None,
             reusable_keys: BTreeMap::new(),
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
@@ -1769,6 +1907,7 @@ mod tests {
             approved: vec![],
             suggested_firewall: Default::default(),
             name: None,
+            subnet: None,
             reusable_keys: BTreeMap::new(),
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
@@ -1781,7 +1920,7 @@ mod tests {
         let mut list = MemberList::new();
         list.add(Member {
             identity: id,
-            ip: derive_ip(&id),
+            ip: derive_ip(&id, default_subnet()),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
@@ -1808,7 +1947,7 @@ mod tests {
             key_bytes[2] = b[2];
             key_bytes[3] = b[3];
             let id = iroh::SecretKey::from(key_bytes).public();
-            let ip = derive_ip(&id);
+            let ip = derive_ip(&id, default_subnet());
             if let Some(existing) = seen.get(&ip) {
                 if *existing != id {
                     return Some((*existing, id));
@@ -1825,7 +1964,7 @@ mod tests {
         let id = test_id(5);
         let good = Member {
             identity: id,
-            ip: derive_ip_with_index(&id, 2),
+            ip: derive_ip_with_index(&id, 2, default_subnet()),
             is_coordinator: false,
             hostname: None,
             user_identity: None,
@@ -1833,13 +1972,13 @@ mod tests {
             collision_index: 2,
             last_seen: None,
         };
-        assert!(validate_member(&good).is_ok());
+        assert!(validate_member(&good, default_subnet()).is_ok());
         let bad = Member {
             collision_index: 1,
             last_seen: None,
             ..good.clone()
         }; // ip is for index 2, claims 1
-        assert!(validate_member(&bad).is_err());
+        assert!(validate_member(&bad, default_subnet()).is_err());
     }
 
     #[test]
@@ -1855,7 +1994,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        let dup = derive_ip(&a);
+        let dup = derive_ip(&a, default_subnet());
         assert!(validate_no_duplicate_ips(&[m(a, dup), m(test_id(2), dup)]).is_err());
     }
 
@@ -1864,12 +2003,12 @@ mod tests {
         let (a, b) = find_colliding_pair()
             .expect("birthday bound: should find a collision within 200k identities");
         // Sanity: a and b both map to the same index-0 IP.
-        assert_eq!(derive_ip(&a), derive_ip(&b));
-        let ip0 = derive_ip(&a);
+        assert_eq!(derive_ip(&a, default_subnet()), derive_ip(&b, default_subnet()));
+        let ip0 = derive_ip(&a, default_subnet());
 
         // Add `a` to the list at its index-0 IP.
         let mut list = MemberList::new();
-        let (assigned_a, idx_a) = assign_ip(&list, &a);
+        let (assigned_a, idx_a) = assign_ip(&list, &a, default_subnet());
         assert_eq!(idx_a, 0, "first peer always gets index 0");
         assert_eq!(assigned_a, ip0);
         list.add(Member {
@@ -1885,12 +2024,12 @@ mod tests {
         .unwrap();
 
         // Now assign_ip for `b` must rotate to index >= 1.
-        let (ip_b, idx_b) = assign_ip(&list, &b);
+        let (ip_b, idx_b) = assign_ip(&list, &b, default_subnet());
         assert!(idx_b >= 1, "colliding identity must rotate to index >= 1");
         assert_ne!(ip_b, ip0, "rotated IP must differ from the occupied slot");
         assert_eq!(
             ip_b,
-            derive_ip_with_index(&b, idx_b),
+            derive_ip_with_index(&b, idx_b, default_subnet()),
             "assigned IP must equal derive_ip_with_index at that index"
         );
     }
@@ -1908,7 +2047,7 @@ mod tests {
                 (b, a)
             }
         };
-        let ip = derive_ip(&lo); // both initially claim this ip at index 0
+        let ip = derive_ip(&lo, default_subnet()); // both initially claim this ip at index 0
         let mk = |id| Member {
             identity: id,
             ip,
@@ -1919,7 +2058,7 @@ mod tests {
             collision_index: 0,
             last_seen: None,
         };
-        let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
+        let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)], default_subnet());
         // lower identity keeps `ip`; higher re-rolls to a free index.
         let lo_m = resolved.iter().find(|m| m.identity == lo).unwrap();
         let hi_m = resolved.iter().find(|m| m.identity == hi).unwrap();
@@ -1932,8 +2071,8 @@ mod tests {
     fn is_reserved_ipv4_covers_magic_dns() {
         // The predicate test isolates the guard: it fails if anyone removes the
         // magic DNS IP from the reserved set, independent of IP-derivation.
-        assert!(is_reserved_ipv4(crate::dns::MAGIC_DNS_V4));
-        assert!(!is_reserved_ipv4(Ipv4Addr::new(100, 64, 0, 7)));
+        assert!(is_reserved_ipv4(crate::dns::magic_dns_v4_node(), default_subnet()));
+        assert!(!is_reserved_ipv4(Ipv4Addr::new(100, 64, 0, 7), default_subnet()));
     }
 
     #[test]
@@ -1944,7 +2083,7 @@ mod tests {
         let id = iroh::SecretKey::from(kb).public();
         let m = Member {
             identity: id,
-            ip: crate::dns::MAGIC_DNS_V4,
+            ip: crate::dns::magic_dns_v4_node(),
             collision_index: 0,
             is_coordinator: false,
             hostname: None,
@@ -1952,6 +2091,108 @@ mod tests {
             device_cert: None,
             last_seen: None,
         };
-        assert!(validate_member(&m).is_err());
+        assert!(validate_member(&m, default_subnet()).is_err());
+    }
+
+    // --- configurable subnet (SUBNET-003/004/005/007) ------------------------
+
+    const CUSTOM: Subnet = (Ipv4Addr::new(10, 88, 0, 0), 16);
+
+    #[test]
+    fn derive_ip_lands_in_custom_subnet_and_avoids_reserved() {
+        for seed in 1u8..40 {
+            let ip = derive_ip(&test_id(seed), CUSTOM);
+            assert!(ip_in_subnet(ip, CUSTOM), "{ip} not in 10.88.0.0/16");
+            let host = u32::from(ip) & subnet_host_mask(16);
+            assert!(host >= 2, "{ip} must avoid network(.0)/gateway(.1)");
+            // A custom-subnet address must NOT be a default-range CGNAT address.
+            assert!(!ip_in_subnet(ip, default_subnet()));
+        }
+    }
+
+    #[test]
+    fn derive_ip_is_deterministic_per_subnet() {
+        let id = test_id(7);
+        assert_eq!(derive_ip(&id, CUSTOM), derive_ip(&id, CUSTOM));
+        // Different subnets generally yield different addresses.
+        assert_ne!(
+            u32::from(derive_ip(&id, CUSTOM)) & !subnet_host_mask(16),
+            u32::from(derive_ip(&id, default_subnet())) & !subnet_host_mask(10),
+        );
+    }
+
+    #[test]
+    fn netmask_and_gateway_track_prefix() {
+        assert_eq!(subnet_netmask(10), Ipv4Addr::new(255, 192, 0, 0));
+        assert_eq!(subnet_netmask(16), Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(subnet_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(subnet_gateway(CUSTOM), Ipv4Addr::new(10, 88, 0, 1));
+        assert_eq!(subnet_gateway(default_subnet()), Ipv4Addr::new(100, 64, 0, 1));
+    }
+
+    #[test]
+    fn ensure_in_range_respects_custom_subnet() {
+        // In-subnet host is accepted.
+        assert!(ensure_in_cgnat_range(Ipv4Addr::new(10, 88, 5, 9), CUSTOM).is_ok());
+        // Network + gateway are rejected.
+        assert!(ensure_in_cgnat_range(Ipv4Addr::new(10, 88, 0, 0), CUSTOM).is_err());
+        assert!(ensure_in_cgnat_range(Ipv4Addr::new(10, 88, 0, 1), CUSTOM).is_err());
+        // A default-range address is outside the custom subnet.
+        assert!(ensure_in_cgnat_range(Ipv4Addr::new(100, 64, 0, 5), CUSTOM).is_err());
+    }
+
+    #[test]
+    fn magic_dns_is_subnet_relative_and_back_compatible() {
+        // Reproduces the historical resolver address for the default subnet.
+        assert_eq!(
+            crate::dns::magic_dns_v4(default_subnet()),
+            Ipv4Addr::new(100, 100, 100, 53)
+        );
+        // For a custom subnet it stays inside the range.
+        assert!(ip_in_subnet(crate::dns::magic_dns_v4(CUSTOM), CUSTOM));
+    }
+
+    #[test]
+    fn parse_cidr_roundtrips_and_rejects_garbage() {
+        assert_eq!(parse_cidr("10.88.0.0/16").unwrap(), CUSTOM);
+        assert!(parse_cidr("10.88.0.0").is_err());
+        assert!(parse_cidr("not-an-ip/16").is_err());
+        assert!(parse_cidr("10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn group_blob_subnet_survives_roundtrip() {
+        let members = make_member_list_in(&[1, 2], CUSTOM);
+        let bytes = canonical_group_bytes(
+            &members,
+            &ApprovedList::new(),
+            &SuggestedFirewall::default(),
+            None,
+            &BTreeMap::new(),
+            Some(CUSTOM),
+        );
+        let blob = decode_group_blob(&bytes).unwrap();
+        assert_eq!(resolve_subnet(blob.subnet), CUSTOM);
+    }
+
+    /// Like [`make_member_list`] but derives IPs in `subnet`.
+    fn make_member_list_in(seeds: &[u8], subnet: Subnet) -> MemberList {
+        let mut list = MemberList::new();
+        for &s in seeds {
+            let id = test_id(s);
+            let (ip, idx) = assign_ip(&list, &id, subnet);
+            list.add(Member {
+                identity: id,
+                ip,
+                is_coordinator: false,
+                hostname: None,
+                user_identity: None,
+                device_cert: None,
+                collision_index: idx,
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        list
     }
 }

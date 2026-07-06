@@ -25,7 +25,7 @@ use zbus::zvariant::Value;
 
 use crate::DNS_DOMAIN;
 
-// Must equal dns::MAGIC_DNS_V4.
+// Must equal dns::magic_dns_v4_node.
 const RESOLVER_IP: &str = "100.100.100.53";
 
 #[async_trait]
@@ -427,7 +427,7 @@ impl DnsConfigurator for SystemdResolvedDBus {
         // SetLinkDNS(ifindex, [(family, address)])
         // AF_INET = 2; the address is the magic resolver IP, routed into the TUN.
         let dns_addrs: Vec<(i32, Vec<u8>)> =
-            vec![(2i32, crate::dns::MAGIC_DNS_V4.octets().to_vec())];
+            vec![(2i32, crate::dns::magic_dns_v4_node().octets().to_vec())];
         conn.call_method(
             Some("org.freedesktop.resolve1"),
             "/org/freedesktop/resolve1",
@@ -598,7 +598,7 @@ impl DnsConfigurator for NetworkManagerDns {
             && config_path.as_str() != "/"
         {
             // Set DNS nameservers via D-Bus Properties — magic DNS IP as u32 (NM host u32 of network-order bytes)
-            let dns_servers: Vec<u32> = vec![u32::from_le_bytes(crate::dns::MAGIC_DNS_V4.octets())]; // NM wants the address as a host u32 of its network-order bytes
+            let dns_servers: Vec<u32> = vec![u32::from_le_bytes(crate::dns::magic_dns_v4_node().octets())]; // NM wants the address as a host u32 of its network-order bytes
             let _ = conn
                 .call_method(
                     Some("org.freedesktop.NetworkManager"),
@@ -812,7 +812,7 @@ fn parse_resolv_nameservers(contents: &str) -> Vec<Ipv4Addr> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver "))
         .filter_map(|s| s.trim().parse::<Ipv4Addr>().ok())
-        .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
+        .filter(|ip| *ip != crate::dns::magic_dns_v4_node())
         .collect()
 }
 
@@ -1177,7 +1177,7 @@ mod tests {
     fn resolver_ip_matches_magic_dns_constant() {
         assert_eq!(
             RESOLVER_IP.parse::<Ipv4Addr>().unwrap(),
-            crate::dns::MAGIC_DNS_V4
+            crate::dns::magic_dns_v4_node()
         );
     }
 

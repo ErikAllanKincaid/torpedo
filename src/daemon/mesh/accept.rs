@@ -525,7 +525,7 @@ impl CoordinatorAcceptState {
     ) -> std::result::Result<(Ipv4Addr, u32, Option<String>), String> {
         let (peer_ip, collision_index) = {
             let s = self.state.read().unwrap();
-            crate::membership::assign_ip(&s.members, &remote_id)
+            crate::membership::assign_ip(&s.members, &remote_id, s.subnet)
         };
         let final_hostname = if let Some(desired) = hostname {
             let taken = {

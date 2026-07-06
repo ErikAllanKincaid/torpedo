@@ -386,6 +386,18 @@ pub struct AppConfig {
     /// back to a random generated name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_hostname: Option<String>,
+    /// The node's operative overlay IPv4 subnet, cached locally as a CIDR string
+    /// (e.g. "10.88.0.0/16"). The authoritative value lives in each network's
+    /// signed `GroupBlob`; this is a read-through cache so the daemon can build
+    /// its single TUN / identity in the right subnet at bootstrap, before any
+    /// network is active. `None` means the default 100.64.0.0/10. Written by
+    /// `create --subnet` and `join`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::membership::cidr_opt"
+    )]
+    pub subnet: Option<crate::membership::Subnet>,
     /// Per-user "contact key" used by `ray connect`: a standing, rotatable
     /// identity (distinct from the transport key and per-network keys) published
     /// to pkarr so others can request a direct connection without a room id or
@@ -456,6 +468,7 @@ impl Default for AppConfig {
             mdns_enabled: true,
             operator_uid: None,
             default_hostname: None,
+            subnet: None,
             contact_secret_key: None,
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
@@ -536,6 +549,12 @@ struct Settings {
     operator_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_hostname: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::membership::cidr_opt"
+    )]
+    subnet: Option<crate::membership::Subnet>,
     #[serde(default, with = "option_secret_key_hex")]
     contact_secret_key: Option<SecretKey>,
     #[serde(default)]
@@ -798,6 +817,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
             mdns_enabled: true,
             operator_uid: None,
             default_hostname: None,
+            subnet: None,
             contact_secret_key: None,
             relay: ServerOverride::default(),
             discovery_dns: ServerOverride::default(),
@@ -842,6 +862,7 @@ fn load_in(dir: &Path) -> Result<AppConfig> {
         mdns_enabled: settings.mdns_enabled,
         operator_uid: settings.operator_uid,
         default_hostname: settings.default_hostname,
+        subnet: settings.subnet,
         contact_secret_key: settings.contact_secret_key,
         relay: settings.relay,
         discovery_dns: settings.discovery_dns,
@@ -864,11 +885,35 @@ pub fn save_settings(config: &AppConfig) -> Result<()> {
     save_settings_in(&config_dir()?, config)
 }
 
+/// The node's operative overlay subnet (cached in [`AppConfig::subnet`]), or the
+/// default if unset/unreadable. Read at daemon bootstrap to build the TUN and
+/// identity in the right range before any network is active.
+pub fn node_subnet() -> crate::membership::Subnet {
+    load()
+        .ok()
+        .and_then(|c| c.subnet)
+        .unwrap_or_else(crate::membership::default_subnet)
+}
+
+/// Persist the node's operative overlay subnet (a local cache of the network's
+/// authoritative `GroupBlob` value) so the daemon rebuilds its TUN/identity in
+/// it at the next bootstrap. Stores `None` for the default subnet.
+pub fn set_node_subnet(subnet: crate::membership::Subnet) -> Result<()> {
+    let mut cfg = load()?;
+    cfg.subnet = if subnet == crate::membership::default_subnet() {
+        None
+    } else {
+        Some(subnet)
+    };
+    save_settings(&cfg)
+}
+
 fn save_settings_in(dir: &Path, config: &AppConfig) -> Result<()> {
     let settings = Settings {
         mdns_enabled: config.mdns_enabled,
         operator_uid: config.operator_uid,
         default_hostname: config.default_hostname.clone(),
+        subnet: config.subnet,
         contact_secret_key: config.contact_secret_key.clone(),
         relay: config.relay.clone(),
         discovery_dns: config.discovery_dns.clone(),

@@ -314,6 +314,7 @@ impl MeshManager {
                 GroupMode::Restricted,
                 Some(name),
                 Some(my_host),
+                None,
                 true,
                 Some((peer, req.hostname.clone())),
             )

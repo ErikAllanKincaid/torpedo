@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
 #[cfg(not(target_os = "android"))]
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 // The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
 // off Android, where the packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
@@ -68,64 +68,24 @@ pub struct TunWriter {
     writer: DeviceWriter,
 }
 
-#[cfg(not(target_os = "android"))]
-fn is_cgnat(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    octets[0] == 100 && (octets[1] & 0xC0) == 64
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn check_cgnat_conflict() -> Result<()> {
-    let output = Command::new("ifconfig").output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Ok(()),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut current_iface = String::new();
-
-    for line in stdout.lines() {
-        if !line.starts_with('\t')
-            && !line.starts_with(' ')
-            && let Some(name) = line.split(':').next()
-        {
-            current_iface = name.to_string();
-        }
-        if line.contains("inet ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pos) = parts.iter().position(|&p| p == "inet")
-                && let Some(ip_str) = parts.get(pos + 1)
-                && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
-                && is_cgnat(ip)
-            {
-                bail!(
-                    "interface {} already has CGNAT address {} — another VPN \
-                     (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting rayfish.",
-                    current_iface,
-                    ip
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Creates a TUN device with the given virtual IPs and splits it into
-/// independent read/write halves. IPv4 gets a /10 netmask (100.64.0.0/10);
-/// IPv6 gets a /7 prefix (`200::/7`) so the kernel installs the connected
-/// route for the whole peer range, mirroring how the IPv4 /10 netmask works.
+/// independent read/write halves. IPv4 gets the configured overlay subnet's
+/// netmask (derived from its prefix length) so the kernel installs the connected
+/// route for the whole peer range; IPv6 gets a /7 prefix (`200::/7`) the same way.
 #[cfg(not(target_os = "android"))]
-pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, String)> {
-    let gateway = Ipv4Addr::new(100, 64, 0, 1);
+pub async fn create(
+    v4: Ipv4Addr,
+    v6: Ipv6Addr,
+    subnet: crate::membership::Subnet,
+) -> Result<(TunReader, TunWriter, String)> {
+    let (_, prefix) = subnet;
+    let gateway = crate::membership::subnet_gateway(subnet);
+    let nm = crate::membership::subnet_netmask(prefix).octets();
     let mut config = Configuration::default();
     config
         .address(v4)
         .destination(gateway)
-        .netmask((255, 192, 0, 0)) // /10
+        .netmask((nm[0], nm[1], nm[2], nm[3]))
         .mtu(TUN_MTU)
         .up();
 
@@ -282,7 +242,7 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Routes the magic-DNS virtual IP (`dns::MAGIC_DNS_V4`) into the TUN as a `/32`
+/// Routes the magic-DNS virtual IP (`dns::magic_dns_v4_node`) into the TUN as a `/32`
 /// host route so that packets from the kernel addressed to that IP are delivered
 /// to the TUN device (and thus intercepted by our DNS server) rather than going
 /// out the host's default gateway. The IP is **never** assigned as a local
@@ -309,7 +269,7 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
             .index;
 
         let route = RouteMessageBuilder::<Ipv4Addr>::new()
-            .destination_prefix(crate::dns::MAGIC_DNS_V4, 32)
+            .destination_prefix(crate::dns::magic_dns_v4_node(), 32)
             .output_interface(index)
             .build();
         handle
@@ -330,7 +290,7 @@ pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub async fn route_magic_dns(tun_name: &str) -> Result<()> {
-    let ip = crate::dns::MAGIC_DNS_V4.to_string();
+    let ip = crate::dns::magic_dns_v4_node().to_string();
     let _ = Command::new("route")
         .args([
             "-n",

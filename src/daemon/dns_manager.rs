@@ -56,7 +56,7 @@ impl DnsManager {
                 let is_direct = c.name() == "direct-resolv.conf";
                 #[cfg(target_os = "linux")]
                 let search = c.search_domains();
-                tracing::info!(backend = c.name(), resolver_ip = %crate::dns::MAGIC_DNS_V4, upstreams = ?upstreams, "Magic DNS active");
+                tracing::info!(backend = c.name(), resolver_ip = %crate::dns::magic_dns_v4_node(), upstreams = ?upstreams, "Magic DNS active");
                 self.resolver.set_upstreams(upstreams);
                 *self.configurator.lock().unwrap() = Some(c);
                 // In direct mode, re-assert /etc/resolv.conf the instant another

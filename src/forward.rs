@@ -262,7 +262,7 @@ pub struct ForwardCtx {
 
 /// True when a parsed packet is a DNS query addressed to the magic resolver IP.
 pub(crate) fn is_magic_dns(info: &firewall::PacketInfo) -> bool {
-    info.dst_port == 53 && info.dst_ip == IpAddr::V4(crate::dns::MAGIC_DNS_V4)
+    info.dst_port == 53 && info.dst_ip == IpAddr::V4(crate::dns::magic_dns_v4_node())
 }
 
 /// Main TUN read loop. Reads packets from the TUN device, extracts the destination IP,
@@ -827,8 +827,8 @@ mod tests {
             icmp_type: 0,
             icmp_id: 0,
         };
-        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 53)));
-        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::MAGIC_DNS_V4), 80)));
+        assert!(is_magic_dns(&mk(IpAddr::V4(crate::dns::magic_dns_v4_node()), 53)));
+        assert!(!is_magic_dns(&mk(IpAddr::V4(crate::dns::magic_dns_v4_node()), 80)));
         assert!(!is_magic_dns(&mk("100.64.0.9".parse().unwrap(), 53)));
     }
 

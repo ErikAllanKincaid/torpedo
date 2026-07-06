@@ -1,14 +1,14 @@
 //! Magic DNS responder for the `.ray` TLD.
 //!
 //! Answers A, AAAA, PTR, and SOA queries for `*.ray` names. The resolver is
-//! reached via a magic IP (`MAGIC_DNS_V4` = 100.100.100.53) routed through the
-//! TUN — no host-level port 53 bind is made. `handle_query` is called directly
-//! by `forward::run_mesh` when it intercepts a UDP DNS packet destined for the
-//! magic IP.
+//! reached via a magic IP ([`magic_dns_v4_node`], a fixed host offset within the
+//! node's overlay subnet) routed through the TUN — no host-level port 53 bind is
+//! made. `handle_query` is called directly by `forward::run_mesh` when it
+//! intercepts a UDP DNS packet destined for the magic IP.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
@@ -19,14 +19,45 @@ use simple_dns::{
 };
 
 use crate::DNS_DOMAIN;
+use crate::membership::{Subnet, default_subnet, ip_in_subnet, subnet_host_mask};
 
-/// Reserved virtual IPv4 for the in-daemon Magic DNS resolver. It lives in the
-/// `100.64.0.0/10` peer range (so the existing TUN route delivers packets to it)
-/// but is NEVER assigned to a member and NEVER bound as a local interface
-/// address — it is reachable only by being routed into the TUN, which is what
-/// lets us answer DNS without competing for the host's port 53. Distinct from
-/// Tailscale's 100.100.100.100 so both can coexist.
-pub const MAGIC_DNS_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
+/// The reserved virtual IPv4 for the in-daemon Magic DNS resolver, as a fixed
+/// host offset within `subnet`. It lives inside the overlay subnet (so the TUN
+/// route delivers packets to it) but is NEVER assigned to a member and NEVER
+/// bound as a local interface address — it is reachable only by being routed
+/// into the TUN. The `0x0064_6435` offset reproduces the historical resolver
+/// address for the default subnet and yields a stable, distinct in-subnet
+/// address for any /24-or-larger custom subnet. Distinct from Tailscale's own
+/// resolver so both can coexist.
+pub fn magic_dns_v4(subnet: Subnet) -> Ipv4Addr {
+    let (base_addr, prefix) = subnet;
+    let host_mask = subnet_host_mask(prefix);
+    let base = u32::from(base_addr) & !host_mask;
+    let host = 0x0064_6435 & host_mask;
+    Ipv4Addr::from(base | host)
+}
+
+/// Node-global overlay subnet + derived Magic DNS resolver address. The node
+/// runs a single overlay subnet / TUN, so these are process-global and set once
+/// at daemon bootstrap via [`init_node_overlay`]. Operational sites that lack a
+/// [`Subnet`] in scope (packet fast-path, OS DNS config) read them through the
+/// accessors below.
+static NODE_SUBNET: OnceLock<Subnet> = OnceLock::new();
+
+/// Set the node's operative overlay subnet once at bootstrap. Idempotent.
+pub fn init_node_overlay(subnet: Subnet) {
+    let _ = NODE_SUBNET.set(subnet);
+}
+
+/// The node's operative overlay subnet (default until [`init_node_overlay`]).
+pub fn node_subnet() -> Subnet {
+    *NODE_SUBNET.get_or_init(default_subnet)
+}
+
+/// The node-global Magic DNS resolver address, derived from [`node_subnet`].
+pub fn magic_dns_v4_node() -> Ipv4Addr {
+    magic_dns_v4(node_subnet())
+}
 
 /// Per-network hostname → (IPv4, IPv6) mapping.
 pub type HostnameEntry = (Ipv4Addr, Ipv6Addr);
@@ -242,9 +273,9 @@ async fn handle_ptr_query(
     // If IP is in our range but not found, NXDOMAIN
     match ip {
         IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            // 100.64.0.0/10
-            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+            // In the node's configured overlay subnet but not found -> NXDOMAIN.
+            // Mirrors membership::ensure_in_cgnat_range via the shared predicate.
+            if ip_in_subnet(v4, node_subnet()) {
                 tracing::info!(ip = %ip, "DNS PTR NXDOMAIN (our range)");
                 return Some(make_nxdomain(packet));
             }

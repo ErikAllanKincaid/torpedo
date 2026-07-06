@@ -777,6 +777,7 @@ pub(crate) async fn ipc_apply_create(name: &str) -> Result<()> {
             name: Some(name.to_string()),
             hostname: None,
             transport: None,
+            subnet: None,
         },
     )
     .await?;

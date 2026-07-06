@@ -195,7 +195,10 @@ pub(crate) async fn reconverge_and_apply(
     // collision index, producing a roster with duplicate IPs. Resolve it
     // deterministically (lowest identity keeps the slot, others re-roll) before
     // it reaches the PeerTable/DNS so every node converges on the same map.
-    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
+    let tiebroken = crate::membership::resolve_ip_tiebreak(
+        data.members.clone(),
+        crate::membership::resolve_subnet(data.subnet),
+    );
     if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
         tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
     }

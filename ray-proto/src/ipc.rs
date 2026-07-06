@@ -20,6 +20,12 @@ pub enum IpcMessage {
         name: Option<String>,
         hostname: Option<String>,
         transport: Option<TransportMode>,
+        /// Overlay IPv4 subnet as a CIDR string (e.g. "10.88.0.0/16"). `None`
+        /// uses the default 100.64.0.0/10. Kept as a raw string here so the
+        /// wire protocol crate stays free of the main crate's parsing helpers;
+        /// the daemon parses/validates it.
+        #[serde(default)]
+        subnet: Option<String>,
     },
     Join {
         network_key: String,
@@ -760,6 +766,7 @@ mod tests {
             name: None,
             hostname: None,
             transport: None,
+            subnet: None,
         };
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();

@@ -6,8 +6,14 @@ pub(crate) async fn ipc_create(
     mode: GroupMode,
     name: Option<String>,
     hostname: Option<String>,
+    subnet: Option<String>,
     tor: bool,
 ) -> Result<()> {
+    // Validate the CIDR locally so the user gets an immediate error, but send it
+    // as the raw string; the daemon re-parses it authoritatively.
+    if let Some(ref cidr) = subnet {
+        membership::parse_cidr(cidr)?;
+    }
     let transport = if tor {
         Some(config::TransportMode::Tor)
     } else {
@@ -21,6 +27,7 @@ pub(crate) async fn ipc_create(
             name,
             hostname,
             transport,
+            subnet,
         },
     )
     .await?;

@@ -411,8 +411,8 @@ pub struct AppConfig {
     /// (e.g. "10.88.0.0/16"). The authoritative value lives in each network's
     /// signed `GroupBlob`; this is a read-through cache so the daemon can build
     /// its single TUN / identity in the right subnet at bootstrap, before any
-    /// network is active. `None` means the default 100.64.0.0/10. Written by
-    /// `create --subnet` and `join`.
+    /// network is active. `None` means the default 10.88.0.0/16. Written by
+    /// `create --subnet`, `join`, and `torpedo config set subnet`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

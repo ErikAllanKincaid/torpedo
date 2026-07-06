@@ -21,7 +21,7 @@ pub enum IpcMessage {
         hostname: Option<String>,
         transport: Option<TransportMode>,
         /// Overlay IPv4 subnet as a CIDR string (e.g. "10.88.0.0/16"). `None`
-        /// uses the default 100.64.0.0/10. Kept as a raw string here so the
+        /// uses the default 10.88.0.0/16. Kept as a raw string here so the
         /// wire protocol crate stays free of the main crate's parsing helpers;
         /// the daemon parses/validates it.
         #[serde(default)]

@@ -66,9 +66,9 @@ pub(crate) enum Command {
         /// Your hostname within the network (e.g. "alice" → alice.gaming.ray). Random if not set
         #[arg(long)]
         hostname: Option<String>,
-        /// Overlay IPv4 subnet in CIDR form (e.g. "10.88.0.0/16"). Lets the mesh
-        /// use a range outside 100.64.0.0/10 so it can coexist with Tailscale.
-        /// Defaults to 100.64.0.0/10 when omitted.
+        /// Overlay IPv4 subnet in CIDR form (e.g. "10.88.0.0/16"). Override the
+        /// default only if it collides with an existing local network. Defaults
+        /// to 10.88.0.0/16, chosen to coexist with Tailscale's 100.64.0.0/10.
         #[arg(long)]
         subnet: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)

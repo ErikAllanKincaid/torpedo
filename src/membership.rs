@@ -571,8 +571,8 @@ pub struct GroupBlob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The network-wide overlay IPv4 subnet as `(base, prefix)`, serialized as a
-    /// CIDR string. `None` means the [`default_subnet`] (100.64.0.0/10), keeping
-    /// existing default-range networks unchanged. This is the signed, network-wide
+    /// CIDR string. `None` means the [`default_subnet`] (10.88.0.0/16), keeping
+    /// default-subnet networks byte-identical. This is the signed, network-wide
     /// source of truth every peer derives and validates addresses against.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "cidr_opt")]
     pub subnet: Option<Subnet>,

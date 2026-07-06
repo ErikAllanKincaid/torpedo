@@ -1619,11 +1619,11 @@ mod headless_tests {
     /// the builder awaits, matching the daemon binary's `#[tokio::main]` runtime.
     /// The `timeout` guard turns a future startup regression into a fast failure
     /// instead of a hung test.
-    /// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or
+    /// Process-wide lock serializing tests that mutate `TORPEDO_CONFIG_DIR` (or
     /// any other env var read by `config::config_dir()`), since lib tests share
     /// one process and run on parallel threads. Shared with `identity::tests`
     /// via `crate::config::CONFIG_ENV_LOCK` so neither module's tests observe a
-    /// `RAYFISH_CONFIG_DIR` bled through from the other.
+    /// `TORPEDO_CONFIG_DIR` bled through from the other.
     use crate::config::CONFIG_ENV_LOCK as ENV_LOCK;
 
     /// RAII guard that restores a previous env var value (or removes it if it
@@ -1662,14 +1662,14 @@ mod headless_tests {
     async fn build_headless_returns_usable_state_without_ipc_socket() {
         // Serialize against any other test that touches env vars read by
         // `config::config_dir()`, so no concurrent test observes a bled-through
-        // `RAYFISH_CONFIG_DIR`.
+        // `TORPEDO_CONFIG_DIR`.
         let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().unwrap();
         // Isolate identity/config/blobs from the system config dir. The guard
         // restores the previous value (or removes the var) on drop, including
         // on panic, so this can't poison later tests.
-        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let _env_guard = EnvVarGuard::set("TORPEDO_CONFIG_DIR", tmp.path());
 
         let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
             .await
@@ -1739,7 +1739,7 @@ mod headless_tests {
     async fn attach_tun_is_self_healing_on_reattach_and_double_attach() {
         let _env_lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let _env_guard = EnvVarGuard::set("RAYFISH_CONFIG_DIR", tmp.path());
+        let _env_guard = EnvVarGuard::set("TORPEDO_CONFIG_DIR", tmp.path());
 
         let daemon = tokio::time::timeout(std::time::Duration::from_secs(30), build_headless())
             .await

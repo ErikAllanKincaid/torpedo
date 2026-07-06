@@ -651,13 +651,15 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// Linux: `/etc/torpedo` (system service location, root:torpedo). macOS: the
 /// daemon's `~/.config/torpedo` (root-only under `/var/root`).
 pub fn config_dir() -> Result<PathBuf> {
-    // An explicit `RAYFISH_CONFIG_DIR` override is honored only on Android
+    // An explicit `TORPEDO_CONFIG_DIR` override (renamed from RAYFISH_CONFIG_DIR,
+    // RENAME-007, so it cannot collide with a genuine rayfish process's own
+    // override on the same host) is honored only on Android
     // (`ray-mobile`'s `Node::new` points it at the app's `Context.getFilesDir()`)
     // and in `cfg(test)` (headless/test harnesses run against an isolated config
     // tree). Desktop/service production builds never check this var, so their
     // resolved path is byte-for-byte unchanged from before the override existed.
     #[cfg(any(target_os = "android", test))]
-    if let Some(dir) = std::env::var_os("RAYFISH_CONFIG_DIR") {
+    if let Some(dir) = std::env::var_os("TORPEDO_CONFIG_DIR") {
         let dir = PathBuf::from(dir);
         ensure_dir(&dir)?;
         return Ok(dir);
@@ -1055,10 +1057,10 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
     config.networks.len() < before
 }
 
-/// Process-wide lock serializing tests that mutate `RAYFISH_CONFIG_DIR` (or any
+/// Process-wide lock serializing tests that mutate `TORPEDO_CONFIG_DIR` (or any
 /// other env var read by [`config_dir`]), since lib tests share one process and
 /// run on parallel threads. Shared across test modules (`identity`, `daemon`)
-/// so none of them observe a `RAYFISH_CONFIG_DIR` value set by a concurrent test.
+/// so none of them observe a `TORPEDO_CONFIG_DIR` value set by a concurrent test.
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -335,9 +335,9 @@ pub(crate) enum Command {
         /// (see `torpedo pair list`)
         device: String,
     },
-    /// Handle a rayfish:// deep link (join or pair)
+    /// Handle a torpedo:// deep link (join or pair)
     Open {
-        /// The rayfish:// URI, e.g. rayfish://join/<code> or rayfish://pair/<ticket>
+        /// The torpedo:// URI, e.g. torpedo://join/<code> or torpedo://pair/<ticket>
         uri: String,
     },
     /// Print the torpedo version

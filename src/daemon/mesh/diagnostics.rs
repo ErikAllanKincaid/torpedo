@@ -427,7 +427,7 @@ impl MeshManager {
 
         let bound = self.endpoint.bound_sockets();
         let bound_port = bound.first().map(|a| a.port()).unwrap_or(0);
-        let port_is_fixed = bound_port == transport::RAYFISH_LISTEN_PORT;
+        let port_is_fixed = bound_port == transport::TORPEDO_LISTEN_PORT;
 
         // The endpoint runs net reports continuously; the first may still be in
         // flight, so wait briefly for an initialized report, then fall back to

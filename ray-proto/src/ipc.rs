@@ -396,7 +396,7 @@ pub enum IpcMessage {
     NetcheckResponse {
         /// Bound UDP port of the shared endpoint.
         bound_port: u16,
-        /// True when the bound port is the fixed `RAYFISH_LISTEN_PORT` (manually
+        /// True when the bound port is the fixed `TORPEDO_LISTEN_PORT` (manually
         /// forwardable); false when the daemon fell back to an ephemeral port.
         port_is_fixed: bool,
         /// Home relay URL the endpoint currently prefers.

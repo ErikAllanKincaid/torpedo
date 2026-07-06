@@ -1,5 +1,5 @@
 target := "x86_64-unknown-linux-gnu"
-binary := "ray"
+binary := "torpedo"
 user := "root"
 
 # Host cdylib extension for the UniFFI bindgen `--library` input.
@@ -28,13 +28,13 @@ cross:
 deploy ip:
     cross -q build --release --target {{target}}
     rsync -az --progress target/{{target}}/release/{{binary}} {{user}}@{{ip}}:/tmp/
-    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
+    ssh {{user}}@{{ip}} "getent group torpedo >/dev/null || groupadd torpedo && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart torpedo 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}}"
 
 deploy-dev ip:
     cross -q build --target {{target}}
     rsync -az --progress target/{{target}}/debug/{{binary}} {{user}}@{{ip}}:/tmp/
-    ssh {{user}}@{{ip}} "getent group rayfish >/dev/null || groupadd rayfish && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart rayfish 2>/dev/null || {{binary}} up)"
+    ssh {{user}}@{{ip}} "getent group torpedo >/dev/null || groupadd torpedo && install -m 755 /tmp/{{binary}} /usr/local/bin/{{binary}} && (systemctl restart torpedo 2>/dev/null || {{binary}} up)"
     @echo "Deployed and installed daemon on {{ip}} (debug build)"
 
 check:

@@ -358,6 +358,18 @@ pub fn ip_in_subnet(ip: Ipv4Addr, subnet: Subnet) -> bool {
     (u32::from(ip) & !host_mask) == base
 }
 
+/// True if two IPv4 subnets share any address. Compares network bits at the
+/// shorter (less specific) prefix, so it catches overlap in both directions —
+/// a smaller range inside a larger one, or vice versa (SUBNET-012). Two ranges
+/// that share no network bits (e.g. 10.88.0.0/16 vs Tailscale's 100.64.0.0/10)
+/// do not overlap.
+pub fn subnets_overlap(a: Subnet, b: Subnet) -> bool {
+    let (a_addr, a_prefix) = a;
+    let (b_addr, b_prefix) = b;
+    let host_mask = subnet_host_mask(a_prefix.min(b_prefix));
+    (u32::from(a_addr) & !host_mask) == (u32::from(b_addr) & !host_mask)
+}
+
 /// The gateway address for a subnet: base + 1 (the `.1` the TUN takes).
 pub fn subnet_gateway(subnet: Subnet) -> Ipv4Addr {
     let (base, _) = subnet;
@@ -2128,6 +2140,22 @@ mod tests {
         assert_eq!(subnet_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(subnet_gateway(CUSTOM), Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(subnet_gateway(default_subnet()), Ipv4Addr::new(10, 88, 0, 1));
+    }
+
+    #[test]
+    fn subnets_overlap_detects_both_directions_but_not_disjoint() {
+        let overlay = (Ipv4Addr::new(10, 88, 0, 0), 16);
+        // A LAN address inside our range overlaps.
+        assert!(subnets_overlap((Ipv4Addr::new(10, 88, 5, 2), 24), overlay));
+        // A broad host route (10/8) that CONTAINS our range overlaps.
+        assert!(subnets_overlap((Ipv4Addr::new(10, 0, 0, 5), 8), overlay));
+        // Identical range overlaps itself.
+        assert!(subnets_overlap(overlay, overlay));
+        // A disjoint home LAN does not.
+        assert!(!subnets_overlap((Ipv4Addr::new(192, 168, 1, 5), 24), overlay));
+        // Crucially, Tailscale's 100.64.0.0/10 does NOT overlap 10.88.0.0/16 —
+        // this is the whole point of the safe default.
+        assert!(!subnets_overlap((Ipv4Addr::new(100, 64, 0, 1), 10), overlay));
     }
 
     #[test]

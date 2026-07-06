@@ -11,10 +11,13 @@
 use super::super::*;
 
 pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
-    // This fork deliberately runs on a configurable overlay subnet (default or a
-    // custom range chosen via `create --subnet`), so it no longer refuses to
-    // start next to a foreign VPN holding a 100.64.0.0/10 address (Tailscale).
-    // The upstream CGNAT preflight is removed for this reason (spec SUBNET-006).
+    // This fork runs on a configurable overlay subnet, so instead of the removed
+    // hardcoded CGNAT preflight (SUBNET-006) it refuses to start only if the
+    // *chosen* overlay subnet would collide with an existing local network
+    // (SUBNET-012) — which the safe default (10.88.0.0/16) does not next to
+    // Tailscale's 100.64.0.0/10. Runs before anything is built, fail-fast.
+    #[cfg(not(target_os = "android"))]
+    tun::check_subnet_overlap(config::node_subnet())?;
 
     // Build the always-on infrastructure without a packet interface, then attach
     // the desktop OS TUN device below. The headless builder is the same one

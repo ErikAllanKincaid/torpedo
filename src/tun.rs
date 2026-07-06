@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
 #[cfg(not(target_os = "android"))]
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 // The desktop TUN device (the `tun` crate) and its async I/O helpers only exist
 // off Android, where the packet interface is a `VpnService` fd instead.
 #[cfg(not(target_os = "android"))]
@@ -66,6 +66,63 @@ pub struct TunReader {
 #[cfg(not(target_os = "android"))]
 pub struct TunWriter {
     writer: DeviceWriter,
+}
+
+/// Refuse to start if `subnet` overlaps an existing local IPv4 interface, so the
+/// overlay never hijacks the host's own routing (SUBNET-012). This is the
+/// subnet-aware replacement for the removed hardcoded CGNAT check: it fires only
+/// on a genuine overlap between the *chosen* overlay subnet and a real local
+/// network, so it does not block the Tailscale-coexistence case. Fail-open: if
+/// interfaces can't be enumerated it allows startup rather than blocking on a
+/// missing tool.
+#[cfg(not(target_os = "android"))]
+pub fn check_subnet_overlap(subnet: crate::membership::Subnet) -> Result<()> {
+    let (base, prefix) = subnet;
+    for (iface, addr, plen) in local_ipv4_interfaces() {
+        if crate::membership::subnets_overlap((addr, plen), subnet) {
+            bail!(
+                "overlay subnet {base}/{prefix} overlaps interface {iface} ({addr}/{plen}); \
+                 pick a different range with `torpedo config set subnet <cidr>` and restart"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate local IPv4 `(interface, address, prefix)` via `ip -o -4 addr show`,
+/// skipping loopback. Returns empty (fail-open) if `ip` is unavailable or fails.
+#[cfg(not(target_os = "android"))]
+fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr, u8)> {
+    let out = match Command::new("ip").args(["-o", "-4", "addr", "show"]).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut result = Vec::new();
+    // Each line: "<idx>: <iface>    inet <A.B.C.D>/<prefix> [brd ...] scope ..."
+    for line in text.lines() {
+        let mut toks = line.split_whitespace();
+        let _idx = toks.next();
+        let iface = match toks.next() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if iface == "lo" {
+            continue;
+        }
+        // Advance to the token after "inet" and parse its CIDR.
+        while let Some(t) = toks.next() {
+            if t == "inet"
+                && let Some(cidr) = toks.next()
+                && let Some((a, p)) = cidr.split_once('/')
+                && let (Ok(addr), Ok(plen)) = (a.parse::<Ipv4Addr>(), p.parse::<u8>())
+            {
+                result.push((iface.clone(), addr, plen));
+                break;
+            }
+        }
+    }
+    result
 }
 
 /// Creates a TUN device with the given virtual IPs and splits it into

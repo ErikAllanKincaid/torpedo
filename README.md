@@ -46,7 +46,7 @@ torpedo join <invite-code> --hostname bob
 
 # From either machine:
 torpedo status                      # networks, peers, your mesh IP, traffic
-ping bob.<network>.ray              # reach peers by name (Magic DNS)
+ping bob.ray                        # reach peers by name (Magic DNS)
 torpedo ping bob                    # mesh probe: RTT, loss, direct-vs-relay path
 ```
 
@@ -62,7 +62,7 @@ sudo torpedo restart
 torpedo create --hostname alice          # the network uses your node subnet
 ```
 
-`torpedo create --subnet <cidr>` also works and pins the node to that subnet. If you ask for a subnet that disagrees with the one the node is already on, or one that overlaps a real local network, torpedo refuses and tells you to pick another instead of silently breaking your routing.
+Do the `config set subnet` + `restart` on **every** node before it creates or joins, so all nodes share one subnet. `torpedo create --subnet <cidr>` records the subnet but only applies it to the live TUN at the next restart — it prints a reminder to run `sudo torpedo restart`, so `config set subnet` + `restart` first is the reliable path. If a requested subnet disagrees with the one the node is already on, or overlaps a real local network, torpedo refuses and tells you to pick another instead of silently breaking your routing.
 
 ## What this fork changes
 

@@ -43,29 +43,42 @@ Legend: `[ ]` = to do, `[x]` = passed, `[!]` = failed (record the finding).
 
 ---
 
-## Stage 0 — Init (both machines)
+## Stage 0 — Init + subnet (both machines)
 
-**Goal:** daemon starts and the node gets an identity, with Tailscale running.
+**Goal:** the daemon starts (coexisting with Tailscale) and — for the
+configurable-subnet test — **every** node is put on the SAME non-default subnet
+*before* any network exists. The subnet is a node-wide setting the TUN is built
+from at daemon start, so it must be set and applied by a restart up front; the
+`--subnet` flag on `create`/`join` only persists it and warns you to restart.
 
 ```bash
-sudo torpedo up          # on BOTH machines
-torpedo status           # confirm daemon is reachable
+sudo torpedo up                               # install + start daemon; grants operator
+# Non-default-subnet test: run on EVERY node, then restart so the TUN rebuilds on it.
+# (The default 10.88.0.0/16 already avoids Tailscale — skip these two to test on it.)
+sudo torpedo config set subnet 10.99.0.0/16
+sudo torpedo restart
+torpedo status                                # daemon reachable
+ip -4 addr show tun0                           # inet is 10.99.x (10.88.x if you skipped)
 ```
 
-- [ ] Daemon starts cleanly on both (no "refusing to run next to Tailscale").
-- [ ] `torpedo status` prints a contact id and "no networks".
+- [ ] Daemon starts on both (no "refusing to run next to Tailscale").
+- [ ] `ip addr show tun0` shows the chosen subnet on **both** nodes (must match).
 - [ ] Tailscale is still fully functional on the node(s) where it runs.
+- Note: `torpedo config get subnet` is root-only — use `sudo torpedo config get subnet`
+  (a non-root call now hints instead of printing a misleading `<default>`).
 
 ## Stage 1 — First control node (AORUS)
 
-**Goal:** create a closed network on a **non-default** subnet to prove
-configurability and Tailscale-range avoidance.
+**Goal:** create a closed network with a chosen hostname (the subnet was already
+set in Stage 0, so no `--subnet` here — the node is already on it).
 
 ```bash
-torpedo create --name testnet --subnet 10.99.0.0/16
+torpedo create --name testnet --hostname aorus   # closed by default; --open for public
 ```
 
 - [ ] A room id (network public key) is printed.
+- [ ] Without `--hostname` the node auto-generates a random name (e.g. `hill`); pass
+      `--hostname` to control it, or fix it later with `torpedo hostname testnet aorus`.
 
 ## Stage 2 — Check parameters (AORUS)
 
@@ -78,16 +91,21 @@ torpedo status --json
 
 ## Stage 3 — Enroll xps by invite
 
-**Goal:** closed-network admission via a hostname-bound single-use invite.
+**Goal:** closed-network admission via a single-use invite; the joiner picks its
+own hostname.
 
 ```bash
-# AORUS
-torpedo invite testnet --hostname xps-17-9720      # prints an invite code
-# xps  (after its own `sudo torpedo up`)
+# AORUS — invite takes ONLY the network name in this build
+# (no --hostname/--expires/--qr/--reusable/list/revoke).
+torpedo invite testnet                             # prints a single-use invite code
+# xps — must have finished Stage 0 (up + same subnet + restart) first.
 torpedo join <invite-code> --hostname xps-17-9720
 ```
 
 - [ ] xps joins and reports success.
+- [ ] If xps was NOT on the network's subnet before joining, `join` prints a
+      `⚠ subnet … takes effect after sudo torpedo restart` — restart xps, then it
+      lands on the shared subnet. (Do Stage 0's subnet step first to avoid this.)
 
 ## Stage 4 — Check parameters (both)
 
@@ -264,7 +282,7 @@ This is the path the field report hit, and the one **DNS-001** now warns about.
 ```bash
 sudo torpedo up                             # EXPECT the DNS-001 takeover warning
 ls -l /etc/resolv.conf.before-torpedo       # backup was created
-cat /etc/resolv.conf                        # "# Added by torpedo", nameserver 100.100.100.53
+cat /etc/resolv.conf                        # "# Added by torpedo", nameserver <subnet>.100.53 (e.g. 10.99.100.53; subnet-derived)
 ping github.com                             # captured upstreams forward normal DNS
 sudo torpedo uninstall
 cat /etc/resolv.conf                        # restored to the pre-torpedo original
@@ -276,7 +294,7 @@ ping github.com                             # resolves after restore
       `/etc/resolv.conf.before-torpedo` and the restore command.
 - [ ] Backup exists while up; the live file carries the `# Added by torpedo`
   
-      marker and points at `100.100.100.53`.
+      marker and points at the subnet-derived resolver (e.g. `10.99.100.53`).
 - [ ] Normal (non-`.ray`) DNS still resolves while up (upstream passthrough).
 - [ ] After uninstall, `/etc/resolv.conf` matches the original, the backup file is
   
@@ -329,7 +347,7 @@ ls -l /etc/resolv.conf                                   # a plain DHCP-managed 
 cp /etc/resolv.conf /tmp/resolv.conf.orig      # independent copy to diff against
 sudo torpedo up                                # EXPECT the DNS-001 takeover warning
 ls -l /etc/resolv.conf.before-torpedo          # backup created
-cat /etc/resolv.conf                           # "# Added by torpedo", nameserver 100.100.100.53
+cat /etc/resolv.conf                           # "# Added by torpedo", nameserver <subnet>.100.53 (e.g. 10.99.100.53; subnet-derived)
 ping github.com                                # captured upstreams still forward normal DNS
 sudo torpedo uninstall
 diff /etc/resolv.conf /tmp/resolv.conf.orig    # empty ⇒ restored to the pre-torpedo original
@@ -341,7 +359,7 @@ ping github.com                                # resolves after restore
       and the restore command.
 - [ ] Backup exists while up; the live file carries the `# Added by torpedo` marker
   
-      and points at `100.100.100.53`.
+      and points at the subnet-derived resolver (e.g. `10.99.100.53`).
 - [ ] Non-`.ray` DNS resolves while up (upstream passthrough).
 - [ ] After uninstall, `diff` is empty (original restored) and the backup file is gone.
 - [ ] This ran with no peers, confirming DNS-001 is validated in isolation from the mesh.

@@ -51,6 +51,16 @@ pub trait DnsConfigurator: Send + Sync {
     fn search_domains(&self) -> Vec<String> {
         Vec::new()
     }
+    /// A user-facing notice to surface at `torpedo up` (DNS-001). Only the
+    /// direct `/etc/resolv.conf` takeover returns `Some`: split-DNS backends
+    /// (systemd-resolved / NetworkManager / resolvconf) leave the file untouched,
+    /// so they have nothing to warn about. Threaded into `activate()`'s existing
+    /// `warnings` channel so the person running `torpedo up` sees that torpedo is
+    /// now managing resolv.conf — instead of discovering it by surprise.
+    /// Default: `None`.
+    fn user_warning(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Revert a DNS configuration.
@@ -1136,9 +1146,10 @@ impl DnsConfigurator for DirectResolvConf {
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
-        tracing::info!(
+        tracing::warn!(
             upstreams = ?self.captured_upstreams,
-            "configured /etc/resolv.conf directly (fallback); captured upstream resolvers"
+            backup = %backup_path(path).display(),
+            "took over /etc/resolv.conf directly (no split-DNS backend found); original backed up"
         );
         Ok(())
     }
@@ -1162,6 +1173,21 @@ impl DnsConfigurator for DirectResolvConf {
 
     fn search_domains(&self) -> Vec<String> {
         self.search.clone()
+    }
+
+    fn user_warning(&self) -> Option<String> {
+        // DNS-001: surfaced by `torpedo up`. No systemd-resolved / NetworkManager
+        // / resolvconf backend was found (common on a default Debian server), so
+        // torpedo manages /etc/resolv.conf itself. Name the backup + restore path
+        // so the change is understood rather than a surprise.
+        let backup = backup_path(Path::new("/etc/resolv.conf"));
+        Some(format!(
+            "torpedo is now managing /etc/resolv.conf directly \
+             (no systemd-resolved, NetworkManager, or resolvconf backend was found). \
+             Your previous file was backed up to {} and is restored on \
+             `torpedo down` or `sudo torpedo uninstall`.",
+            backup.display()
+        ))
     }
 }
 
@@ -1242,5 +1268,33 @@ mod tests {
         assert!(!nm_supports_split_dns("default"));
         assert!(!nm_supports_split_dns("unbound"));
         assert!(!nm_supports_split_dns(""));
+    }
+
+    // DNS-001: the direct /etc/resolv.conf takeover must surface a user-facing
+    // warning that names the backup file, while split-DNS backends stay silent
+    // (they never touch resolv.conf, so there is nothing to warn about).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_takeover_warns_user_split_dns_does_not() {
+        use super::{DirectResolvConf, DnsConfigurator, Resolvconf, ResolvconfVariant};
+
+        let direct = DirectResolvConf {
+            captured_upstreams: vec![],
+            search: vec![],
+        };
+        let w = direct
+            .user_warning()
+            .expect("direct resolv.conf takeover must warn the user");
+        assert!(
+            w.contains("/etc/resolv.conf.before-torpedo"),
+            "warning must name the backup path: {w}"
+        );
+        assert!(w.contains("resolv.conf"));
+
+        // A split-DNS backend leaves resolv.conf untouched, so it must not warn.
+        let split = Resolvconf {
+            variant: ResolvconfVariant::Debian,
+        };
+        assert!(split.user_warning().is_none());
     }
 }

@@ -58,6 +58,11 @@ impl DnsManager {
                 let search = c.search_domains();
                 tracing::info!(backend = c.name(), resolver_ip = %crate::dns::magic_dns_v4_node(), upstreams = ?upstreams, "Magic DNS active");
                 self.resolver.set_upstreams(upstreams);
+                // DNS-001: if this backend took over /etc/resolv.conf directly,
+                // surface that to the user via `torpedo up` (not just the log).
+                if let Some(w) = c.user_warning() {
+                    warnings.push(w);
+                }
                 *self.configurator.lock().unwrap() = Some(c);
                 // In direct mode, re-assert /etc/resolv.conf the instant another
                 // program (NetworkManager, dhclient) overwrites it (inotify watch).

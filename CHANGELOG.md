@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DNS takeover notice**: on a host with no systemd-resolved, NetworkManager,
+  or resolvconf backend (for example a default Debian server install),
+  `sudo torpedo up` now warns that torpedo is managing `/etc/resolv.conf`
+  directly. The notice names the `/etc/resolv.conf.before-torpedo` backup and the
+  restore path (`torpedo down` or `sudo torpedo uninstall`). Previously the
+  takeover happened silently (daemon log only), so users discovered it only by
+  noticing their `resolv.conf` had changed.
 - **Ephemeral peer auto-kick**: a per-network policy that automatically removes
   members which stay offline longer than a configured time, the same as
   `ray kick`. Set it with `ray ephemeral <net> <duration>` (`12h`, `7d`, `1w`;

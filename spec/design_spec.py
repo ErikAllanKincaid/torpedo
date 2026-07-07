@@ -492,3 +492,37 @@ class NoResidualHostIdentityLeak(Constraint):
     """
     constraint_id = "CON-007"
     enforcement_logic = "{{ host_identity.leak_count == 0 }}"
+
+
+class SurfaceDnsTakeoverWarning(Requirement):
+    """REQUIREMENT-ID: DNS-001
+
+    When torpedo has to manage /etc/resolv.conf directly (the tier-5
+    `DirectResolvConf` takeover, reached only when no systemd-resolved,
+    NetworkManager, resolvectl, or resolvconf backend is present — the common
+    case on a default Debian trixie server / minimal install), `sudo torpedo up`
+    MUST surface a user-visible warning, not merely a daemon-side log line. The
+    prior behavior logged the takeover at INFO to /var/log/torpedo, so the user
+    discovered the change only by noticing that their resolv.conf had been
+    rewritten (reported in the field against upstream).
+
+    The warning rides the EXISTING `activate()` `warnings` channel (returned in
+    the `Up` IPC Ok message and rendered by `torpedo up`), so no IPC wire change
+    is needed. Its text names the backup path (/etc/resolv.conf.before-torpedo)
+    and the restore path (`torpedo down` / `sudo torpedo uninstall`) so the
+    notice is actionable, not alarming. Implemented as a
+    `DnsConfigurator::user_warning()` trait method: default None (split-DNS
+    backends leave resolv.conf untouched), overridden to Some(..) by
+    DirectResolvConf; `DnsManager::configure` pushes it into `warnings`. The
+    takeover daemon log is also raised INFO -> WARN so it appears in
+    `torpedo report` bundles for the non-interactive (reboot / auto-activate)
+    path where there is no CLI to print to.
+
+    Scope: covers the interactive `torpedo up`. Surfacing the active DNS mode in
+    `torpedo status` for the non-interactive path is a separate later item.
+
+    ENFORCEMENT: unit test (run by reconcile.py's `test` check) asserts
+    DirectResolvConf::user_warning() is Some and names the backup file, and that
+    a split-DNS configurator returns None.
+    """
+    req_id = "DNS-001"

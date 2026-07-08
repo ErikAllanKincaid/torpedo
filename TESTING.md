@@ -28,6 +28,15 @@ actually under test:
   hole-punching and relay fallback. Ideally run the connectivity stages **once
   each way**. `torpedo ping` reports `direct` vs `relay` so you can see which you
   got.
+- **Debian trixie / minimal installs rewrite `/etc/resolv.conf`.** On a host
+  with no systemd-resolved, NetworkManager, resolvectl, or resolvconf (e.g. a
+  minimal Debian trixie netinst — this is the common case there), `sudo torpedo
+  up` falls through to directly taking over `/etc/resolv.conf` as a last
+  resort: it backs up the original to `/etc/resolv.conf.before-torpedo`, prints
+  a warning naming the backup and restore path, and restores it automatically
+  on `torpedo down`/`uninstall` or after a crash. See the README's "DNS on
+  hosts without a resolver manager" section for the full mechanism, and Stage
+  13 below (13b/13d) for the guided repro/verification of it.
 
 Install the binary on both machines first (glibc build needs the target on
 glibc >= 2.39; otherwise rebuild with `--target x86_64-unknown-linux-musl`):
@@ -148,24 +157,52 @@ torpedo netcheck            # endpoint diagnostics on each node
 
 ## Stage 7 — Firewall
 
-**Goal:** prove default-deny inbound, then an allow rule, before SSH/send depend
-on it. Run a listener on the target and probe it from the peer.
+**Goal:** prove the **FW-001** mode-dependent inbound default, then that an
+explicit rule still overrides it, before SSH/send depend on the firewall.
+`testnet` (Stage 1) is a **closed** network (created without `--open`), so per
+FW-001 it seeds a network-scoped `allow in any` (`RuleOrigin::ClosedDefault`,
+`src/firewall.rs`) the moment it is created/joined-by-invite — connectivity is
+open like a normal LAN, and host-service auth (SSH keys, etc.) is the gate.
+**Open** networks get no such rule and keep the secure default-deny inbound.
+Run a listener on the target and probe it from the peer, on **both** a closed
+and an open network, to see the contrast.
 
 ```bash
 # xps: start a throwaway TCP listener on 8080
 python3 -m http.server 8080
 
-# AORUS: should FAIL under the default inbound-deny
+# AORUS: closed network (testnet) — should SUCCEED with no explicit rule (FW-001 default-allow)
 curl --max-time 5 http://xps.ray:8080/
+torpedo firewall show   # confirm the seeded "closed-net default" allow-in-any rule for testnet
 
-# xps: allow it from aorus, then re-test from AORUS (should succeed)
-torpedo firewall add in allow -p tcp -P 8080 --peer aorus
-torpedo firewall show
+# xps: add an explicit deny for aorus on testnet, confirm it overrides the default-allow
+torpedo firewall add in deny -p tcp -P 8080 --peer aorus
+curl --max-time 5 http://xps.ray:8080/   # from AORUS: should now FAIL
+torpedo firewall show                    # note the new rule's index
+torpedo firewall remove <index>          # clean up before Stage 8+ (remove takes an index, not a selector)
+
+# --- contrast: an OPEN network stays default-deny ---
+# AORUS: create a second, open network and have xps join by room id (no invite)
+torpedo create --open --name opennet --hostname aorus
+# xps:
+torpedo join <opennet-room-id> --hostname xps-open
+# xps: start a listener bound the same way, then probe from AORUS over opennet
+python3 -m http.server 8081
+# AORUS: should FAIL under the default inbound-deny (no FW-001 rule on an open network)
+curl --max-time 5 http://xps-open.ray:8081/
+torpedo firewall show   # no "closed-net default" rule for opennet
 ```
 
-- [ ] The probe is **blocked** before the allow rule (default inbound-deny holds).
-- [ ] The probe **succeeds** after `firewall add in allow -p tcp -P 8080 --peer aorus`.
-- [ ] `firewall show` lists the new rule at the front.
+- [ ] On **closed** `testnet`, the probe **succeeds with no explicit rule** —
+      `firewall show` lists the seeded `ClosedDefault` allow-in-any rule for
+      `testnet`, appended at the back.
+- [ ] An explicit `deny` rule on `testnet` still **overrides** the default-allow
+      (explicit rules win over `ClosedDefault`, since it sits at the back).
+- [ ] On the **open** `opennet`, the probe is **blocked** by default (no
+      `ClosedDefault` rule is seeded for an open network) — confirms FW-001 is
+      closed-network-only.
+- [ ] `firewall show` distinguishes rule origins clearly (`closed-net default`
+      vs. explicit `Local`/`Network` rules).
 
 ## Stage 8 — Magic DNS
 
@@ -397,16 +434,16 @@ torpedo update --check          # must no-op / refuse (SELF_UPDATE_ENABLED = fal
 Record date, machines, Tailscale on/off, network placement (LAN vs cross-NAT),
 and any `[!]` findings with the `torpedo report` bundle path.
 
-### Run 2026-07-07 (in progress)
+### Run 2026-07-07, attempt 1 (superseded)
 
 - Machines: **AORUS** (Ubuntu 24.04, systemd-resolved / **tier-1 split-DNS**,
   coordinator) + **xps-17-9720** (LMDE trixie, **tier-5 direct `/etc/resolv.conf`
   takeover**, member).
 - Tailscale: **on** (both nodes).
-- Placement: TBD (determine direct vs relay at the connectivity stage).
-- Progress: Stages 0-2 done on AORUS — created `testnet` on `10.99.0.0/16`, address
-  `10.99.56.74`, role coordinator (**subnet configurability confirmed**). xps Stage 0
-  done (daemon up; tier-5 takeover occurred). Join pending.
+- Stopped after the **CRITICAL `create --subnet` data-plane corruption** finding
+  below. Both machines fully wiped (binary, `/etc/torpedo`, `/var/log/torpedo`,
+  systemd unit) and the run restarted from a clean slate as attempt 2, once
+  SUBNET-014 + FW-001 landed to address the findings here.
 
 Findings:
 
@@ -416,7 +453,8 @@ Findings:
   the data plane at startup, so the takeover + warning happen there (logged), and the
   interactive `up` short-circuits before the `warnings` channel is populated. Fix:
   persist DNS mode/warning on the daemon; return it from `up` even on `already up`, and
-  surface it in `torpedo status` (merges DNS-001-fix + DNS-002).
+  surface it in `torpedo status` (merges DNS-001-fix + DNS-002). **Still open** — see
+  attempt 2, reproduced identically on a fresh install.
 - [!] **Resolver IP is subnet-derived; docs are stale.** Magic DNS resolver is
   `10.88.100.53` (subnet-relative to the default subnet, by design — avoids Tailscale's
   `100.100.100.100`), NOT `100.100.100.53`. This plan and AGENTS.md still say
@@ -446,3 +484,32 @@ Findings:
   just `torpedo invite <NETWORK>`. AGENTS.md (inherited from upstream) documents
   `--hostname`/`--expires`/`--qr`/`--reusable`/`list`/`revoke` on invite that this
   binary lacks. Audit AGENTS.md against the actual CLI and trim to what exists.
+
+### Run 2026-07-07, attempt 2 (in progress)
+
+- Both machines wiped clean first (binary, `/etc/torpedo`, `/var/log/torpedo`,
+  systemd unit removed) and rebuilt from HEAD `6ffee52b` (includes FW-001 +
+  SUBNET-014, the fixes prompted by attempt 1's findings above).
+- Machines/roles unchanged: **AORUS** (tier-1 split-DNS, coordinator) +
+  **xps-17-9720** (tier-5 direct takeover, member). Tailscale **on** on both.
+- Subnet decision for this attempt: custom `10.99.0.0/16` (not the default),
+  specifically to regression-test the SUBNET-014 fixes against the exact
+  failure attempt 1 hit.
+- Progress: Stage 0 install done on both — `torpedo up` run fresh on AORUS and
+  xps, binary confirmed current (`torpedo version` = `6ffee52b` on both,
+  matching `git log -1`). Both nodes currently on the **default** `10.88.0.0/16`
+  (tun0: AORUS `10.88.49.50`, xps `10.88.3.155`) — the `config set subnet` +
+  `restart` step to move both to `10.99.0.0/16` is next.
+
+Findings so far:
+
+- [!] **DNS-001 CLI-warning gap reproduces on a clean install (still open).**
+  Identical to attempt 1: on fresh xps, the takeover fired correctly (backup
+  `/etc/resolv.conf.before-torpedo` created, live file marked `# Added by
+  torpedo`, and `journalctl` shows the WARN-level
+  `took over /etc/resolv.conf directly … backup=/etc/resolv.conf.before-torpedo`
+  at the exact timestamp of `torpedo up`), but the interactive `sudo torpedo up`
+  output was only `torpedo service started. already up` — no warning text at
+  all. Rules out "stale state from the old run" as an explanation; this is a
+  real, deterministic gap in the current code, not fixed by SUBNET-014/FW-001
+  (unrelated areas). Confirms the fix noted in attempt 1 is still needed.

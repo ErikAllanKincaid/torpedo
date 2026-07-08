@@ -99,6 +99,19 @@ An **open** network (`torpedo create --open`) lets anyone with the room id join 
 
 Skip room ids entirely: everyone has a rotatable **contact id** (`torpedo contact`, also shown atop `torpedo status`) you can share like a phone number. `torpedo connect <contact-id>` asks to link up; `torpedo connections approve <id>` on the other side creates a private 2-peer network.
 
+### DNS on hosts without a resolver manager
+
+Magic DNS works by pointing the OS resolver at torpedo's in-process resolver on `<subnet>.100.53` (e.g. `10.88.100.53`). To do that, torpedo detects the host's DNS stack and picks the least invasive integration it can, in order: systemd-resolved (D-Bus) → NetworkManager (D-Bus) → `resolvectl` → `resolvconf` → as a last resort, **directly rewriting `/etc/resolv.conf`**.
+
+That last path is not hypothetical: a minimal **Debian trixie** install (no desktop task, no systemd-resolved, no NetworkManager, no resolvconf — a common default-server profile) lands there, and it is the scenario a field report was filed against upstream for. When it happens, torpedo:
+
+- backs up the original file to `/etc/resolv.conf.before-torpedo` before touching it,
+- writes its own file (marked `# Added by torpedo`), pointing at the subnet-derived resolver, with your original nameservers kept as upstream fallback for non-`.ray` queries,
+- prints a visible warning at `sudo torpedo up` naming the backup path and the restore command, so the takeover is never silent,
+- restores the original file automatically on `torpedo down` / `sudo torpedo uninstall`, and also after a crash or hard kill (the panic hook and the next daemon start both run the restore).
+
+On hosts with systemd-resolved or NetworkManager (most desktop Linux, and where Tailscale runs its own split-DNS), none of this applies — torpedo registers a scoped `.ray` resolver alongside your existing DNS instead of touching `/etc/resolv.conf` at all.
+
 ## Features (inherited from rayfish)
 
 - 🔒 **Closed-by-default networks** with one-time invites, reusable fleet keys, or live approval (`--open` for public ones).

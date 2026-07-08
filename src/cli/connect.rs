@@ -66,7 +66,7 @@ pub(crate) async fn ipc_connections_list() -> Result<()> {
                 print!("{}", table(&["id", "host", "waiting"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint("approve with: ray connections approve <id>")
+                    style::faint("approve with: torpedo connections approve <id>")
                 );
             }
         }
@@ -110,7 +110,7 @@ pub(crate) async fn ipc_contact(action: Option<ContactAction>) -> Result<()> {
                 println!("{}", contact_id);
                 println!(
                     "  {}",
-                    style::faint("share this so others can: ray connect <contact-id>")
+                    style::faint("share this so others can: torpedo connect <contact-id>")
                 );
             }
         }
@@ -195,7 +195,7 @@ pub(crate) async fn ipc_ping(peer: &str, count: u32, interval: u64) -> Result<()
                     "  {}",
                     style::faint(
                         "no replies — the peer may be offline, firewalled, or on an \
-                         incompatible version (run ray update)"
+                         incompatible version (run torpedo update)"
                     )
                 );
             } else {

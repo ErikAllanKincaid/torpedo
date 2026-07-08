@@ -1,7 +1,7 @@
-//! Declarative deployment spec for `ray apply`.
+//! Declarative deployment spec for `torpedo apply`.
 //!
 //! The spec is a read-only description of the *intended* network state: which
-//! networks should exist and the suggested firewall rules for each. `ray apply`
+//! networks should exist and the suggested firewall rules for each. `torpedo apply`
 //! reconciles the live state against it — creating missing (closed) networks and
 //! publishing suggestions — but never joins or mutates membership directly (it
 //! only reports the membership gap and offers to mint hostname-bound invites).
@@ -67,7 +67,7 @@ pub fn load(path: &Path) -> Result<DeploySpec> {
         .to_ascii_lowercase();
     anyhow::ensure!(
         matches!(ext.as_str(), "yaml" | "yml"),
-        "ray apply specs must be YAML (.yaml/.yml): {}",
+        "torpedo apply specs must be YAML (.yaml/.yml): {}",
         path.display()
     );
     let text = std::fs::read_to_string(path)
@@ -130,35 +130,35 @@ fn normalize_nil(v: &mut config::Value) {
     }
 }
 
-/// Serialize a spec to YAML (sorted, stable, canonical). Used by `ray apply
+/// Serialize a spec to YAML (sorted, stable, canonical). Used by `torpedo apply
 /// --dry-run` to echo the normalized intent.
 pub fn to_yaml(spec: &DeploySpec) -> Result<String> {
     serde_yml::to_string(spec).context("serializing spec to YAML")
 }
 
-/// The example spec printed by `ray apply --example` (YAML).
-pub const EXAMPLE_SPEC: &str = r#"# Rayfish deploy spec. See `ray apply --help`.
+/// The example spec printed by `torpedo apply --example` (YAML).
+pub const EXAMPLE_SPEC: &str = r#"# Torpedo deploy spec. See `torpedo apply --help`.
 # Under `networks:`, each network name maps directly to its firewall subjects.
-# Save as e.g. deploy.yaml and run: ray apply deploy.yaml  (YAML only).
+# Save as e.g. deploy.yaml and run: torpedo apply deploy.yaml  (YAML only).
 #
-# Subject/peer keys are HOSTNAMES. They are the names `ray apply
+# Subject/peer keys are HOSTNAMES. They are the names `torpedo apply
 # --invite-missing` binds into invites — a node joining with such an invite is
 # assigned that exact hostname (it cannot pick another), so the firewall always
 # resolves the peer it names. The `*` subject targets every node, and a `*` peer
 # means any peer. Suggestions are advisory: each node queues them for
-# `ray firewall accept`, or auto-installs them if it joined with
+# `torpedo firewall accept`, or auto-installs them if it joined with
 # `--auto-accept-firewall`.
 #
 # Optional `aliases:` and `groups:` are coordinator-side shorthand, expanded
 # client-side before publishing (they never reach the network). An alias names a
-# user by identity (copy it from `ray identityof <net> <host>`) and expands to
+# user by identity (copy it from `torpedo identityof <net> <host>`) and expands to
 # all of that user's joined device hostnames. A group is a named set of aliases
 # and/or literal hostnames. Both can be used as a rule subject or peer. An alias
 # only resolves once the user has joined; literal hostnames work pre-join.
 
 aliases:
   # Fill in a real identity, e.g.:
-  #   alice: <paste from `ray identityof infra alice-laptop`>
+  #   alice: <paste from `torpedo identityof infra alice-laptop`>
 groups:
   admins: [alice, jumpbox]   # `alice` (alias, once defined) + a literal hostname
 
@@ -411,7 +411,7 @@ networks:
 
     #[test]
     fn load_requires_yaml_extension() {
-        // `ray apply` is YAML-only: a .toml/.json path is rejected up front.
+        // `torpedo apply` is YAML-only: a .toml/.json path is rejected up front.
         let dir = std::env::temp_dir().join(format!("rayfish-apply-ext-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let toml_path = dir.join("spec.toml");
@@ -795,7 +795,7 @@ networks: {}
 
     #[test]
     fn example_spec_parses() {
-        // The constant printed by `ray apply --example` must round-trip.
+        // The constant printed by `torpedo apply --example` must round-trip.
         let spec = parse(EXAMPLE_SPEC).expect("EXAMPLE_SPEC must parse");
         let g = spec.networks.get("gaming").unwrap();
         assert_eq!(g.len(), 3);

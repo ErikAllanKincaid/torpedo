@@ -32,11 +32,11 @@ pub(crate) fn print_error(title: &str, detail: &str, hint: Option<&str>) {
 pub(crate) fn infer_hint(message: &str) -> Option<String> {
     let m = message.to_lowercase();
     if m.contains("daemon") && (m.contains("not running") || m.contains("connect")) {
-        Some("start the service: sudo ray up".into())
+        Some("start the service: sudo torpedo up".into())
     } else if m.contains("expired") || m.contains("invite") {
-        Some("ask the coordinator for a fresh code: ray invite <net>".into())
+        Some("ask the coordinator for a fresh code: torpedo invite <net>".into())
     } else if m.contains("root") || m.contains("permission") || m.contains("operator") {
-        Some("run with sudo, or `sudo ray set-operator <you>` once".into())
+        Some("run with sudo, or `sudo torpedo set-operator <you>` once".into())
     } else if m.contains("hostname") && m.contains("collision") {
         Some("pick another name: --hostname <name>".into())
     } else {
@@ -201,7 +201,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 style::value(&endpoint_id.fmt_short().to_string()),
             );
             if !active {
-                println!("  {}", style::faint("run `ray up` to activate"));
+                println!("  {}", style::faint("run `torpedo up` to activate"));
             }
             if let Some(ref cid) = contact_id {
                 println!("  {} {}", style::label("contact"), style::rose(cid),);
@@ -252,7 +252,7 @@ pub(crate) async fn ipc_status() -> Result<()> {
                 );
                 println!(
                     "  {}",
-                    style::faint("run `sudo ray update` to restart the daemon onto the new binary"),
+                    style::faint("run `sudo torpedo update` to restart the daemon onto the new binary"),
                 );
             }
             println!();
@@ -450,14 +450,14 @@ fn print_pending_summary(
             pending.push((
                 net.pending_suggestions,
                 pluralize(net.pending_suggestions, "firewall suggestion"),
-                format!("ray firewall pending {}", net.name),
+                format!("torpedo firewall pending {}", net.name),
             ));
         }
         if net.pending_requests > 0 {
             pending.push((
                 net.pending_requests,
                 pluralize(net.pending_requests, "join request"),
-                format!("ray requests {}", net.name),
+                format!("torpedo requests {}", net.name),
             ));
         }
     }
@@ -465,14 +465,14 @@ fn print_pending_summary(
         pending.push((
             pending_files,
             pluralize(pending_files, "file offer"),
-            "ray files".to_string(),
+            "torpedo files".to_string(),
         ));
     }
     if pending_connects > 0 {
         pending.push((
             pending_connects,
             pluralize(pending_connects, "connection request"),
-            "ray connections".to_string(),
+            "torpedo connections".to_string(),
         ));
     }
     if pending.is_empty() {

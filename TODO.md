@@ -17,19 +17,21 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       `reconcile.py` check that greps `justfile`/`contrib/` for stale
       `ray`/`rayfish` tokens, so the justfile fix can not silently regress.
       (The justfile is not Rust, so CON-007 does not cover it.)
-- [ ] **RENAME-011 — user-facing CLI hint strings still say `ray`** (found in
-      Phase-7 testing: `torpedo create` prints `ray join …` / `ray up`). ~27 sites
-      across `src/apply.rs` and `src/cli/{network,invite,firewall,status}.rs` print
-      "next steps" / help hints invoking `ray <subcommand>`, but the binary is
-      `torpedo` — there is no `ray` command, so the guidance is wrong. Also the
-      product name `Rayfish` in user-facing text: `EXAMPLE_SPEC` header (apply.rs),
-      the 1Password item description (onepassword.rs). Sweep
-      `ray <subcommand>` -> `torpedo <subcommand>`. EXCLUDE: the `.ray` Magic-DNS
-      TLD, the internal `rayfish` crate name, and be careful with the 1Password
-      item **title** default (`Rayfish Identity`) — renaming it breaks `pair
-      restore` for anyone who already stored a backup under the old title (keep the
-      title, or add a back-compat lookup). Candidate for a `reconcile.py` grep
-      guard (a `ray <subcommand>` pattern) so it can not regress.
+- [x] **RENAME-011 — user-facing CLI hint strings still say `ray`** (found in
+      Phase-7 testing: `torpedo create` prints `ray join …` / `ray up`). Done:
+      41 live/reachable sites swept `ray <subcommand>` -> `torpedo <subcommand>`
+      across `src/main.rs`, `src/apply.rs` (incl. `EXAMPLE_SPEC`),
+      `src/onepassword.rs`, `src/cli/{status,network,invite,pair,connect,alias,
+      service,files,firewall}.rs`, `src/daemon/mod.rs`, `src/daemon/mesh/
+      {runtime,create_join,files,firewall}.rs`, plus the dormant `APP_NAME`
+      constant in `src/lib.rs`. Since this is pre-release WIP with no real
+      backups to break, the 1Password item **title** default was also renamed
+      `Rayfish Identity` -> `Torpedo Identity` (no back-compat lookup needed).
+      See `spec/design_spec.py`'s `RENAME-011` for the full include/exclude list
+      (the `.ray` Magic-DNS TLD and the internal `rayfish` crate name are
+      correctly excluded). No `reconcile.py` guard added (see that class's
+      docstring for why a token-count gate would false-fail on the
+      deliberately-untouched comments and dead `cli/update.rs` code).
 - [ ] **DNS-001-fix — warning not delivered in the real flow** (found in Phase-7 on
       tier-5 xps): the daemon auto-activates at startup, so the DNS takeover + warning
       happen there (log only) and the interactive `sudo torpedo up` short-circuits with

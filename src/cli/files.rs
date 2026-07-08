@@ -97,7 +97,7 @@ pub(crate) async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         let rows = files
                             .iter()
                             .map(|f| {
-                                let accept = format!("ray files accept {}", f.id);
+                                let accept = format!("torpedo files accept {}", f.id);
                                 vec![
                                     layout::Cell::new(
                                         f.id.to_string(),

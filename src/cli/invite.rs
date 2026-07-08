@@ -111,7 +111,7 @@ fn print_invite_created(
     if show_qr {
         qr2term::print_qr(code).ok();
     }
-    print_next(&[(&format!("ray join {code}"), "the holder runs this to join")]);
+    print_next(&[(&format!("torpedo join {code}"), "the holder runs this to join")]);
     if !show_qr {
         println!("  {}", style::faint("add --qr for a scannable QR code"));
     }
@@ -130,7 +130,7 @@ fn print_invite_created(
         println!(
             "  servers join unattended with: {}",
             style::faint(&format!(
-                "ray join {code} --hostname <h> --auto-accept-firewall"
+                "torpedo join {code} --hostname <h> --auto-accept-firewall"
             ))
         );
     } else {
@@ -222,7 +222,7 @@ pub(crate) async fn ipc_requests(network: &str) -> Result<()> {
                 print!("{}", table(&["id", "host", "waiting"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint(&format!("admit with: ray accept {network} <id>"))
+                    style::faint(&format!("admit with: torpedo accept {network} <id>"))
                 );
             }
         }

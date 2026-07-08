@@ -754,7 +754,7 @@ impl MeshManager {
 
         Some(IpcMessage::Error {
             message: "permission denied: this user is not authorized to control torpedo.\n\
-                      Grant access with: sudo ray set-operator <user>"
+                      Grant access with: sudo torpedo set-operator <user>"
                 .to_string(),
         })
     }
@@ -777,7 +777,7 @@ impl MeshManager {
             };
         }
         IpcMessage::Ok {
-            message: format!("operator set to uid {uid}; that user can now run ray without sudo"),
+            message: format!("operator set to uid {uid}; that user can now run torpedo without sudo"),
         }
     }
 

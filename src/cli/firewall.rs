@@ -223,7 +223,7 @@ pub(crate) fn render_firewall_rules(
         out.push_str(&format!(
             "  {}  {}\n\n",
             style::label("status     "),
-            style::red("disabled (all packets allowed; ray firewall on to re-enable)")
+            style::red("disabled (all packets allowed; torpedo firewall on to re-enable)")
         ));
     }
     if let Some((inbound, outbound)) = default {
@@ -604,7 +604,7 @@ pub(crate) async fn ipc_apply(
             style::label("diff")
         );
         for (net, host) in &missing_hosts {
-            let cmd = format!("ray invite {net} --hostname {host}");
+            let cmd = format!("torpedo invite {net} --hostname {host}");
             if invite_missing {
                 match ipc_invite_mint(net, Some(host.clone())).await {
                     Ok(code) => println!(
@@ -728,7 +728,7 @@ fn canonicalize_aliases(
         .map(|(name, id)| {
             let parsed = id.parse::<iroh::EndpointId>().map_err(|_| {
                 anyhow::anyhow!(
-                    "alias '{name}' has an invalid identity '{id}' (copy it from `ray identityof <net> <host>`)"
+                    "alias '{name}' has an invalid identity '{id}' (copy it from `torpedo identityof <net> <host>`)"
                 )
             })?;
             Ok((name.clone(), parsed.to_string()))

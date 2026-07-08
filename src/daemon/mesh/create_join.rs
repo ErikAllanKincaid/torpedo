@@ -486,7 +486,7 @@ impl MeshManager {
                     }
                 });
                 IpcMessage::Ok {
-                    message: "join request sent - waiting for coordinator approval (run `ray status` to check)"
+                    message: "join request sent - waiting for coordinator approval (run `torpedo status` to check)"
                         .to_string(),
                 }
             }
@@ -609,7 +609,7 @@ impl MeshManager {
             anyhow::ensure!(
                 net_ver == mine,
                 "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
-                 - run `ray update` so both sides match"
+                 - run `torpedo update` so both sides match"
             );
         }
 

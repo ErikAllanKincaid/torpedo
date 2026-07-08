@@ -61,10 +61,10 @@ pub(crate) async fn ipc_create(
                 style::faint("·"),
                 style::rose(&short),
             );
-            let join = format!("ray join {network_key}");
+            let join = format!("torpedo join {network_key}");
             print_next(&[
                 (&join, "share this to invite peers"),
-                ("ray up", "activate the VPN"),
+                ("torpedo up", "activate the VPN"),
             ]);
             if let Some(w) = &warning {
                 println!("  ⚠ {w}");
@@ -144,8 +144,8 @@ pub(crate) async fn ipc_join(
                 style::value(&dns),
             );
             print_next(&[
-                ("ray status", "see who's online"),
-                ("ray up", "activate the VPN"),
+                ("torpedo status", "see who's online"),
+                ("torpedo up", "activate the VPN"),
             ]);
             if let Some(w) = &warning {
                 println!("  ⚠ {w}");

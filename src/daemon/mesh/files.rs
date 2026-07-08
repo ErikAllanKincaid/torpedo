@@ -331,7 +331,7 @@ impl MeshManager {
             None => {
                 tracing::warn!(
                     from = %from.fmt_short(),
-                    "auto-accept: no download target configured (set `ray files download-dir` or `download-user`); leaving offer queued"
+                    "auto-accept: no download target configured (set `torpedo files download-dir` or `download-user`); leaving offer queued"
                 );
                 return;
             }
@@ -670,7 +670,7 @@ impl MeshManager {
         if !is_paired {
             return IpcMessage::Error {
                 message: format!(
-                    "'{device}' is not one of your paired devices (see `ray pair list`)"
+                    "'{device}' is not one of your paired devices (see `torpedo pair list`)"
                 ),
             };
         }

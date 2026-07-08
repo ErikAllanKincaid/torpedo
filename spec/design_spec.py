@@ -494,6 +494,89 @@ class NoResidualHostIdentityLeak(Constraint):
     enforcement_logic = "{{ host_identity.leak_count == 0 }}"
 
 
+class UserFacingCommandNameRenamed(Requirement):
+    """REQUIREMENT-ID: RENAME-011
+
+    RENAME-006..009 renamed host artifacts, wire identifiers, and doc-comment/
+    metadata cosmetics, but missed the pre-fork upstream binary's own short
+    name, `ray`, hardcoded directly into ~40 LIVE, reachable, user-facing
+    strings: CLI hint text, error messages, an IPC response message, a printed
+    YAML example, the `torpedo version` banner, and shell-completion
+    registration. A user following any of these would try to run a binary that
+    does not exist on a torpedo install. Found via live two-machine testing
+    (`torpedo version` was directly observed printing `ray 0.1.5 (...)` on the
+    first line, `torpedo --version` printing `torpedo 0.1.5 (...)` on the
+    second — the same binary, two different self-identifications).
+
+    Renamed (literal `ray` -> `torpedo` in each string, no behavior change):
+    - `src/main.rs`: the `clap_complete::generate(shell, ..., "ray", ...)` call
+      (so `torpedo completions <shell>` registers completions for a command
+      name that actually exists); the `Command::Version` println (the
+      `ray {FULL_VERSION}` banner); both `config set`/`unset` "restart" hints.
+    - `src/cli/status.rs`: `infer_hint`'s three hints (daemon-not-running,
+      expired-invite, needs-operator); the inactive-data-plane hint; the
+      version-skew hint; all four `print_pending_summary` command hints
+      (`firewall pending`, `requests`, `files`, `connections`).
+    - `src/cli/network.rs`: the post-`create` invite hint and both `print_next`
+      command tables (`ray status`/`ray up`).
+    - `src/cli/invite.rs` (join hint, reusable-key hint, admit hint),
+      `src/cli/pair.rs` (unpair hint), `src/cli/connect.rs` (approve hint,
+      share hint, incompatible-version hint), `src/cli/alias.rs` (identity hint),
+      `src/cli/service.rs` (sudo re-run hint), `src/cli/files.rs` (accept hint),
+      `src/cli/firewall.rs` (disabled-state hint, invite-missing suggested
+      command, alias-identity hint).
+    - `src/apply.rs`: the non-YAML error message, and the entire `EXAMPLE_SPEC`
+      constant printed by `torpedo apply --example` (also fixes a stray
+      "Rayfish deploy spec" mention).
+    - `src/onepassword.rs`: the backup item's stored `value` text — this one
+      is written verbatim into the user's own 1Password vault item by
+      `torpedo pair backup --1password`, so the leak is persisted outside the
+      repo entirely until fixed. Also `src/main.rs`'s `pair backup`/`pair
+      restore --1password` item **title** default, `"Rayfish Identity"` ->
+      `"Torpedo Identity"` (both subcommands, kept identical since restore
+      looks up by this default title). This fork is pre-release with no real
+      users, so there is no existing backup stored under the old title to
+      break; a back-compat lookup is unneeded and was not added.
+    - `src/daemon/mod.rs` (operator-grant hint + confirmation message),
+      `src/daemon/mesh/runtime.rs` (kick-yourself error), `src/daemon/mesh/
+      create_join.rs` (pending-approval message, version-mismatch message),
+      `src/daemon/mesh/files.rs` (auto-accept warning, not-your-device error),
+      `src/daemon/mesh/firewall.rs` (mesh-SSH no-peer-authorized nudge).
+    - `src/lib.rs`: `APP_NAME` corrected from `"ray"` to `"torpedo"`. Dormant
+      (grep confirms nothing references this constant), but an exported wrong
+      value is exactly the residual-identity class this series targets, and
+      the fix is zero-risk since nothing consumes it today.
+
+    Deliberately EXCLUDED (false positives / different `ray` / out of scope):
+    - `src/lib.rs`'s `DNS_DOMAIN = "ray"` and every `.ray`-suffixed hostname in
+      `src/dns.rs`, `src/dns_resolver.rs`, `src/dns_config.rs` (tests and
+      domain-suffix logic) — this is the KEEP-ON-PURPOSE `.ray` Magic-DNS TLD,
+      an unrelated "ray".
+    - `src/network_name.rs`'s hostname-generator wordlist entry `"ray"` —
+      the English word (as in stingray), coincidental, part of a list with
+      "reed", "pond", "quay".
+    - `src/update.rs`'s `release_asset_name` (`ray-{os}-{arch}`) and the
+      matching literals in `src/main.rs` (`ray-linux-x86_64` etc.) — these name
+      **upstream's own** release asset filenames (self-update, gated off by
+      CON-006, still points `REPO_SLUG` at `rayfish/rayfish` on purpose);
+      renaming would make a hypothetical re-enabled updater look for an asset
+      that does not exist in upstream's releases.
+    - Every other user-facing string inside `cli/update.rs` past its
+      `SELF_UPDATE_ENABLED` early-return (confirmed unreachable in this fork's
+      shipped behavior — `cmd_update` returns before reaching any of them).
+    - Source comments and doc-comments (`//`, `///`, `//!`) mentioning `ray
+      <verb>` — not user-facing, matches the cosmetic carve-out RENAME-009
+      already established; left for a later opportunistic pass, not this one.
+
+    No new Constraint: unlike CON-007's curated host-artifact tokens (which
+    never appear in comments or dead code), a token-count gate here would
+    false-fail on the deliberately-untouched comments and the dead
+    `cli/update.rs` tail, which still contain `ray <verb>` after this change.
+    Verified by reading the diff, same as RENAME-006..009.
+    """
+    req_id = "RENAME-011"
+
+
 class SurfaceDnsTakeoverWarning(Requirement):
     """REQUIREMENT-ID: DNS-001
 

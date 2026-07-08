@@ -465,7 +465,7 @@ impl MeshManager {
         let has_allow = app_config.networks.iter().any(|n| !n.ssh_allow.is_empty());
         let message = if enabled && !has_allow {
             "mesh SSH on. No peer is authorized yet. Grant access with \
-             `ray firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
+             `torpedo firewall ssh allow <network> <peer>` (peer = hostname / mesh IP / \
              short id, or `*` for any peer on the network)."
                 .to_string()
         } else {

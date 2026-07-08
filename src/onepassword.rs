@@ -90,7 +90,7 @@ pub fn store(vault: Option<&str>, title: &str, blob: &str, public_key: &str) -> 
               "purpose": "PASSWORD", "value": blob },
             { "label": "public_key", "type": "STRING", "value": public_key },
             { "id": "notesPlain", "label": "notesPlain", "type": "STRING", "purpose": "NOTES",
-              "value": "Rayfish encrypted identity backup. Restore with `ray pair restore --1password`." }
+              "value": "Torpedo encrypted identity backup. Restore with `torpedo pair restore --1password`." }
         ]
     })
     .to_string();

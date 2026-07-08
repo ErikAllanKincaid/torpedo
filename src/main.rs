@@ -419,7 +419,7 @@ pub(crate) enum PairAction {
         #[arg(long)]
         vault: Option<String>,
         /// 1Password item title
-        #[arg(long, default_value = "Rayfish Identity")]
+        #[arg(long, default_value = "Torpedo Identity")]
         item: String,
     },
     /// Restore a signing key from an encrypted backup
@@ -433,7 +433,7 @@ pub(crate) enum PairAction {
         #[arg(long)]
         vault: Option<String>,
         /// 1Password item title
-        #[arg(long, default_value = "Rayfish Identity")]
+        #[arg(long, default_value = "Torpedo Identity")]
         item: String,
     },
 }
@@ -1016,7 +1016,7 @@ async fn main() -> Result<()> {
         Command::Install { auto_update } => cmd_install(auto_update).await,
         Command::Restart => cmd_restart().await,
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut Cli::command(), "torpedo", &mut std::io::stdout());
             Ok(())
         }
         Command::Invite { network, action } => ipc_invite(&network, action).await,
@@ -1059,7 +1059,7 @@ async fn main() -> Result<()> {
         Command::Unpair { device } => ipc_unpair(&device).await,
         Command::Open { uri } => cmd_open(&uri).await,
         Command::Version => {
-            println!("ray {FULL_VERSION}");
+            println!("torpedo {FULL_VERSION}");
             Ok(())
         }
         Command::Update {
@@ -1171,13 +1171,13 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
             let mut cfg = config::load()?;
             config::config_set(&mut cfg, &key, &value, replace)?;
             config::save_settings(&cfg)?;
-            println!("Set {key}. Run 'sudo ray restart' for changes to take effect.");
+            println!("Set {key}. Run 'sudo torpedo restart' for changes to take effect.");
         }
         ConfigAction::Unset { key } => {
             let mut cfg = config::load()?;
             config::config_set(&mut cfg, &key, "", false)?;
             config::save_settings(&cfg)?;
-            println!("Reset {key} to default. Run 'sudo ray restart' for changes to take effect.");
+            println!("Reset {key} to default. Run 'sudo torpedo restart' for changes to take effect.");
         }
     }
     Ok(())

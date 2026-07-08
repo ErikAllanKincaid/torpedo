@@ -7,7 +7,7 @@
 //! these modules via `use rayfish::…`.
 #![doc(hidden)]
 
-pub const APP_NAME: &str = "ray";
+pub const APP_NAME: &str = "torpedo";
 pub const DNS_DOMAIN: &str = "ray";
 
 use futures::StreamExt;

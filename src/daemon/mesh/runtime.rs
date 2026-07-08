@@ -443,7 +443,7 @@ impl MeshManager {
         };
         if member_id == self.endpoint.id() {
             return IpcMessage::Error {
-                message: "cannot kick yourself — use `ray leave` or `ray nuke`".to_string(),
+                message: "cannot kick yourself — use `torpedo leave` or `torpedo nuke`".to_string(),
             };
         }
         if is_coord {

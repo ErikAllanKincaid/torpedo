@@ -126,7 +126,7 @@ pub(crate) async fn ipc_pair_list() -> Result<()> {
                 print!("{}", table(&["device", "id", "networks"], rows, 2));
                 println!(
                     "\n  {}",
-                    style::faint("revoke one with: ray unpair <device>")
+                    style::faint("revoke one with: torpedo unpair <device>")
                 );
             }
         }

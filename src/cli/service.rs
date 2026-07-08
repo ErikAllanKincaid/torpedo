@@ -199,7 +199,7 @@ pub(crate) fn require_root() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(
             "this command manages the system service and needs root.\n\
-             Re-run with: sudo ray <command>"
+             Re-run with: sudo torpedo <command>"
         );
         std::process::exit(1);
     }

@@ -931,7 +931,7 @@ class ReleaseWorkflowBuildIdentity(Requirement):
     can fetch a prebuilt binary instead of building from source. `.github/
     workflows/release.yml` and `nightly.yml` were inherited from upstream
     verbatim and never adapted past the binary rename: both packaging steps do
-    `BINARY=target/${{ matrix.target }}/release/ray`, but this fork's
+    `BINARY=target/<matrix target>/release/ray`, but this fork's
     `Cargo.toml` renamed the bin target to `torpedo` — the `cp` fails
     ("No such file or directory") the moment either workflow actually runs.
     Fix: `ray` -> `torpedo` in both `Package for release` steps.

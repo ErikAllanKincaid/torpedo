@@ -1,8 +1,8 @@
 name: Release
 
-# Continuous releases: pushing a tag like `v0.1.0` cuts a release with
-# Linux + macOS binaries. Can also be run manually from the Actions tab.
-# Windows support: TODO.
+# Continuous releases: pushing a tag like `v0.1.0` cuts a release with Linux
+# binaries (macOS/Android disabled — see CI-002). Can also be run manually
+# from the Actions tab. Windows support: TODO.
 on:
   push:
     tags:
@@ -90,18 +90,75 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            name: ray-linux-x86_64
+            name: torpedo-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
-            name: ray-linux-aarch64
+            name: torpedo-linux-aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.target }}"
+          cache-on-failure: true
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package for release
+        run: |
+          BINARY=target/${{ matrix.target }}/release/torpedo
+          cp "$BINARY" ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          else
+            shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          fi
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  # DISABLED (CI-002): macOS support is unfinished — `route_peer_range`/
+  # `route_self_loopback` in src/tun.rs still hardcode the old 100.64.0.0/10
+  # range and ignore --subnet (see TODO.md's "macOS rewrite" section), and none
+  # of the cfg(macos) code is compiled or tested on this Linux dev host.
+  # Shipping a release binary that silently misroutes a real Mac's network
+  # config is not acceptable, so this job is kept (for when macOS is actually
+  # fixed and verified) but never runs. Flip `if: false` off only once that
+  # work is done and tested on a real Mac.
+  build-macos:
+    needs: create-release
+    if: false
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - target: aarch64-apple-darwin
             runner: macos-latest
-            name: ray-macos-aarch64
+            name: torpedo-macos-aarch64
           - target: x86_64-apple-darwin
             # Cross-compiled on Apple Silicon (universal SDK); macos-13 Intel
             # runners are being retired and leave the job queued indefinitely.
             runner: macos-latest
-            name: ray-macos-x86_64
+            name: torpedo-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
@@ -126,7 +183,7 @@ jobs:
 
       - name: Package for release
         run: |
-          BINARY=target/${{ matrix.target }}/release/ray
+          BINARY=target/${{ matrix.target }}/release/torpedo
           cp "$BINARY" ${{ matrix.name }}
           if command -v sha256sum &>/dev/null; then
             sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
@@ -146,6 +203,12 @@ jobs:
 
   android:
     needs: create-release
+    # DISABLED (CI-002): the Android rewrite is unfinished — the deep-link
+    # scheme mismatch (manifest still rayfish://) is actively broken and the
+    # Kotlin/package identity rename + ray-mobile subnet-agnosticism are not
+    # done (see TODO.md's "Android rewrite" section). Kept for when that work
+    # lands; not run until then.
+    if: false
     # 24.04 (glibc 2.39): the prebuilt cargo-ndk from install-action is linked
     # against glibc 2.39 and won't load on 22.04 (glibc 2.35). Safe here because
     # this job's output is Android-target (bionic .so + APK), so the host glibc
@@ -217,8 +280,8 @@ jobs:
       # keystore yet. Swap to a signed assembleRelease once one exists.
       - name: Package APK
         run: |
-          cp android/app/build/outputs/apk/debug/app-debug.apk rayfish-android.apk
-          sha256sum rayfish-android.apk > rayfish-android.apk.sha256
+          cp android/app/build/outputs/apk/debug/app-debug.apk torpedo-android.apk
+          sha256sum torpedo-android.apk > torpedo-android.apk.sha256
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -227,5 +290,5 @@ jobs:
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: |
-            rayfish-android.apk
-            rayfish-android.apk.sha256
+            torpedo-android.apk
+            torpedo-android.apk.sha256

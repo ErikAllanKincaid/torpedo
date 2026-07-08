@@ -918,3 +918,110 @@ class ClosedNetworkInboundDefaultAllow(Requirement):
     ENFORCEMENT: unit test on set_closed_default (reconcile's `test` check).
     """
     req_id = "FW-001"
+
+
+# --------------------------------------------------------------------------
+# Requirement: CI/release workflow identity (RENAME-012) and correctness (CI-001)
+# --------------------------------------------------------------------------
+
+class ReleaseWorkflowBuildIdentity(Requirement):
+    """REQUIREMENT-ID: RENAME-012
+
+    Found 2026-07-08 while setting up GitHub Releases so remote test machines
+    can fetch a prebuilt binary instead of building from source. `.github/
+    workflows/release.yml` and `nightly.yml` were inherited from upstream
+    verbatim and never adapted past the binary rename: both packaging steps do
+    `BINARY=target/${{ matrix.target }}/release/ray`, but this fork's
+    `Cargo.toml` renamed the bin target to `torpedo` — the `cp` fails
+    ("No such file or directory") the moment either workflow actually runs.
+    Fix: `ray` -> `torpedo` in both `Package for release` steps.
+
+    Also renamed for consistency (these are OUR OWN fork's release artifacts,
+    downloaded manually since self-update is disabled — see the carve-out
+    below for why this is safe): the Linux/macOS asset names
+    (`ray-linux-x86_64` -> `torpedo-linux-x86_64`, `ray-linux-aarch64` ->
+    `torpedo-linux-aarch64`, `ray-macos-aarch64` -> `torpedo-macos-aarch64`,
+    `ray-macos-x86_64` -> `torpedo-macos-x86_64`) and the Android artifact
+    (`rayfish-android.apk` -> `torpedo-android.apk`, in both `release.yml` and
+    `nightly.yml`). `nightly.yml`'s release-notes body also told users to
+    "Install with `ray update --nightly`" — misleading since self-update is
+    neutralized in this fork (CON-006) — replaced with a plain
+    download-the-asset instruction.
+
+    Deliberately NOT touched (do not "fix" this on a future pass): `src/
+    update.rs`'s `release_asset_name` (`ray-{os}-{arch}`) and the matching
+    literals in `src/main.rs`, which RENAME-011 already carved out on purpose.
+    That code names asset filenames on **upstream's** rayfish/rayfish releases
+    (the disabled self-updater's `REPO_SLUG` target, kept per CON-006) — a
+    different `ray` than this class's, and renaming it would make a
+    hypothetically re-enabled updater look for an asset upstream does not
+    publish. This class's renames are entirely on the fork's own
+    ErikAllanKincaid/torpedo release assets and do not interact with that code
+    path at all.
+
+    ENFORCEMENT: none — YAML workflow files, not `src/**/*.rs`, so CON-007's
+    curated-token grep does not (and should not) cover them, same rationale as
+    the justfile identity item (TODO.md). Verified by reading the diff and
+    (once triggered) an actual Actions run producing correctly-named assets.
+    """
+    req_id = "RENAME-012"
+
+
+class ReleaseWorkflowsActuallyRun(Requirement):
+    """REQUIREMENT-ID: CI-001
+
+    Found 2026-07-08, same audit as RENAME-012. `ci.yml` and `nightly.yml`
+    both trigger on `push: branches: [master]`, but this repo's default
+    branch is `main` (confirmed: local `main` tracks `origin/main`). Neither
+    workflow has ever fired on an ordinary push to this fork — `ci.yml` only
+    ran (if at all) via its unfiltered `pull_request:` trigger, and
+    `nightly.yml` has no such fallback, so the rolling `nightly` pre-release
+    has never been produced automatically. `reconcile.py`, run locally, has
+    been the only gate exercised so far; GitHub Actions itself has likely
+    never executed on this fork.
+
+    Fix: `branches: - master` -> `branches: - main` in both workflows' `on:
+    push:` blocks. `release.yml` is unaffected (it triggers on tag push /
+    `workflow_dispatch`, not a branch push).
+
+    ENFORCEMENT: none — YAML workflow files, same rationale as RENAME-012.
+    Verified by reading the diff and (once pushed) an actual triggered run.
+    """
+    req_id = "CI-001"
+
+
+class ReleaseWorkflowLinuxOnlyForNow(Requirement):
+    """REQUIREMENT-ID: CI-002
+
+    Decided 2026-07-08 while fixing RENAME-012/CI-001: `release.yml` and
+    `nightly.yml` build Linux, macOS, and Android artifacts, but only Linux
+    (`torpedo-linux-x86_64`, `torpedo-linux-aarch64`) is actually ready to
+    ship. Neither of the other two platforms is safe or complete to publish:
+
+    - **macOS**: `route_peer_range`/`route_self_loopback` in `src/tun.rs`
+      still hardcode the old `100.64.0.0/10` range and ignore `--subnet`
+      (TODO.md "macOS rewrite"), and no `#[cfg(macos)]` code is compiled or
+      type-checked on any Linux CI runner or dev host in this project. A
+      released macOS binary would silently misroute a real Mac's network
+      config — unacceptable to publish to actual users' machines.
+    - **Android**: the deep-link scheme is actively broken (manifest still
+      `rayfish://` vs. the Rust side's `torpedo://`), plus the outstanding
+      Kotlin/package identity rename and `ray-mobile` subnet-agnosticism
+      (TODO.md "Android rewrite").
+
+    Whether to finish these platforms or drop them entirely is undecided.
+    Rather than delete the job definitions (losing the working matrix/build
+    steps) or leave them silently broken, both are kept in the workflow files
+    — with RENAME-012's identity fixes already applied so they are correct
+    the moment they're reactivated — but gated `if: false` at the job level
+    (`build-macos` in both workflows; `android` in both workflows), each with
+    a comment pointing back to the relevant TODO.md section and this ID. Only
+    the `build` job (Linux matrix) and the Android/macOS-free `create-release`
+    / `roll-tag` jobs actually run.
+
+    ENFORCEMENT: none — YAML workflow files, same rationale as RENAME-012/
+    CI-001. Verified by reading the diff (both disabled jobs present with
+    `if: false`) and, once triggered, that only Linux assets appear on a
+    release.
+    """
+    req_id = "CI-002"

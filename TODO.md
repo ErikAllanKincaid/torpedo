@@ -5,6 +5,17 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
 
 ## Upcoming (active agenda)
 
+- [ ] **CONN-001 — relay stickiness after a network change (investigate).** Found
+      2026-07-08 moving xps-17 LAN -> hotspot -> LAN. Once the endpoint's address
+      set churns and iroh falls to `relay`, it does NOT re-probe the now-available
+      direct path: stayed on relay (~60ms) for ~7 min back on the LAN; `torpedo
+      down`/`up` did not help; only `sudo torpedo restart` restored direct (~5ms).
+      Cross-NAT ingress itself worked (via relay on the hotspot). Likely upstream
+      iroh path-management behavior. Options: trigger a re-dial / path re-probe on
+      a detected network change, or (acceptable stopgap) document "run `torpedo
+      restart` after changing networks". Also seen: iroh resolves relay hostnames
+      via system DNS, so a transition DNS hiccup briefly stalls relay too.
+
 - [ ] **DNS-003 — CRITICAL, TOP PRIORITY: mutual DNS forwarding loop with
       Tailscale on tier-5 hosts.** Found 2026-07-08 live testing on xps-17-9720.
       torpedo's `DirectResolvConf` takeover rewrites `/etc/resolv.conf` to its

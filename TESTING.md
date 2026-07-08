@@ -113,9 +113,12 @@ torpedo status --json
 own hostname.
 
 ```bash
-# AORUS — invite takes ONLY the network name in this build
-# (no --hostname/--expires/--qr/--reusable/list/revoke).
+# AORUS — bare `invite <net>` mints a default single-use invite; to pass any
+# flag (--hostname/--expires/--qr/--reusable) the `create` subcommand word
+# must be spelled out explicitly (clap will not attach flags to the bare form).
 torpedo invite testnet                             # prints a single-use invite code
+# or, to bind an authoritative hostname on redemption:
+# torpedo invite testnet create --hostname xps-17-9720
 # xps — must have finished Stage 0 (up + same subnet + restart) first.
 torpedo join <invite-code> --hostname xps-17-9720
 ```
@@ -291,7 +294,7 @@ offline. Promotion alone is not the test; failover is.
 torpedo admin add testnet xps
 torpedo admin list testnet
 # xps: prove it can now admit — mint an invite FROM xps for a 3rd machine
-torpedo invite testnet --hostname node3
+torpedo invite testnet create --hostname node3
 # AORUS: go offline, then confirm the 3rd machine can still join via xps
 sudo torpedo stop
 ```
@@ -491,6 +494,14 @@ Findings:
   just `torpedo invite <NETWORK>`. AGENTS.md (inherited from upstream) documents
   `--hostname`/`--expires`/`--qr`/`--reusable`/`list`/`revoke` on invite that this
   binary lacks. Audit AGENTS.md against the actual CLI and trim to what exists.
+  **Follow-up (DOC-001, 2026-07-08): the diagnosis above was incomplete, not the
+  binary.** All of `--hostname`/`--expires`/`--qr`/`--reusable`/`list`/`revoke`
+  exist today (`InviteAction` in `src/main.rs`) and match AGENTS.md — the actual
+  bug was that they belong to an explicit `create` subcommand, which clap
+  requires spelled out before it will parse subcommand-specific flags. The
+  failing invocation above was missing that word; `torpedo invite testnet
+  create --hostname xps-17-9720` works. AGENTS.md/TESTING.md corrected to show
+  the `create` keyword rather than trimmed, since nothing was actually missing.
 
 ### Run 2026-07-07, attempt 2 (in progress)
 

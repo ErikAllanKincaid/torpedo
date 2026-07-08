@@ -1099,3 +1099,53 @@ class SecurityPolicyIdentityAndReportingFix(Requirement):
     RENAME-012. Verified by reading the diff.
     """
     req_id = "RENAME-013"
+
+
+# --------------------------------------------------------------------------
+# Requirement: documentation accuracy, not identity (DOC-*)
+# --------------------------------------------------------------------------
+
+class DocsMatchCurrentBinaryAndSubnetFormula(Requirement):
+    """REQUIREMENT-ID: DOC-001
+
+    Found/fixed 2026-07-08, the two remaining items from TODO.md's doc-fix
+    list. Distinct from the `RENAME-*` series: neither of these is stale
+    `rayfish` identity, they are plain factual drift between AGENTS.md/
+    TESTING.md and the current binary/formula.
+
+    (1) **Hardcoded resolver IP.** AGENTS.md stated the Magic DNS resolver
+    address as the fixed literal `100.100.100.53` in four places (the
+    KEEP-ON-PURPOSE list, and the `forward.rs`/`dns.rs`/`dns_config.rs` module
+    descriptions). Since SUBNET-007/008 this has been subnet-derived
+    (`dns::magic_dns_v4`) — `10.88.100.53` on the default `10.88.0.0/16`,
+    `10.99.100.53` on a `10.99.0.0/16` network, etc. — and was never a fixed
+    value to begin with once that change landed. Fixed to describe the
+    formula + default-subnet example instead of the stale literal.
+    `DESIGN.md`'s mention was already correctly historical ("instead of the
+    fixed 100.100.100.53") and needed no change; `TESTING.md`'s Results-log
+    mention was likewise already a correct, dated finding and was left as-is.
+
+    (2) **Invite CLI audit — the binary was right, the diagnosis was wrong.**
+    TODO.md/TESTING.md's "attempt 1" finding claimed AGENTS.md documents
+    invite flags (`--hostname`/`--expires`/`--qr`/`--reusable`/`list`/
+    `revoke`) that the binary lacks. Reading `InviteAction` in `src/main.rs`
+    and its dispatcher in `src/cli/invite.rs` shows all of them exist and
+    match AGENTS.md's description. The actual bug: those flags belong to an
+    explicit `create` subcommand variant, and clap will not parse
+    subcommand-specific flags unless that subcommand word is present in
+    argv — `torpedo invite testnet --hostname X` (no `create`) genuinely
+    errors "unexpected argument", while `torpedo invite testnet create
+    --hostname X` works. AGENTS.md's compact CLI reference omitted the
+    `create` keyword, reading as if the flags attached to the bare `invite
+    <net>` form; so did TESTING.md's Stage 3, Stage 12, and the hostname-change
+    flow description. All four corrected to show `create` explicitly. The
+    original TESTING.md finding was left in place (it accurately records what
+    happened during that test run) with a follow-up note appended correcting
+    the diagnosis, rather than rewritten, so the history of "what we thought
+    was wrong vs. what actually was wrong" stays visible.
+
+    ENFORCEMENT: none — Markdown, not `src/**/*.rs`. Verified by reading the
+    diff and cross-checking against `src/main.rs`/`src/cli/invite.rs`/
+    `src/dns.rs`.
+    """
+    req_id = "DOC-001"

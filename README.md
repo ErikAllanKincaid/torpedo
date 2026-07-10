@@ -2,6 +2,8 @@
 
 <img src="images/torpedo2.png" alt="Electric ray (Torpedo)" width="320">
 
+Electric ray *Torpedo californica*
+
 **A P2P mesh VPN that coexists with Tailscale.** Torpedo is a small, focused fork of [rayfish](https://github.com/rayfish/rayfish) that makes the overlay IPv4 subnet configurable, so it can run on the same machine as an active Tailscale client. Connect your machines by cryptographic identity — no servers to run, no ports to forward, no static IPs to manage.
 
 ```bash
@@ -16,7 +18,7 @@ ping bob.<network>.ray          # reach each other by name
 ![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)
 ![Fork of: rayfish](https://img.shields.io/badge/fork%20of-rayfish-blue.svg)
 
-> **This is not original software.** Torpedo is rayfish with a focused set of changes, kept as an honest fork under the same MPL-2.0 license. All credit for the mesh-VPN design belongs to [upstream rayfish](https://github.com/rayfish/rayfish); this fork exists to run it alongside Tailscale on machines the author controls. It may need rework as upstream evolves and does not track it automatically.
+> **This is not original software.** Torpedo is rayfish with a focused set of changes, kept as an honest fork under the same MPL-2.0 license. All credit for the mesh-VPN design belongs to [upstream rayfish](https://github.com/rayfish/rayfish); this fork exists to run it alongside Tailscale as a second ingress. It may need rework as upstream evolves and does not track it automatically.
 
 ---
 
@@ -87,13 +89,17 @@ Each machine runs the `torpedo` daemon, which creates a TUN device, captures IP 
 
 ### Who can join
 
+##### Closed network
+
 The **room id** is a discovery key, never an admission credential. On a **closed** network (the default) there are three ways in:
 
 - **Invite code** — `torpedo invite <network>` mints a single-use, expiring code; the holder runs `torpedo join <code>`.
 - **Reusable key** — `torpedo invite <network> --reusable` mints a multi-use, revocable key for unattended fleets (`torpedo join <key> --hostname web --auto-accept-firewall`).
 - **Live approval** — the holder of just the room id runs `torpedo join <room-id>` and lands in a queue; the coordinator runs `torpedo requests` then `torpedo accept`/`deny`.
 
-An **open** network (`torpedo create --open`) lets anyone with the room id join directly.
+##### Open network
+
+An **open** network (`torpedo create --open`) lets anyone with the room id join directly. By default the firewall default-deny blocks traffic `torpedo firewall show` and ports must be opened specifically. This will allow a peer to access a web server on your machine  `torpedo firewall add out allow -p tcp -P 80 --peer <PEERNAME>`
 
 ### Direct 2-peer connections
 
@@ -111,6 +117,10 @@ That last path is not hypothetical: a minimal **Debian trixie** install (no desk
 - restores the original file automatically on `torpedo down` / `sudo torpedo uninstall`, and also after a crash or hard kill (the panic hook and the next daemon start both run the restore).
 
 On hosts with systemd-resolved or NetworkManager (most desktop Linux, and where Tailscale runs its own split-DNS), none of this applies — torpedo registers a scoped `.ray` resolver alongside your existing DNS instead of touching `/etc/resolv.conf` at all.
+
+## Development
+
+Developed with [Specification-driven development](https://en.wikipedia.org/wiki/Specification-driven_development) using [libspec](https://github.com/drhodes/libspec) a Specification Management System.
 
 ## Features (inherited from rayfish)
 
@@ -189,4 +199,4 @@ The key contrast: plain WireGuard gives you the encrypted tunnel but leaves you 
 
 ## Relationship to upstream & license
 
-Torpedo is a fork of [rayfish](https://github.com/rayfish/rayfish), licensed under the **Mozilla Public License 2.0** (`LICENSE`), the same as upstream. The entire mesh-VPN design, and the overwhelming majority of the code, is rayfish's work; this fork only changes what is listed under [What this fork changes](#what-this-fork-changes). If you want the general, upstream-quality version of configurable subnets, that belongs in rayfish itself — this fork is a scrappier, personal-use variant.
+Torpedo is a fork of [rayfish](https://github.com/rayfish/rayfish), licensed under the **Mozilla Public License 2.0** (`LICENSE`), the same as upstream. The entire mesh-VPN design, and the overwhelming majority of the code, is rayfish's work; this fork is in development, but changes what is listed under [What this fork changes](#what-this-fork-changes). If you want the general, upstream-quality version of configurable subnets, that belongs in rayfish itself — this fork is a scrappier, personal-use variant.

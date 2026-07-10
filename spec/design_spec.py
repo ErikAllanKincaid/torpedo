@@ -1063,7 +1063,7 @@ class ReleaseWorkflowLinuxOnlyForNow(Requirement):
     — with RENAME-012's identity fixes already applied so they are correct
     the moment they're reactivated — but gated `if: false` at the job level
     (`build-macos` in both workflows; `android` in both workflows), each with
-    a comment pointing back to the relevant TODO.md section and this ID. Only
+    a comment citing this ID (CI-002) for the rationale. Only
     the `build` job (Linux matrix) and the Android/macOS-free `create-release`
     / `roll-tag` jobs actually run.
 

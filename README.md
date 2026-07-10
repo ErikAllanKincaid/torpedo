@@ -76,7 +76,7 @@ Everything below is the *only* difference from upstream rayfish; every other fea
 - **Self-update disabled.** Upstream's self-updater pulls from rayfish's release repo; enabling it here would overwrite torpedo with an upstream build. It is neutralized — [upgrade manually](#upgrading).
 - **Kept on purpose:** the `rayfish` relay / discovery-DNS presets (they name upstream's hosted servers; the default is iroh's neutral n0 infrastructure), and the `.ray` Magic-DNS domain, so names are still `host.network.ray`.
 
-See [`DESIGN.md`](DESIGN.md) for the full rationale and `spec/design_spec.py` for the tracked requirements (this fork is developed spec-first with [libspec](https://github.com/drhodes/libspec)).
+See `spec/design_spec.py` for the tracked requirements and the full rationale (this fork is developed spec-first with [libspec](https://github.com/drhodes/libspec)).
 
 ## How it works
 
@@ -175,7 +175,7 @@ just cross                      # build for x86_64 Linux
 just deploy <ip>                # cross-build release + install + start on a remote host
 ```
 
-Torpedo currently targets **Linux**. (The macOS and Android paths inherited from rayfish still assume the old range and identity; see `TODO.md`.)
+Torpedo currently targets **Linux**. (The macOS and Android paths inherited from rayfish still assume the old range and identity; deferred, tracked as SUBNET-013 in `spec/design_spec.py`.)
 
 ## Background and further reading
 

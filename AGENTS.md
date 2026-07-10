@@ -49,7 +49,7 @@ cargo build --release          # distributable binary at target/release/torpedo
 
 The crate splits into a library (`src/lib.rs`, daemon modules as `pub mod`) and a thin binary (`src/main.rs`, the `torpedo` CLI/IPC client, `use rayfish::…` — the library name is kept, see KEEP-ON-PURPOSE). The split lets benchmarks (`benches/`) and integration tests reach the internal data path; `cargo install` builds the binary against the in-package library unchanged.
 
-**justfile:** `just cross`/`just deploy`/`just deploy-dev` identity was fixed (`binary := "torpedo"`, `groupadd torpedo`, `systemctl restart torpedo`) — safe to use. `ray-mobile`/`libray_mobile` (Android crate/artifact name) is a separate, deliberately-undecided item, see the Android rewrite section in TODO.md.
+**justfile:** `just cross`/`just deploy`/`just deploy-dev` identity was fixed (`binary := "torpedo"`, `groupadd torpedo`, `systemctl restart torpedo`) — safe to use. `ray-mobile`/`libray_mobile` (Android crate/artifact name) is a separate, deliberately-undecided item (RENAME-010, out of scope).
 
 ## Run
 

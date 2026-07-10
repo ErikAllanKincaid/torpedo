@@ -161,8 +161,8 @@ impl MeshManager {
             network_name: Some(name.to_string()),
             mode,
             suggested_firewall,
-            // Single-TUN node: use the provider's operative subnet (built from the
-            // persisted node cache at bootstrap). See DESIGN.md.
+            // SUBNET-010: single-TUN node — use the provider's operative subnet
+            // (built from the persisted node cache at bootstrap).
             subnet: self.identity.subnet(),
             reusable_keys,
             pending_suggestions: Vec::new(),

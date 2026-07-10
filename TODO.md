@@ -5,6 +5,195 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
 
 ## Upcoming (active agenda)
 
+- [ ] **PING-001 — `torpedo ping` (identity-based control-channel probe) got zero
+      replies AORUS -> xps-17-9720, while raw ICMP over the TUN and `torpedo
+      ping` to xeon40 both worked fine.** Found 2026-07-09, same live 3-machine
+      session as ADMIN-001, right after that saga. `torpedo ping xps-17-9720 -c
+      3` from AORUS: 3 sent, 0 received, 100% loss ("no reply ... timeout").
+      Contrast: `ping -c 3 10.88.80.165` (raw ICMP, same pair) had just
+      succeeded minutes earlier (0% loss); `torpedo ping xeon40 -c 3` from
+      AORUS succeeded cleanly (0% loss, via relay, ~59ms avg) in the same
+      breath. So this is the inverse of the usual data-plane-vs-control-plane
+      split seen elsewhere (e.g. SUBNET-014, where raw ping failed but the
+      identity-based path worked) — here the **data plane works and the
+      control-channel `ControlMsg::Ping`/`Pong` round trip does not**, and only
+      for the one pair (AORUS<->xps) that had just been through ADMIN-001's
+      restart/promotion/manual-accept churn today; xeon40's connection (never
+      restarted mid-session) was unaffected.
+      **CONFIRMED real and reproducible, and root cause narrowed to a specific
+      node, not a specific link.** Retested `torpedo ping xps-17-9720 -c 5`
+      from AORUS — 5 sent, 0 received, 100% loss again; raw `ping -c 3
+      10.88.80.165` immediately after was still 0% loss. Reverse direction
+      (`torpedo ping aorus -c 5` from xps) — also 100% loss; raw `ping -c 3
+      10.88.68.29` from xps — 0% loss. **Then the key test: `torpedo ping
+      xeon40 -c 5` run from xps** — also 5 sent, 0 received, 100% loss, while
+      `ping -c 3 10.88.134.27` from xps (same target) was 0% loss. But
+      `torpedo ping xeon40` from AORUS succeeds cleanly (0% loss, ~51ms avg via
+      relay), and xeon40's link was never restarted all session.
+      **This rules out "the AORUS<->xps link specifically."** Full 3x3 matrix
+      completed (xeon40->aorus and xeon40->xps run directly by the user on
+      xeon40): every `torpedo ping` call that has **xps on either end** fails
+      (AORUS<->xps both directions, xps->xeon40, xeon40->xps — all 100% loss),
+      while every call between the two nodes that never restarted (AORUS,
+      xeon40, both directions) succeeds at 0% loss. Raw ICMP is unaffected in
+      every case tested (data plane is fine everywhere). This is a clean,
+      complete confirmation of a **per-node defect on xps**, not a per-link
+      one.
+      The one thing that singles xps out: it is the only node in this session
+      that went through `restore_coordinator_network` (the coordinator-restore
+      boot path, taken because it persisted a `network_secret_key` after
+      today's `AdminGrant`) rather than the plain member-reconnect/fresh-join
+      path AORUS and xeon40 used. Strongest lead: compare whatever
+      `restore_coordinator_network` / `spawn_coordinator_background_tasks`
+      wires up for a restored coordinator against what a normal member join
+      (`join_mesh_shared` / `spawn_member_control_listener`) wires up for
+      `ControlMsg::Ping`/`Pong` handling (the `pending_pongs` correlation map,
+      and whatever registers a coordinator's own outbound-ping/inbound-pong
+      handling) — the coordinator-restore path likely never sets up (or
+      resets) this piece for coordinator-role connections, breaking ping in
+      both directions for every peer xps talks to, while leaving the
+      independently-wired data-plane/forwarding path untouched. Should be
+      reproducible without the full ADMIN-001 scenario: create a network,
+      promote a member to co-coordinator, restart it, then `torpedo ping` in
+      both directions against any peer.
+
+      **ROOT CAUSE VERIFIED (2026-07-09, code read, not yet fixed).** Every peer
+      connection gets a data-plane reader (`forward::spawn_peer_reader`, which
+      pulls datagrams -> TUN, so raw IP forwarding always works). But the
+      *control* reader (the task that does `conn.accept_bi()` and handles
+      `ControlMsg::*`, incl. replying `Pong` to a `Ping` and firing the
+      `pending_pongs` oneshot on a `Pong`) is attached to only ONE connection
+      per node: the **primary coordinator<->member control link**.
+      - Member side: `spawn_member_control_listener` (`join.rs:217`) is attached
+        only to `initial_conn` — the single coordinator that welcomed this node
+        on join.
+      - Coordinator side: `spawn_coordinator_control_reader` is attached in the
+        accept path (`accept.rs:87` `handle_known_member_reconnect`, `:586`
+        `spawn_admitted_member_tasks`) for each admitted member.
+      EVERY other peer link gets `forward::spawn_peer_reader` **only**, no
+      control reader — verified at all five such sites:
+      `register_mesh_peer` (`join.rs:370`, member dials roster peers on join),
+      `spawn_reconnect_loop` (`join.rs:933`, ANY peer re-dial after a drop),
+      `MemberAcceptState::register_peer` (`accept.rs:631`, a member accepting an
+      inbound peer), and the coordinator-dials-members reconnect
+      (`create_join.rs:1329`). `torpedo ping` (`diagnostics.rs:363`) sends its
+      `Ping` over `peers.lookup_v4(ip).conn` — whatever connection the PeerTable
+      holds for that IP — and needs a control reader on BOTH ends of THAT
+      connection. So ping only works over the primary coordinator<->member link.
+      Two distinct consequences, both observed:
+      1. **member<->member / secondary-coordinator links never had a control
+         reader** (roster-peer links). Explains xps<->xeon40 failing:
+         xeon40's primary link is to AORUS, so its link to xps is a roster-peer
+         link. Also explains why 2-node tests always passed (the only link IS the
+         primary link).
+      2. **reconnect drops the control reader even on the primary link.**
+         `spawn_reconnect_loop` re-dials a dropped peer and re-attaches only
+         `forward::spawn_peer_reader` (`join.rs:933`) — never re-attaches
+         `spawn_member_control_listener`. So after ANY disconnect/reconnect
+         (peer restart, `torpedo restart`, network blip) the re-dialing side
+         permanently loses control-message handling on that link until the
+         daemon fully restarts into a fresh accept. This is what broke
+         AORUS<->xps after xps's restart, and would break even a plain 2-node
+         mesh's ping after a single reconnect. **NOT xps- or coordinator-
+         specific** — the ADMIN-001 scenario just happened to force the
+         reconnect that exposed it.
+      **The user's instinct is correct — ping is only the symptom I tested.**
+      Any peer-to-peer `ControlMsg` sent over a reader-less link is silently
+      dropped: `Ping`/`Pong` today, and `MeshHello` (hostname rename) or
+      `AdminGrant` if either is ever delivered peer-to-peer over a non-primary
+      or post-reconnect link rather than via the coordinator + signed blob. The
+      core protocol survives today only because it funnels all authoritative
+      state through the coordinator link + pkarr blob; anything assuming direct
+      peer-to-peer control messaging is affected.
+      **PROPOSED FIX.** Guarantee exactly one `accept_bi` consumer per
+      connection that always handles at least `Ping`/`Pong`. Cleanest: a minimal
+      `spawn_peer_ping_responder(conn, pending_pongs, token)` (an `accept_bi`
+      loop handling only `Ping`->`respond_pong` and `Pong`->fire
+      `pending_pongs`), spawned at exactly the five sites above that today spawn
+      `forward::spawn_peer_reader` WITHOUT any control reader. Safe from
+      stream-steal precisely because those links currently have zero `accept_bi`
+      consumer; must NOT be added to the primary-link sites (`join.rs:217`,
+      `accept.rs:87/586`) which already run a full reader. Main plumbing cost:
+      thread the `protocol_router.pending_pongs` Arc into `register_mesh_peer`,
+      `spawn_reconnect_loop`, `MemberAcceptState::register_peer`, and the
+      `create_join.rs:1329` path (none receive it today). Longer-term
+      alternative: unify into one role-aware control reader per connection so
+      there is never a link without one. Either way add a `spec/design_spec.py`
+      requirement (e.g. PING-001) + keep `reconcile.py` green + a
+      TESTING.md stage that pings across a reconnect and across a
+      non-primary-coordinator pair.
+
+- [ ] **ADMIN-001 — CRITICAL: a newly-promoted co-coordinator can't serve the
+      group blob it advertises, breaking the failover story.** Found 2026-07-09
+      live-testing a 3-machine/2-coordinator topology (AORUS + xps-17-9720 +
+      xeon40, `noisebridge-torpedonet`). Sequence: AORUS creates the network,
+      xps joins, AORUS runs `torpedo admin <net> add <xps-short-id>` to promote
+      xps to co-coordinator, AORUS then goes offline (`sudo torpedo stop`), and
+      xeon40 tries to join through an invite minted from xps. Join fails:
+      `could not fetch group blob from any peer`. xeon40's log shows it reached
+      xps fine (`connected to peer ... alpn=/iroh-bytes/4`) but the fetch itself
+      failed (`blob fetch failed: io: stream reset by peer: error 3`) — xps
+      accepted the connection but had nothing to serve.
+      **Root cause:** `spawn_member_control_listener`'s `AdminGrant` handler
+      (`src/daemon/mesh/join.rs:707-714`) calls `s.refresh_snapshot()` and starts
+      the lazy DHT publisher (which announces the *new* blob hash), but never
+      writes the corresponding bytes into the local `blob_store` — unlike every
+      other coordinator-sealing path (`seal_and_publish`, `create_join.rs:56-58`,
+      which does `refresh_snapshot()` then
+      `blob_store.blobs().add_slice(&snap.msgpack_bytes).await`). So a freshly
+      promoted co-coordinator truthfully publishes a hash in the DHT record that
+      its own `iroh_blobs` store has no bytes for. `spawn_member_control_listener`
+      doesn't even take `blob_store` as a parameter today, though it's already in
+      scope at the call site (`join_mesh_shared`, from `MeshCtx`) — plumbing it
+      through is straightforward.
+      **`sudo torpedo restart` workaround tried live — partially fixes it, and
+      exposes a second, compounding defect.** Restarting the co-coordinator (xps)
+      does trigger `restore_coordinator_network` -> `seal_and_publish`, which
+      correctly populates `blob_store` this time (confirmed: xeon40's next join
+      attempt got past the blob-fetch stage entirely, a new failure mode). But
+      the restart's roster restore hit `could not restore roster from DHT blob
+      ... falling back to config` (DHT/seed-peer fetch still unreachable with
+      AORUS down) — and the **fallback config roster is stale**: it reflects
+      xps's roster from its *original join*, before the `AdminGrant`, because
+      that handler (`join.rs:707-714`) never persists `is_coordinator = true`
+      into xps's own config-file member entry, only into the in-memory
+      `SharedNetworkState` that a restart discards. So the freshly re-sealed
+      blob xps re-publishes after restart still shows *only AORUS* as
+      coordinator-flagged.
+      **Consequence, confirmed live:** xeon40's retried join fetched the blob
+      fine, then failed at the dial stage — `no coordinator admitted the join
+      (tried 1): coordinator offline: failed to connect to peer`, dialing
+      `272e5c87ea` (AORUS, still offline at that point) and never attempting
+      `edc6f50214` (xps, the actual invite minter, reachable the whole time).
+      `coordinator_dial_order` evidently builds its candidate list from the
+      blob's `is_coordinator` flags (or the invite-pinned-minter priority
+      doesn't override it) — either way, once xps's own flag is wrong in the
+      republished roster, new joins can't reach it even though it holds the key
+      and is willing to serve.
+      **Net effect:** the two defects compound. Fresh promotion breaks blob
+      serving outright (fix #1). Recovering via restart fixes blob serving but
+      re-exposes a stale roster that excludes the co-coordinator from the dial
+      list entirely (fix #2) whenever the DHT/seed-peer roster fetch can't reach
+      the original coordinator to get the authoritative version. Both must be
+      fixed together for the "survives any single coordinator offline" claim in
+      AGENTS.md to actually hold.
+      **Fix:**
+      1. Add `blob_store: FsStore` to `spawn_member_control_listener`'s params
+         (pass `blob_store.clone()` from `join_mesh_shared`, already in scope),
+         and after `s.refresh_snapshot()` in the `AdminGrant` arm, write
+         `blob_store.blobs().add_slice(&bytes).await` the same way
+         `seal_and_publish` does — the `RwLockWriteGuard` must be dropped before
+         the `.await`.
+      2. In the same `AdminGrant` handler, persist `is_coordinator = true` into
+         the config-file member entry for `my_identity_c` (not just the
+         in-memory `SharedNetworkState`), so a later restart's config-fallback
+         roster carries it forward even when the DHT/seed-peer fetch fails.
+      Add a `spec/design_spec.py` requirement + keep `reconcile.py` green.
+      **Live-test workaround that unblocks a demo/test today without the code
+      fix:** bring the original coordinator back online (`sudo torpedo start`)
+      so it's a valid, correctly-flagged dial target again; defer the actual
+      failover proof until this is fixed in code.
+
 - [ ] **CONN-001 — relay stickiness after a network change (investigate).** Found
       2026-07-08 moving xps-17 LAN -> hotspot -> LAN. Once the endpoint's address
       set churns and iroh falls to `relay`, it does NOT re-probe the now-available

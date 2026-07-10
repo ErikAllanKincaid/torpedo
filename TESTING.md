@@ -291,8 +291,11 @@ offline. Promotion alone is not the test; failover is.
 
 ```bash
 # AORUS: promote xps to co-coordinator (grants the network key)
-torpedo admin add testnet xps
-torpedo admin list testnet
+# <xps-short-id> is xps's own short id as shown in ITS `torpedo status` (its
+# endpoint-id prefix) — hostname is NOT accepted here and fails with
+# "could not resolve identity" (unlike --peer elsewhere, which does take a hostname)
+torpedo admin testnet add <xps-short-id>
+torpedo admin testnet list
 # xps: prove it can now admit — mint an invite FROM xps for a 3rd machine
 torpedo invite testnet create --hostname node3
 # AORUS: go offline, then confirm the 3rd machine can still join via xps

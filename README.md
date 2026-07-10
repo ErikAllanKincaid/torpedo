@@ -99,7 +99,7 @@ The **room id** is a discovery key, never an admission credential. On a **closed
 
 ##### Open network
 
-An **open** network (`torpedo create --open`) lets anyone with the room id join directly. By default the firewall default-deny blocks traffic `torpedo firewall show` and ports must be opened specifically. This will allow a peer to access a web server on your machine  `torpedo firewall add out allow -p tcp -P 80 --peer <PEERNAME>`
+An **open** network (`torpedo create --open`) lets anyone with the room id join directly. By default the inbound firewall is default-deny (see `torpedo firewall show`), so ports must be opened explicitly. To let a peer reach a web server on your machine: `torpedo firewall add in allow -p tcp -P 80 --peer <PEERNAME>`.
 
 ### Direct 2-peer connections
 

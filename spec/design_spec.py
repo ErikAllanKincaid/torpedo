@@ -478,14 +478,17 @@ class CosmeticIdentitySweep(Requirement):
 class NoResidualHostIdentityLeak(Constraint):
     """CONSTRAINT-ID: CON-007
 
-    After RENAME-006..008, none of the collision-prone `rayfish` host-artifact /
-    user-identifier tokens remain in src/: the curated set is `rayfish-dns.conf`,
-    `.before-rayfish`, `# Added by rayfish`, `tun-rayfish`, `com.rayfish.vpn`,
-    `rayfish://`, `RAYFISH_CONFIG_DIR`, and the SCDynamicStore `rayfish` service
-    key/client name. This is a completeness + anti-regression gate; it targets
-    those specific tokens only, so it never trips on the KEEP-ON-PURPOSE
-    `rayfish` names (relay/discovery preset URLs, REPO_SLUG, crate name, author
-    attribution), which are allowed to remain.
+    After RENAME-006..008 (and RENAME-015's observability names), none of the
+    collision-prone `rayfish` host-artifact / user-identifier tokens remain in
+    src/: the curated set is `rayfish-dns.conf`, `.before-rayfish`, `# Added by
+    rayfish`, `tun-rayfish`, `com.rayfish.vpn`, `rayfish://`, `RAYFISH_CONFIG_DIR`,
+    the SCDynamicStore `rayfish` service key/client name, and (RENAME-015) the
+    observability names `name = "rayfish"` / `name = "rayfish_peer"` (Prometheus
+    metric families) and `service_name("rayfish")` / `tracer("rayfish")` (OTEL).
+    This is a completeness + anti-regression gate; it targets those specific
+    tokens only, so it never trips on the KEEP-ON-PURPOSE `rayfish` names
+    (relay/discovery preset URLs, REPO_SLUG, crate name, author attribution),
+    which are allowed to remain.
 
     ENFORCEMENT (reconcile.py): host_identity.leak_count equals 0.
     """
@@ -1273,3 +1276,39 @@ class NoResidualReportIdentityLeak(Constraint):
     """
     constraint_id = "CON-009"
     enforcement_logic = "{{ report_identity.unexpected_count == 0 }}"
+
+
+class ObservabilityIdentityRenamed(Requirement):
+    """REQUIREMENT-ID: RENAME-015
+
+    Workstream B of the 2026-07-10 `ray`/`rayfish` audit: the last observability
+    identifiers still naming upstream. Distinct from RENAME-011 (`ray` binary
+    short-name) and RENAME-014 (report/repo surface) — these are the names a
+    monitoring stack sees:
+
+    - `src/stats.rs` — the iroh-metrics group names drive the exported Prometheus
+      family prefix on `:9090`. `#[metrics(name = "rayfish")]` (ForwardMetrics) ->
+      `"torpedo"` and `#[metrics(name = "rayfish_peer")]` (PeerMetrics) ->
+      `"torpedo_peer"`, so series export as `torpedo_packets_rx`,
+      `torpedo_peer_rtt_us`, etc.
+    - `src/main.rs` — the `otel` feature's OTLP span identity:
+      `.with_service_name("rayfish")` and `provider.tracer("rayfish")` -> `"torpedo"`.
+    - `src/daemon/mesh/bootstrap.rs` — folded in: the metrics-server doc-comment
+      "Register rayfish counters" -> "torpedo" (self-consistency with the rename).
+
+    `torpedo` is already the fork convention (`bootstrap.rs`'s mDNS
+    `service_name("torpedo")`, unchanged). NOTE (breaking-only-after-release):
+    renaming a metric family / OTLP service name breaks existing scrapers,
+    dashboards, and collector filters — but this fork is pre-release with no such
+    consumers, so the change is free NOW and only becomes breaking post-release.
+    No back-compat alias added for that reason.
+
+    ENFORCEMENT: CON-007 gains the four observability tokens (`name = "rayfish"`,
+    `name = "rayfish_peer"`, `service_name("rayfish")`, `tracer("rayfish")`).
+    Additionally locked by the `stats::tests::metrics_export_under_torpedo_prefix`
+    unit test, which encodes both groups through `iroh_metrics::Registry` and
+    asserts the rendered OpenMetrics text carries the `torpedo`/`torpedo_peer`
+    prefixes and no `rayfish` — the exported prefix is otherwise a compile-time
+    derive constant with no runtime assertion.
+    """
+    req_id = "RENAME-015"

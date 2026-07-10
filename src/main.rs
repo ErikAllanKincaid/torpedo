@@ -852,13 +852,13 @@ where
     };
 
     let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name("rayfish")
+        .with_service_name("torpedo")
         .build();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
-    let tracer = provider.tracer("rayfish");
+    let tracer = provider.tracer("torpedo");
     guard.otel_provider = Some(provider);
 
     tracing::info!("OpenTelemetry OTLP span export enabled");

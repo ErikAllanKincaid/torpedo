@@ -85,6 +85,10 @@ def check_host_identity() -> dict:
         "com.rayfish.vpn",  # macOS launchd label / plist (RENAME-008)
         "rayfish://",  # deep-link URI scheme (RENAME-007)
         "RAYFISH_CONFIG_DIR",  # config-dir override env var (RENAME-007)
+        'name = "rayfish"',  # Prometheus ForwardMetrics family (RENAME-015)
+        'name = "rayfish_peer"',  # Prometheus PeerMetrics family (RENAME-015)
+        'service_name("rayfish")',  # OTEL OTLP service name (RENAME-015)
+        'tracer("rayfish")',  # OTEL tracer name (RENAME-015)
     ]
     leaks = 0
     for p in Path("src").rglob("*.rs"):

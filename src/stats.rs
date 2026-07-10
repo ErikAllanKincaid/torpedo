@@ -62,7 +62,7 @@ pub struct MetricsSnapshot {
 }
 
 #[derive(Debug, MetricsGroup)]
-#[metrics(name = "rayfish", default)]
+#[metrics(name = "torpedo", default)]
 pub struct ForwardMetrics {
     /// Total packets received from peers
     pub packets_rx: Counter,
@@ -187,7 +187,7 @@ pub struct PeerLabels {
 }
 
 #[derive(Debug, MetricsGroup)]
-#[metrics(name = "rayfish_peer", default)]
+#[metrics(name = "torpedo_peer", default)]
 pub struct PeerMetrics {
     /// RTT to peer in microseconds
     pub rtt_us: Family<PeerLabels, Gauge>,
@@ -233,6 +233,41 @@ impl PeerMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    // RENAME-015: the Prometheus families must export under the `torpedo`/
+    // `torpedo_peer` prefixes (renamed from `rayfish`/`rayfish_peer`), and no
+    // `rayfish`-named series may leak onto the :9090 endpoint. `name = "..."`
+    // in the derive drives the exported prefix, so this locks it end-to-end
+    // (the compile-time constant is not observable any other way).
+    #[test]
+    fn metrics_export_under_torpedo_prefix() {
+        let mut registry = iroh_metrics::Registry::default();
+        registry.register(Arc::new(ForwardMetrics::default()));
+        // PeerMetrics families are labeled, so they export no series until a
+        // sample exists — record one so the peer family actually renders.
+        let peer = Arc::new(PeerMetrics::default());
+        peer.rtt_us
+            .get_or_create(&PeerLabels {
+                peer: "testpeer".to_string(),
+            })
+            .set(42);
+        registry.register(peer);
+        let mut out = String::new();
+        registry.encode_openmetrics_to_writer(&mut out).unwrap();
+        assert!(
+            out.contains("torpedo_packets_rx"),
+            "ForwardMetrics must export under the torpedo_ prefix:\n{out}"
+        );
+        assert!(
+            out.contains("torpedo_peer_"),
+            "PeerMetrics must export under the torpedo_peer_ prefix:\n{out}"
+        );
+        assert!(
+            !out.contains("rayfish"),
+            "no rayfish-named metric may reach the :9090 endpoint:\n{out}"
+        );
+    }
 
     #[test]
     fn test_record_rx() {

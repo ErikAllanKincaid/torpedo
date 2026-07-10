@@ -108,6 +108,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Prometheus metrics and OTLP traces now export under the `torpedo` name.** The
+  metrics on `:9090` were published under the `rayfish`/`rayfish_peer` family
+  prefixes and OTLP spans (the `otel` feature) under service name `rayfish`; both
+  now use `torpedo`/`torpedo_peer`. If you scrape `:9090` or collect traces, update
+  any dashboards, alerts, or collector filters that referenced the old names.
 - **Magic DNS no longer seizes `/etc/resolv.conf` by default.** New setting
   `torpedo config set magic-dns off|auto|direct` (default `auto`). In `auto`,
   torpedo uses a clean split-DNS backend when one exists (systemd-resolved,

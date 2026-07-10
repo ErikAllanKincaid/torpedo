@@ -374,7 +374,7 @@ fn spawn_mdns_discovery(ep: &Endpoint, token: CancellationToken) {
     });
 }
 
-/// Register rayfish counters, per-peer gauges, and iroh endpoint metrics, then
+/// Register torpedo counters, per-peer gauges, and iroh endpoint metrics, then
 /// start the Prometheus HTTP endpoint on `:9090`. The returned guard must be
 /// kept alive for the process lifetime; `None` means metrics export is disabled.
 async fn spawn_metrics_server(

@@ -7,18 +7,18 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
 
 - [ ] **PING-001 — `torpedo ping` (identity-based control-channel probe) got zero
       replies AORUS -> xps-17-9720, while raw ICMP over the TUN and `torpedo
-      ping` to xeon40 both worked fine.** Found 2026-07-09, same live 3-machine
+      ping` to node-c both worked fine.** Found 2026-07-09, same live 3-machine
       session as ADMIN-001, right after that saga. `torpedo ping xps-17-9720 -c
       3` from AORUS: 3 sent, 0 received, 100% loss ("no reply ... timeout").
       Contrast: `ping -c 3 10.88.80.165` (raw ICMP, same pair) had just
-      succeeded minutes earlier (0% loss); `torpedo ping xeon40 -c 3` from
+      succeeded minutes earlier (0% loss); `torpedo ping node-c -c 3` from
       AORUS succeeded cleanly (0% loss, via relay, ~59ms avg) in the same
       breath. So this is the inverse of the usual data-plane-vs-control-plane
       split seen elsewhere (e.g. SUBNET-014, where raw ping failed but the
       identity-based path worked) — here the **data plane works and the
       control-channel `ControlMsg::Ping`/`Pong` round trip does not**, and only
       for the one pair (AORUS<->xps) that had just been through ADMIN-001's
-      restart/promotion/manual-accept churn today; xeon40's connection (never
+      restart/promotion/manual-accept churn today; node-c's connection (never
       restarted mid-session) was unaffected.
       **CONFIRMED real and reproducible, and root cause narrowed to a specific
       node, not a specific link.** Retested `torpedo ping xps-17-9720 -c 5`
@@ -26,16 +26,16 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       10.88.80.165` immediately after was still 0% loss. Reverse direction
       (`torpedo ping aorus -c 5` from xps) — also 100% loss; raw `ping -c 3
       10.88.68.29` from xps — 0% loss. **Then the key test: `torpedo ping
-      xeon40 -c 5` run from xps** — also 5 sent, 0 received, 100% loss, while
+      node-c -c 5` run from xps** — also 5 sent, 0 received, 100% loss, while
       `ping -c 3 10.88.134.27` from xps (same target) was 0% loss. But
-      `torpedo ping xeon40` from AORUS succeeds cleanly (0% loss, ~51ms avg via
-      relay), and xeon40's link was never restarted all session.
+      `torpedo ping node-c` from AORUS succeeds cleanly (0% loss, ~51ms avg via
+      relay), and node-c's link was never restarted all session.
       **This rules out "the AORUS<->xps link specifically."** Full 3x3 matrix
-      completed (xeon40->aorus and xeon40->xps run directly by the user on
-      xeon40): every `torpedo ping` call that has **xps on either end** fails
-      (AORUS<->xps both directions, xps->xeon40, xeon40->xps — all 100% loss),
+      completed (node-c->aorus and node-c->xps run directly by the user on
+      node-c): every `torpedo ping` call that has **xps on either end** fails
+      (AORUS<->xps both directions, xps->node-c, node-c->xps — all 100% loss),
       while every call between the two nodes that never restarted (AORUS,
-      xeon40, both directions) succeeds at 0% loss. Raw ICMP is unaffected in
+      node-c, both directions) succeeds at 0% loss. Raw ICMP is unaffected in
       every case tested (data plane is fine everywhere). This is a clean,
       complete confirmation of a **per-node defect on xps**, not a per-link
       one.
@@ -43,7 +43,7 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       that went through `restore_coordinator_network` (the coordinator-restore
       boot path, taken because it persisted a `network_secret_key` after
       today's `AdminGrant`) rather than the plain member-reconnect/fresh-join
-      path AORUS and xeon40 used. Strongest lead: compare whatever
+      path AORUS and node-c used. Strongest lead: compare whatever
       `restore_coordinator_network` / `spawn_coordinator_background_tasks`
       wires up for a restored coordinator against what a normal member join
       (`join_mesh_shared` / `spawn_member_control_listener`) wires up for
@@ -82,8 +82,8 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       connection. So ping only works over the primary coordinator<->member link.
       Two distinct consequences, both observed:
       1. **member<->member / secondary-coordinator links never had a control
-         reader** (roster-peer links). Explains xps<->xeon40 failing:
-         xeon40's primary link is to AORUS, so its link to xps is a roster-peer
+         reader** (roster-peer links). Explains xps<->node-c failing:
+         node-c's primary link is to AORUS, so its link to xps is a roster-peer
          link. Also explains why 2-node tests always passed (the only link IS the
          primary link).
       2. **reconnect drops the control reader even on the primary link.**
@@ -126,11 +126,11 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
 - [ ] **ADMIN-001 — CRITICAL: a newly-promoted co-coordinator can't serve the
       group blob it advertises, breaking the failover story.** Found 2026-07-09
       live-testing a 3-machine/2-coordinator topology (AORUS + xps-17-9720 +
-      xeon40, `noisebridge-torpedonet`). Sequence: AORUS creates the network,
+      node-c, `testnet`). Sequence: AORUS creates the network,
       xps joins, AORUS runs `torpedo admin <net> add <xps-short-id>` to promote
       xps to co-coordinator, AORUS then goes offline (`sudo torpedo stop`), and
-      xeon40 tries to join through an invite minted from xps. Join fails:
-      `could not fetch group blob from any peer`. xeon40's log shows it reached
+      node-c tries to join through an invite minted from xps. Join fails:
+      `could not fetch group blob from any peer`. node-c's log shows it reached
       xps fine (`connected to peer ... alpn=/iroh-bytes/4`) but the fetch itself
       failed (`blob fetch failed: io: stream reset by peer: error 3`) — xps
       accepted the connection but had nothing to serve.
@@ -149,7 +149,7 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       **`sudo torpedo restart` workaround tried live — partially fixes it, and
       exposes a second, compounding defect.** Restarting the co-coordinator (xps)
       does trigger `restore_coordinator_network` -> `seal_and_publish`, which
-      correctly populates `blob_store` this time (confirmed: xeon40's next join
+      correctly populates `blob_store` this time (confirmed: node-c's next join
       attempt got past the blob-fetch stage entirely, a new failure mode). But
       the restart's roster restore hit `could not restore roster from DHT blob
       ... falling back to config` (DHT/seed-peer fetch still unreachable with
@@ -160,11 +160,11 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       `SharedNetworkState` that a restart discards. So the freshly re-sealed
       blob xps re-publishes after restart still shows *only AORUS* as
       coordinator-flagged.
-      **Consequence, confirmed live:** xeon40's retried join fetched the blob
+      **Consequence, confirmed live:** node-c's retried join fetched the blob
       fine, then failed at the dial stage — `no coordinator admitted the join
       (tried 1): coordinator offline: failed to connect to peer`, dialing
-      `272e5c87ea` (AORUS, still offline at that point) and never attempting
-      `edc6f50214` (xps, the actual invite minter, reachable the whole time).
+      `<endpoint-a>` (AORUS, still offline at that point) and never attempting
+      `<endpoint-b>` (xps, the actual invite minter, reachable the whole time).
       `coordinator_dial_order` evidently builds its candidate list from the
       blob's `is_coordinator` flags (or the invite-pinned-minter priority
       doesn't override it) — either way, once xps's own flag is wrong in the
@@ -336,6 +336,33 @@ Tracking for deferred work on the fork. See `DESIGN.md` for decisions,
       (c) document the restart requirement in AGENTS.md/CLI help and leave the
       silent gap (weakest option, easy to miss since it fails open with no
       error).
+
+- [ ] **MINIMAL-001 — feature-gate unneeded satellites for a mesh-only build.**
+      Goal: a lean torpedo that provides only the identity-based mesh overlay
+      (TUN + subnet + firewall + DNS), using stock host `sshd` over the overlay
+      instead of the embedded mesh SSH. **Key fact: mesh SSH is already
+      runtime-off by default** (`ssh_enabled=false`, the `:22<->:30022` userspace
+      NAT inactive, admits nobody until `torpedo firewall ssh on` + an `ssh_allow`
+      entry). So this is not about "turning it off" — it is off. It is about
+      dropping the code, the `russh` dependency, and the attack surface from the
+      binary. **Approach: Cargo feature gates (default-on), NOT deletion** —
+      `cargo build --no-default-features` yields the minimal core, each satellite
+      stays one flag away, upstream code is preserved (matches the fork's
+      spec-first + KEEP-ON-PURPOSE philosophy). **Start with `ssh`** to prove the
+      pattern: highest value because it is redundant with `sshd` and carries the
+      most security-sensitive surface (host-key extraction via `sshd -T`,
+      privilege drop in `pre_exec`, `cfg(macos)` blocks, a userspace `:22` NAT in
+      the packet hot path). Other candidates, in rough order: `files` (use
+      scp/rsync over the mesh), `connect` (2-peer friend-request flow), `pair` +
+      `onepassword` (multi-device identity + backup), `apply` (YAML
+      orchestration); `tor` is already a feature. **Watch-outs:** each satellite
+      spans `MeshManager` fields, a `ProtocolRouter` ALPN accept arm, `IpcMessage`
+      variants, CLI subcommands, and config keys — all must be gated together, or
+      the build breaks. SSH's userspace `:22<->:30022` NAT lives in `forward.rs`
+      (the per-packet data path), so gate that carefully to avoid touching the hot
+      loop. Add a `spec/design_spec.py` requirement per gate + keep `reconcile.py`
+      green. Note: removing mesh SSH drops a Tailscale-parity differentiator, but
+      it is unneeded for this personal-use fork.
 
 ## macOS rewrite — adapt to torpedo
 

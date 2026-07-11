@@ -14,8 +14,8 @@ takeover/restore lifecycle.
 | 3 | Resolution drives **real reachability** — ping by `.ray` name (DNS + data plane). |
 | 4 | The resolver **binds no host `:53` socket** — it answers via the magic IP (`100.100.100.53`) routed through the TUN, so it coexists with any existing `:53` resolver (AdGuard/Pi-hole/dnsmasq — the umbrelOS case) by construction. |
 | 5 | **Non-`.ray` names still resolve** while the VPN is up — split-DNS passthrough on hosts with a split-DNS backend, or the resolver forwarding to the captured upstream in direct mode. The feature must not black-hole public DNS. |
-| 6 | *(conditional)* On a host that fell to the **direct `/etc/resolv.conf` takeover** (no split-DNS backend), `resolv.conf` carries the magic IP under the `# Added by rayfish` marker. Skipped cleanly on split-DNS hosts. |
-| 7 | **`ray down` reverts system DNS**: `.ray` names stop resolving; in direct mode the original `resolv.conf` is restored (marker gone). |
+| 6 | *(conditional)* On a host that fell to the **direct `/etc/resolv.conf` takeover** (no split-DNS backend), `resolv.conf` carries the magic IP under the `# Added by torpedo` marker. Skipped cleanly on split-DNS hosts. |
+| 7 | **`torpedo down` reverts system DNS**: `.ray` names stop resolving; in direct mode the original `resolv.conf` is restored (marker gone). |
 
 DNS is probed through the system resolver (`getent ahostsv4`), so it tests the
 whole chain (OS config → magic IP → TUN interception → in-daemon resolver), not

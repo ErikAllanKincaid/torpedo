@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# `ray apply` declarative-deploy e2e test orchestrator.
+# `torpedo apply` declarative-deploy e2e test orchestrator.
 #
 # Topology:
 #   srv-a  coordinator + apply driver (closed network `infra`)
 #   srv-b  member (joined via an --invite-missing invite, auto-accepts firewall)
 #   srv-c  member (joined via an --invite-missing invite, auto-accepts firewall)
 #
-# Exercises the full `ray apply` surface the closed-net smoke only touches at the
+# Exercises the full `torpedo apply` surface the closed-net smoke only touches at the
 # --example/--dry-run level — here against a live daemon, end to end:
 #   - create-if-absent: apply mints a missing closed network, never joins
-#   - membership diff: the gap is reported as `ray invite … --hostname …` lines
+#   - membership diff: the gap is reported as `torpedo invite … --hostname …` lines
 #   - --invite-missing: those invites are minted, and the named hosts join under
 #     their bound hostnames
-#   - `ray identityof`: prints a joined host's identity (+ negative for a stranger)
+#   - `torpedo identityof`: prints a joined host's identity (+ negative for a stranger)
 #   - aliases/groups: a spec aliases a user and groups it with a literal hostname,
 #     then references the group as a firewall subject/peer; --dry-run shows the
 #     expansion resolving to concrete hostnames (sugar never survives)
@@ -21,7 +21,7 @@
 #   - --prune drops an out-of-band suggestion the spec doesn't mention
 #
 # Reads tests/e2e/apply/.servers (written by provision). Does NOT modify infra.
-# Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
+# Re-runnable (resets torpedo state each run unless KEEP_STATE=1).
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,10 +40,10 @@ C="$(server_ip "$SERVERS" srv-c || true)"
 NET=infra
 
 # sugg_tcp_allow <ip> <port> : count of installed *suggested-by-infra* inbound
-# tcp ALLOW rules for <port> on a node (from `ray firewall show --json`). Proves
+# tcp ALLOW rules for <port> on a node (from `torpedo firewall show --json`). Proves
 # an expanded suggestion materialized into a real rule.
 sugg_tcp_allow(){
-  on "$1" 'ray firewall show --json' 2>/dev/null | jq -r --arg p "$2" \
+  on "$1" 'torpedo firewall show --json' 2>/dev/null | jq -r --arg p "$2" \
     '[ .rules[]? | select((.suggested_by // "") == "infra" and .action == "allow"
         and (.protocol | ascii_downcase) == "tcp" and .port == $p) ] | length'
 }
@@ -59,8 +59,8 @@ deploy_all "$ROOT" "$A" "$B" "$C"
 # `srv-a`, not a generated alias — otherwise srv-a is reported as a missing host
 # and peers can't resolve the `srv-a` subject. srv-b/srv-c get their names from
 # the invite binding (`--hostname srv-b|srv-c`), so only srv-a needs this.
-on "$A" 'ray up --hostname srv-a' >/dev/null 2>&1 || true
-for h in "$B" "$C"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
+on "$A" 'torpedo up --hostname srv-a' >/dev/null 2>&1 || true
+for h in "$B" "$C"; do on "$h" 'torpedo up' >/dev/null 2>&1 || true; done
 wait_daemons "$A" "$B" "$C"
 
 # ---------------------------------------------------------------------------
@@ -68,16 +68,16 @@ step "1. apply creates the closed network + reports the membership gap"
 # A spec naming srv-a (subject) plus srv-b/srv-c (peers). expected hosts =
 # {srv-a, srv-b, srv-c}; only srv-a is joined, so the gap is srv-b + srv-c.
 on "$A" "printf 'networks:\n  $NET:\n    srv-a:\n      allows:\n        srv-b: \"tcp:22\"\n        srv-c: \"tcp:22\"\n' > /tmp/spec1.yaml"
-APPLY1="$(on "$A" "ray apply /tmp/spec1.yaml" 2>&1 | strip)"
+APPLY1="$(on "$A" "torpedo apply /tmp/spec1.yaml" 2>&1 | strip)"
 echo "$APPLY1" | sed 's/^/   a| /'
 echo "$APPLY1" | grep -qi 'creating closed network' \
   && pass "apply created the closed network" || fail "apply did not create '$NET'"
 has_net "$A" "$NET" && pass "'$NET' now present on srv-a" || fail "'$NET' missing on srv-a after apply"
 echo "$APPLY1" | grep -qi 'Missing hosts' \
   && pass "apply reported a membership gap" || fail "no membership gap reported"
-echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-b" \
+echo "$APPLY1" | grep -q "torpedo invite $NET --hostname srv-b" \
   && pass "gap lists an invite command for srv-b" || fail "srv-b not in the gap"
-echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-c" \
+echo "$APPLY1" | grep -q "torpedo invite $NET --hostname srv-c" \
   && pass "gap lists an invite command for srv-c" || fail "srv-c not in the gap"
 # apply never joins — the members must not have the network yet.
 ! has_net "$B" "$NET" && ! has_net "$C" "$NET" \
@@ -85,11 +85,11 @@ echo "$APPLY1" | grep -q "ray invite $NET --hostname srv-c" \
 # Consent is per-node: srv-b/srv-c auto-accept via their join flag, but srv-a (the
 # coordinator) must opt in to materialize its own suggested rules (step 5 asserts
 # the coordinator installs the rules it publishes for itself).
-on "$A" "ray firewall auto-accept $NET on" >/dev/null 2>&1 || true
+on "$A" "torpedo firewall auto-accept $NET on" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 step "2. --invite-missing mints invites; the named hosts join"
-APPLY2="$(on "$A" "ray apply /tmp/spec1.yaml --invite-missing" 2>&1 | strip)"
+APPLY2="$(on "$A" "torpedo apply /tmp/spec1.yaml --invite-missing" 2>&1 | strip)"
 echo "$APPLY2" | sed 's/^/   a| /'
 echo "$APPLY2" | grep -qi 'already active' \
   && pass "second apply saw the network already active" || fail "network not reported active on re-apply"
@@ -99,20 +99,20 @@ CODE_C="$(echo "$APPLY2" | grep -- '--hostname srv-c' | grep -oE '[A-Za-z0-9]{40
 [[ -n "$CODE_B" && -n "$CODE_C" ]] \
   && pass "--invite-missing minted invites for srv-b + srv-c" \
   || { fail "could not parse minted invite codes"; summary; }
-on "$B" "ray join $CODE_B --auto-accept-firewall" 2>&1 | strip | sed 's/^/   b| /'
-on "$C" "ray join $CODE_C --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
+on "$B" "torpedo join $CODE_B --auto-accept-firewall" 2>&1 | strip | sed 's/^/   b| /'
+on "$C" "torpedo join $CODE_C --auto-accept-firewall" 2>&1 | strip | sed 's/^/   c| /'
 wait_roster "$A" srv-b srv-c
 
 # ---------------------------------------------------------------------------
-step "3. ray identityof prints a joined host's identity"
-B_IDENT="$(on "$A" "ray identityof $NET srv-b" | strip | tr -d '[:space:]')"
+step "3. torpedo identityof prints a joined host's identity"
+B_IDENT="$(on "$A" "torpedo identityof $NET srv-b" | strip | tr -d '[:space:]')"
 [[ -n "$B_IDENT" ]] && pass "identityof srv-b printed an identity (${B_IDENT:0:16}…)" \
   || { fail "identityof srv-b printed nothing"; summary; }
 # --json carries the same identity and paired=false (srv-b is unpaired).
-PAIRED="$(on "$A" "ray identityof $NET srv-b --json" 2>/dev/null | jq -r '.paired')"
+PAIRED="$(on "$A" "torpedo identityof $NET srv-b --json" 2>/dev/null | jq -r '.paired')"
 [[ "$PAIRED" == "false" ]] && pass "identityof --json reports paired=false" || fail "unexpected paired=$PAIRED"
 # A stranger hostname must error (an alias can only name a joined member).
-if on "$A" "ray identityof $NET ghost" >/dev/null 2>&1; then
+if on "$A" "torpedo identityof $NET ghost" >/dev/null 2>&1; then
   fail "identityof for a non-joined host should have failed"
 else
   pass "identityof errors for a host that has not joined"
@@ -124,7 +124,7 @@ step "4. aliases + groups expand to concrete hostnames (dry-run)"
 # Reference `team` as a firewall peer; the expansion must resolve it to srv-b +
 # srv-c and leave no `bob`/`team` sugar behind.
 on "$A" "printf 'aliases:\n  bob: %s\ngroups:\n  team: [bob, srv-c]\nnetworks:\n  $NET:\n    \"*\":\n      allows:\n        team: \"tcp:22\"\n' '$B_IDENT' > /tmp/spec2.yaml"
-DRY="$(on "$A" "ray apply /tmp/spec2.yaml --dry-run" 2>&1 | strip)"
+DRY="$(on "$A" "torpedo apply /tmp/spec2.yaml --dry-run" 2>&1 | strip)"
 echo "$DRY" | sed 's/^/   a| /'
 echo "$DRY" | grep -qi 'Spec (expanded)' \
   && pass "dry-run echoed the expanded spec" || fail "dry-run did not expand the spec"
@@ -135,7 +135,7 @@ echo "$DRY" | grep -q 'srv-b' && echo "$DRY" | grep -q 'srv-c' \
 
 # ---------------------------------------------------------------------------
 step "5. real apply publishes the expanded suggestions"
-APPLY5="$(on "$A" "ray apply /tmp/spec2.yaml" 2>&1 | strip)"
+APPLY5="$(on "$A" "torpedo apply /tmp/spec2.yaml" 2>&1 | strip)"
 echo "$APPLY5" | sed 's/^/   a| /'
 # srv-a is subject `*`, so it materializes its own inbound tcp:22 allow for each
 # resolved team member (srv-b + srv-c) — the coordinator installs its own.
@@ -158,7 +158,7 @@ stop_tcp_listener "$A" 8080
 # ---------------------------------------------------------------------------
 step "7. --prune drops an out-of-band suggestion"
 # Suggest a rule the spec doesn't mention (subject srv-a, tcp:8080).
-on "$A" "ray firewall suggest $NET --subject srv-a --allow tcp:8080" 2>&1 | strip | sed 's/^/   a| /'
+on "$A" "torpedo firewall suggest $NET --subject srv-a --allow tcp:8080" 2>&1 | strip | sed 's/^/   a| /'
 if retry_until 30 "[[ \"\$(sugg_tcp_allow '$A' 8080)\" -ge 1 ]]"; then
   pass "out-of-band tcp:8080 suggestion installed on srv-a"
 else
@@ -166,7 +166,7 @@ else
 fi
 # Apply spec2 (subject `*` only) with --prune: it publishes exactly the spec's
 # subjects, so the subject-srv-a 8080 suggestion is dropped, tcp:22 survives.
-on "$A" "ray apply /tmp/spec2.yaml --prune" 2>&1 | strip | sed 's/^/   a| /'
+on "$A" "torpedo apply /tmp/spec2.yaml --prune" 2>&1 | strip | sed 's/^/   a| /'
 if retry_until 60 "[[ \"\$(sugg_tcp_allow '$A' 8080)\" -eq 0 ]]"; then
   pass "--prune dropped the out-of-band tcp:8080 suggestion"
 else

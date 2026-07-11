@@ -8,13 +8,13 @@ scenarios don't cover.
 
 | Step | Coverage |
 |------|----------|
-| 2 | **Live approval** with no invite: `srv-b` dials the closed net → `ray requests` shows it → `ray accept` admits it. |
-| 3 | **Live denial**: `srv-c` dials → `ray deny` rejects it → it never becomes a member. |
-| 4 | **Co-coordinator grant**: `ray admin add` promotes `srv-b`; `ray admin list` shows two key-holders. |
-| 5 | **Gatekeeper resilience**: with `srv-a` taken offline (`ray down`), the co-coordinator `srv-b` mints a `ray invite --reusable` key and admits `srv-c` unattended (`--auto-accept-firewall`). |
-| 6 | **Hostname change**: `ray hostname` propagates to the coordinator's roster and the magic-DNS name `srv-bb.priv.ray` resolves + answers. |
-| 7 | **Graceful leave + nuke**: `ray leave` prunes the member promptly; `ray nuke` drops the network. |
-| 8 | **`ray apply` smoke**: `--example` prints a template and `--dry-run` normalizes a spec without creating anything. |
+| 2 | **Live approval** with no invite: `srv-b` dials the closed net → `torpedo requests` shows it → `torpedo accept` admits it. |
+| 3 | **Live denial**: `srv-c` dials → `torpedo deny` rejects it → it never becomes a member. |
+| 4 | **Co-coordinator grant**: `torpedo admin add` promotes `srv-b`; `torpedo admin list` shows two key-holders. |
+| 5 | **Gatekeeper resilience**: with `srv-a` taken offline (`torpedo down`), the co-coordinator `srv-b` mints a `torpedo invite --reusable` key and admits `srv-c` unattended (`--auto-accept-firewall`). |
+| 6 | **Hostname change**: `torpedo hostname` propagates to the coordinator's roster and the magic-DNS name `srv-bb.priv.ray` resolves + answers. |
+| 7 | **Graceful leave + nuke**: `torpedo leave` prunes the member promptly; `torpedo nuke` drops the network. |
+| 8 | **`torpedo apply` smoke**: `--example` prints a template and `--dry-run` normalizes a spec without creating anything. |
 
 Single-use invite redemption is already covered by the `device-cert` scenario.
 

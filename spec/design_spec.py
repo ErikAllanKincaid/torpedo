@@ -1362,8 +1362,9 @@ class SourceCommentCliNameSwept(Requirement):
 class NoResidualCliNameLeak(Constraint):
     """CONSTRAINT-ID: CON-010
 
-    Anti-regression gate for RENAME-016 part (1): the pre-fork `ray <verb>`
-    binary reference must not reappear in `src/**/*.rs`. Regex, not a token
+    Anti-regression gate for RENAME-016 part (1) and RENAME-017: the pre-fork
+    `ray <verb>` binary reference must not reappear in `src/**/*.rs` OR the
+    `tests/` harness (extended to cover tests/ in RENAME-017). Regex, not a token
     list — `(?<![.\\w-])ray (?=[a-z])` — so it matches a bare `ray ` + lowercase
     word (always a stale CLI reference) while the lookbehind excludes every
     KEEP form (`.ray` TLD, `ray-proto`/`ray-mobile`, `stingray`/`array`,
@@ -1376,3 +1377,73 @@ class NoResidualCliNameLeak(Constraint):
     """
     constraint_id = "CON-010"
     enforcement_logic = "{{ cli_reference_identity.unexpected_count == 0 }}"
+
+
+class TestHarnessIdentitySwept(Requirement):
+    """REQUIREMENT-ID: RENAME-017
+
+    Workstream D of the `ray`/`rayfish` audit: the e2e/bench harness under
+    `tests/` (16 shell scripts + 11 READMEs). Unlike RENAME-016's src comments,
+    this is a FUNCTIONAL fix — the scripts RUN against the deployed binary, and
+    `deploy_all` uses `just deploy` (which installs the `torpedo` binary +
+    service, no `ray` symlink), so every stale reference silently breaks or
+    no-ops the test rather than being cosmetic. Confirmed-broken cases:
+
+    - `on "$ip" 'ray <cmd>'` invocations (303 across tests/) → `command not
+      found: ray`. Reworded to `torpedo` via the same lookbehind regex as
+      RENAME-016 (`.ray` TLD, `ray-`, `rayfish` all excluded).
+    - `reset_state` ran `systemctl stop rayfish; rm -rf /etc/rayfish
+      /root/.config/rayfish` — a NO-OP against the `torpedo` service/paths, so
+      state was never actually reset between runs. → torpedo.
+    - `dns/run.sh` grepped `/etc/resolv.conf` for `"Added by rayfish"`, but the
+      binary writes `# Added by torpedo` (`src/dns_config.rs`) — the direct-mode
+      detection never matched. → torpedo.
+    - `unpair` referenced the pkarr record `_rayfish_certgen`; the binary
+      publishes `_torpedo_certgen` (`src/dht.rs`). Bench comment cited ALPN
+      `rayfish/files/1`; real is `torpedo/files/1` (`src/transport.rs`). Invite
+      helpers parsed CLI output for the literal `ray join`/`ray invite` strings
+      the binary now prints as `torpedo`. → torpedo.
+    - Cosmetic prose + bench comparison labels (`rayfish` vs direct, orchestrator
+      comments) reworded uniformly; the `bench_pair "rayfish"` label arg and all
+      its `get/ratio ... rayfish` lookups renamed together so the keying stays
+      consistent.
+
+    KEEP (unchanged): the `.ray` Magic-DNS TLD in every hostname/regex; and the
+    `NAMES=(rayfish-*)` Scaleway instance labels (bare `rayfish`, retained — they
+    are opaque ephemeral cloud-VM identifiers with an operational orphan cost and
+    zero correctness benefit, the same rationale as keeping the crate name).
+    Applied by skipping `NAMES=(` lines in the sweep.
+
+    NOT in scope (separate pre-existing drift, flagged for follow-up): the
+    `100.64.x.x` / `100.64.0.0/10` CGNAT range still cited in several bench/
+    common.sh comments — a SUBNET doc-drift (default is now `10.88.0.0/16`),
+    unrelated to this rename.
+
+    Verified: `bash -n` parses every `tests/**/*.sh`; the full e2e run itself
+    needs 3 provisioned cloud hosts and was NOT executed here.
+
+    ENFORCEMENT: CON-010 extended to also scan `tests/` for the `ray <verb>`
+    regex; CON-011 (below) curated-token gates the functional `rayfish`
+    service/config/marker/record identity. Cosmetic prose is ungated (same
+    reason as RENAME-016 part 2).
+    """
+    req_id = "RENAME-017"
+
+
+class NoResidualTestHarnessIdentityLeak(Constraint):
+    """CONSTRAINT-ID: CON-011
+
+    Anti-regression gate for RENAME-017: the functional pre-fork `rayfish`
+    identity must not reappear in the `tests/` harness. Curated token set
+    (`systemctl {stop,start,restart} rayfish`, `/etc/rayfish`,
+    `/root/.config/rayfish`, `Added by rayfish`, `_rayfish_certgen`,
+    `rayfish/files/1`) — NOT a bare `rayfish` grep, so it never trips on the
+    KEEP `NAMES=(rayfish-*)` Scaleway instance labels or the `.ray` TLD. Mirrors
+    CON-008's approach (build/deploy tooling) but for the test harness, which no
+    other gate covers. The `ray <verb>` CLI class is handled by CON-010's
+    tests/-extended regex, not here.
+
+    ENFORCEMENT (reconcile.py): test_harness_identity.unexpected_count equals 0.
+    """
+    constraint_id = "CON-011"
+    enforcement_logic = "{{ test_harness_identity.unexpected_count == 0 }}"

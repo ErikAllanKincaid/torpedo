@@ -9,13 +9,13 @@ failure). The shared SSH/deploy/reset/assert plumbing lives in
 
 | Dir | Hosts | What it proves |
 |-----|-------|----------------|
-| [`device-cert/`](device-cert) | 3 | A third peer reaches a user identity backed by two paired devices (`ray pair` + DeviceCert), over a closed (invite-gated) network. |
-| [`connect/`](connect) | 2 | The `ray connect` direct 2-peer friend-request flow over the public pkarr DHT — request, approve, `[direct]` network, ping + `ray send`, per-network firewall, offline negative case. |
+| [`device-cert/`](device-cert) | 3 | A third peer reaches a user identity backed by two paired devices (`torpedo pair` + DeviceCert), over a closed (invite-gated) network. |
+| [`connect/`](connect) | 2 | The `torpedo connect` direct 2-peer friend-request flow over the public pkarr DHT — request, approve, `[direct]` network, ping + `torpedo send`, per-network firewall, offline negative case. |
 | [`firewall/`](firewall) | 3 | The coordinator suggested-firewall pipeline (`suggest` → `pending`/`accept`, `auto-accept`, additive whitelist vs blacklist) and the per-packet rule matrix (UDP, port ranges, same-selector replace, `--network` scoping) over a real TUN. |
-| [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `ray hostname` + magic-DNS, `ray leave`/`nuke`, and a `ray apply` smoke. |
-| [`apply/`](apply) | 3 | Declarative `ray apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `ray identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
-| [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `ray down` revert. |
-| [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the rayfish tunnel vs the direct public-IP baseline. Fails when rayfish adds loss over the raw link. |
+| [`closed-net/`](closed-net) | 3 | Closed-net admission + lifecycle commands: live approval (`requests`/`accept`/`deny`), co-coordinator (`admin add`) gatekeeper resilience with a reusable key, `torpedo hostname` + magic-DNS, `torpedo leave`/`nuke`, and a `torpedo apply` smoke. |
+| [`apply/`](apply) | 3 | Declarative `torpedo apply` deploy end to end: create-if-absent + membership-gap diff, `--invite-missing`, `torpedo identityof`, alias/group expansion (`--dry-run`), real suggestion publish + data-plane enforcement, and `--prune`. |
+| [`dns/`](dns) | 2 | Magic DNS resolution over a real TUN: `<host>.<net>.ray` resolves via the system resolver, drives reachability, no host `:53` bind, non-`.ray` passthrough, and `torpedo down` revert. |
+| [`reliability/`](reliability) | 4 | Full-mesh packet-loss test: every pair probed both ways with `ping -c 1000 -i 0.01`, ICMP flood, and iperf3 UDP, over the torpedo tunnel vs the direct public-IP baseline. Fails when torpedo adds loss over the raw link. |
 
 Everything runs through one dispatcher, [`../e2e.sh`](../e2e.sh):
 
@@ -49,4 +49,4 @@ under [`../bench/`](../bench) (same shared `tests/lib/`).
 | `TYPE` | `DEV1-S` | instance type (provision) |
 | `IMAGE` | `ubuntu_jammy` | instance image label (provision) |
 | `SSH_KEY` | `~/.ssh/id_ed25519` | private key for `root@<ip>` |
-| `KEEP_STATE` | `0` | `1` skips the per-run rayfish state wipe |
+| `KEEP_STATE` | `0` | `1` skips the per-run torpedo state wipe |

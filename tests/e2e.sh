@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Single entry point for the rayfish end-to-end / benchmark suites.
+# Single entry point for the torpedo end-to-end / benchmark suites.
 #
 #   ./tests/e2e.sh <scenario> [action]
 #
 # Scenarios:
 #   device-cert   3-peer device-cert / pairing test   (tests/e2e/device-cert)
-#   connect       2-peer `ray connect` direct test     (tests/e2e/connect)
+#   connect       2-peer `torpedo connect` direct test     (tests/e2e/connect)
 #   firewall      3-peer suggested-firewall + rule matrix (tests/e2e/firewall)
 #   closed-net    3-peer admission + lifecycle commands (tests/e2e/closed-net)
-#   apply         3-peer declarative `ray apply` deploy       (tests/e2e/apply)
+#   apply         3-peer declarative `torpedo apply` deploy       (tests/e2e/apply)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
-#   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
+#   ssh           2-peer mesh SSH (`torpedo firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   reliability   4-peer full-mesh packet-loss test (ping + iperf3 UDP) (tests/e2e/reliability)
 #   restore-offline 3-peer member-restore-with-coordinator-offline test (tests/e2e/restore-offline)
-#   unpair        3-peer `ray unpair` device-cert revocation test (tests/e2e/unpair)
+#   unpair        3-peer `torpedo unpair` device-cert revocation test (tests/e2e/unpair)
 #   bench         throughput / latency benchmark        (tests/bench)
 #
 # Actions:

@@ -9,21 +9,21 @@
 # direct QUIC connection. We then probe every unordered pair in BOTH directions,
 # over two paths:
 #   - direct   : the host's PUBLIC IP (raw Scaleway link, the baseline)
-#   - rayfish  : the peer's 100.64.x.x TUN IP (iroh QUIC datagrams over the VPN)
+#   - torpedo  : the peer's 100.64.x.x TUN IP (iroh QUIC datagrams over the VPN)
 #
 # Three probes per direction, each run over both paths:
 #   - ICMP burst : ping -c $PING_COUNT  -i 0.01      (100 pps)
 #   - ICMP flood : ping -f -c $FLOOD_COUNT           (as fast as the link allows)
 #   - iperf3 UDP : iperf3 -u -b $RATE -t $DURATION   (lost_packets / packets)
 #
-# rayfish carries datagrams unreliably (no retransmit), so any loss it ADDS on
+# torpedo carries datagrams unreliably (no retransmit), so any loss it ADDS on
 # top of the raw link points at the protocol (congestion control, MTU, relay
-# fallback, reader backpressure). To avoid blaming rayfish for genuine internet
-# drops, a probe FAILs only when the rayfish-path loss exceeds the direct-path
+# fallback, reader backpressure). To avoid blaming torpedo for genuine internet
+# drops, a probe FAILs only when the torpedo-path loss exceeds the direct-path
 # loss by more than $MARGIN percentage points; direct loss is always reported.
 #
 # Reads tests/e2e/reliability/.servers (written by provision.sh). Does NOT modify
-# infra. Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
+# infra. Re-runnable (resets torpedo state each run unless KEEP_STATE=1).
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -35,7 +35,7 @@ RATE="${RATE:-50M}"             # iperf3 UDP target bitrate
 DURATION="${DURATION:-10}"      # iperf3 seconds per run
 PING_COUNT="${PING_COUNT:-1000}"   # ICMP burst packets at 0.01s interval
 FLOOD_COUNT="${FLOOD_COUNT:-10000}" # ICMP flood packets
-MARGIN="${MARGIN:-0.5}"         # rayfish loss may exceed direct by this many pp
+MARGIN="${MARGIN:-0.5}"         # torpedo loss may exceed direct by this many pp
 
 # shellcheck source=../../lib/common.sh
 source "$ROOT/tests/lib/common.sh"
@@ -81,8 +81,8 @@ iperf_udp_loss(){
   echo "$json" | jq -r '(.end.sum.lost_percent // empty)' 2>/dev/null
 }
 
-# worse_by_margin <rayfish-loss> <direct-loss> : exit 0 if rayfish exceeds direct
-# by more than $MARGIN percentage points (treats empty rayfish loss as a failure
+# worse_by_margin <torpedo-loss> <direct-loss> : exit 0 if torpedo exceeds direct
+# by more than $MARGIN percentage points (treats empty torpedo loss as a failure
 # to measure -> worse; empty direct as 0).
 worse_by_margin(){
   local r="$1" d="$2"
@@ -91,13 +91,13 @@ worse_by_margin(){
   awk -v r="$r" -v d="$d" -v m="$MARGIN" 'BEGIN{exit !(r > d + m)}'
 }
 
-# assert_loss <label> <rayfish-loss> <direct-loss> : PASS/FAIL by the margin rule.
+# assert_loss <label> <torpedo-loss> <direct-loss> : PASS/FAIL by the margin rule.
 assert_loss(){
   local label="$1" r="$2" d="$3"
   if worse_by_margin "$r" "$d"; then
-    fail "$label  rayfish=${r:-?}%  direct=${d:-?}%  (> direct + ${MARGIN}pp)"
+    fail "$label  torpedo=${r:-?}%  direct=${d:-?}%  (> direct + ${MARGIN}pp)"
   else
-    pass "$label  rayfish=${r:-?}%  direct=${d:-?}%"
+    pass "$label  torpedo=${r:-?}%  direct=${d:-?}%"
   fi
 }
 
@@ -117,10 +117,10 @@ wait_daemons "${PUBS[@]}"
 # ---------------------------------------------------------------------------
 step "1. srv-a creates OPEN network '$NET'; srv-b/c/d join"
 A_PUB="${PUBS[0]}"
-CREATE="$(on "$A_PUB" "ray create --open --name $NET --hostname srv-a" | strip)"
+CREATE="$(on "$A_PUB" "torpedo create --open --name $NET --hostname srv-a" | strip)"
 echo "$CREATE" | sed 's/^/   a| /'
-ROOM="$(echo "$CREATE" | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1)"
-[[ -n "$ROOM" ]] || ROOM="$(on "$A_PUB" 'ray status' | strip | sed -n 's/.*\([A-Za-z0-9]\{40,\}\).*/\1/p' | head -1)"
+ROOM="$(echo "$CREATE" | sed -n 's/.*torpedo join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1)"
+[[ -n "$ROOM" ]] || ROOM="$(on "$A_PUB" 'torpedo status' | strip | sed -n 's/.*\([A-Za-z0-9]\{40,\}\).*/\1/p' | head -1)"
 [[ -n "$ROOM" ]] && pass "network '$NET' created (room ${ROOM:0:12}…)" || { fail "no room id"; summary; }
 
 # Join without --name so the joiner keeps the coordinator's network name
@@ -128,7 +128,7 @@ ROOM="$(echo "$CREATE" | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | h
 # the network and break `my_ip4 <ip> $NET` lookups below.)
 for i in 1 2 3; do
   L="${HOSTS[$i]}"
-  on "${PUBS[$i]}" "ray join $ROOM --hostname $L" 2>&1 | strip | sed "s/^/   ${L#srv-}| /"
+  on "${PUBS[$i]}" "torpedo join $ROOM --hostname $L" 2>&1 | strip | sed "s/^/   ${L#srv-}| /"
 done
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ done
 # Probe every unordered pair in both directions. Results also land in a report.
 RESDIR="$DIR/results"; mkdir -p "$RESDIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-RAW="$RESDIR/$STAMP.raw"; : > "$RAW"   # rows: from<TAB>to<TAB>probe<TAB>rayfish<TAB>direct
+RAW="$RESDIR/$STAMP.raw"; : > "$RAW"   # rows: from<TAB>to<TAB>probe<TAB>torpedo<TAB>direct
 
 # probe_pair <from-idx> <to-idx> : run all three probes both paths, assert, record.
 probe_pair(){
@@ -171,7 +171,7 @@ probe_pair(){
   printf '%s\t%s\tudp\t%s\t%s\n' "$from" "$to" "${r:-?}" "${d:-?}" >> "$RAW"
 }
 
-step "3. packet-loss probes over every mesh pair (rayfish vs direct baseline)"
+step "3. packet-loss probes over every mesh pair (torpedo vs direct baseline)"
 for i in "${!HOSTS[@]}"; do
   for ((j=i+1; j<${#HOSTS[@]}; j++)); do
     echo "   -- pair ${HOSTS[$i]} <-> ${HOSTS[$j]} --"
@@ -187,7 +187,7 @@ REPORT="$RESDIR/$STAMP.md"
   echo "# Rayfish reliability — $STAMP"
   echo
   echo "Four Scaleway instances, OPEN network full mesh."
-  echo "Loss % per probe; a probe fails when rayfish exceeds direct by > ${MARGIN}pp."
+  echo "Loss % per probe; a probe fails when torpedo exceeds direct by > ${MARGIN}pp."
   echo "icmp = ping -c $PING_COUNT -i 0.01; flood = ping -f -c $FLOOD_COUNT; udp = iperf3 -u -b $RATE -t ${DURATION}s."
   echo
   printf '| From | To | Probe | Rayfish loss | Direct loss |\n'

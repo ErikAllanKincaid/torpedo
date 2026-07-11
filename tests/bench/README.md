@@ -1,12 +1,12 @@
 # Rayfish throughput / latency benchmark
 
 Spins up **2 Scaleway instances in the same zone** and measures, for both
-directions, the cost rayfish adds on top of the raw link:
+directions, the cost torpedo adds on top of the raw link:
 
-- **latency** — `ping` mean RTT, direct (public IP) vs rayfish (`100.64.x.x` TUN)
-- **throughput** — `iperf3` TCP, direct vs rayfish, forward (`tx`) and reverse (`rx`)
+- **latency** — `ping` mean RTT, direct (public IP) vs torpedo (`100.64.x.x` TUN)
+- **throughput** — `iperf3` TCP, direct vs torpedo, forward (`tx`) and reverse (`rx`)
 
-The two peers join an **open** network (`ray create --open` / `ray join <room>`),
+The two peers join an **open** network (`torpedo create --open` / `torpedo join <room>`),
 so no invite handshake is needed.
 
 ## Prerequisites
@@ -32,8 +32,8 @@ Results are printed and saved to `results/<stamp>.md` (+ `.raw` TSV).
 ## Caveats
 
 `DEV1-S` has a single shared/burstable vCPU, so single-stream TCP is **CPU-bound**
-— rayfish's userspace TUN + iroh QUIC datagram encryption is the bottleneck, and
+— torpedo's userspace TUN + iroh QUIC datagram encryption is the bottleneck, and
 absolute numbers are noisy run-to-run. Use a larger `TYPE` (e.g. `DEV1-L`,
-`PRO2-S`) for steadier throughput; the *direct-vs-rayfish ratio* is the signal,
-not the absolute Mbit/s. rayfish also runs an MTU of 1280 (the IPv6 minimum, per
+`PRO2-S`) for steadier throughput; the *direct-vs-torpedo ratio* is the signal,
+not the absolute Mbit/s. torpedo also runs an MTU of 1280 (the IPv6 minimum, per
 WireGuard/Tailscale), which caps per-packet payload below the link's native MTU.

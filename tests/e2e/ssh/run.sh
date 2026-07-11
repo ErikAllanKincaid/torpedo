@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mesh SSH (`ray firewall ssh`) e2e test orchestrator.
+# Mesh SSH (`torpedo firewall ssh`) e2e test orchestrator.
 #
 # Topology:
 #   srv-a  coordinator of a closed network `ssh`; the SSH *server*
@@ -47,18 +47,18 @@ wait_all_ssh "$A" "$B"
 seed_known_hosts "$A" "$B"
 reset_state "$A" "$B"
 deploy_all "$ROOT" "$A" "$B"
-for h in "$A" "$B"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
+for h in "$A" "$B"; do on "$h" 'torpedo up' >/dev/null 2>&1 || true; done
 wait_daemons "$A" "$B"
 
 # ---------------------------------------------------------------------------
 step "1. srv-a creates the closed network; srv-b joins via invite"
-on "$A" "ray create --name $NET --hostname srv-a" | strip | sed 's/^/   a| /'
+on "$A" "torpedo create --name $NET --hostname srv-a" | strip | sed 's/^/   a| /'
 INV_B="$(mint_invite "$A" "$NET" srv-b)"
 [[ -n "$INV_B" ]] && pass "minted invite for srv-b" || fail "invite mint failed"
-on "$B" "ray join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
+on "$B" "torpedo join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
 wait_roster "$A" srv-b
 
-SA="$(on "$A" 'ray status' | strip)"; SB="$(on "$B" 'ray status' | strip)"
+SA="$(on "$A" 'torpedo status' | strip)"; SB="$(on "$B" 'torpedo status' | strip)"
 A_IP="$(own_ip "$SA")"; B_IP="$(own_ip "$SB")"
 echo "   A mesh ip=$A_IP  B mesh ip=$B_IP"
 [[ -n "$A_IP" && -n "$B_IP" ]] && pass "both have a mesh IP" || fail "missing mesh IP(s)"
@@ -76,12 +76,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "3. ray firewall ssh on — server starts, tcp:22 passthrough seeded"
-on "$A" 'ray firewall ssh on' | strip | sed 's/^/   a| /'
-SHOW="$(on "$A" 'ray firewall ssh show' | strip)"
+step "3. torpedo firewall ssh on — server starts, tcp:22 passthrough seeded"
+on "$A" 'torpedo firewall ssh on' | strip | sed 's/^/   a| /'
+SHOW="$(on "$A" 'torpedo firewall ssh show' | strip)"
 echo "$SHOW" | sed 's/^/   a| /'
 echo "$SHOW" | grep -qi 'on' && pass "ssh show reports on" || fail "ssh show did not report on"
-on "$A" 'ray firewall show' | strip | grep -Ei '22.*ssh|ssh.*22' \
+on "$A" 'torpedo firewall show' | strip | grep -Ei '22.*ssh|ssh.*22' \
   && pass "tcp:22 passthrough present (tagged ssh)" \
   || fail "tcp:22 passthrough not found in firewall show"
 
@@ -98,11 +98,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "5. ray firewall ssh allow srv-b — default grants any non-root user only"
+step "5. torpedo firewall ssh allow srv-b — default grants any non-root user only"
 # Create a plain user on srv-a; the default allow (no --user) permits non-root
 # logins but must NOT permit root.
 on "$A" 'id meshtest >/dev/null 2>&1 || useradd -m -s /bin/bash meshtest' >/dev/null 2>&1
-on "$A" "ray firewall ssh allow $NET srv-b" | strip | sed 's/^/   a| /'
+on "$A" "torpedo firewall ssh allow $NET srv-b" | strip | sed 's/^/   a| /'
 # root is denied under the default (non-root) policy.
 OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
@@ -151,7 +151,7 @@ echo "   b| carriage-returns in output: ${CR:-?}"
 
 # ---------------------------------------------------------------------------
 step "5d. --user '*' grants root explicitly"
-on "$A" "ray firewall ssh allow $NET srv-b --user '*'" | strip | sed 's/^/   a| /'
+on "$A" "torpedo firewall ssh allow $NET srv-b --user '*'" | strip | sed 's/^/   a| /'
 OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -qi '^root' && pass "root login allowed once '*' is granted" \
@@ -162,7 +162,7 @@ step "5e. --user deploy restricts to a single named account"
 # Setting the rule to a single user replaces the prior '*'. Only `deploy` may log
 # in: the named user works, but root AND any other non-root user are denied.
 on "$A" 'id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash deploy' >/dev/null 2>&1
-on "$A" "ray firewall ssh allow $NET srv-b --user deploy" | strip | sed 's/^/   a| /'
+on "$A" "torpedo firewall ssh allow $NET srv-b --user deploy" | strip | sed 's/^/   a| /'
 # the named user is admitted
 OUT="$(ssh_try "$B" "$A_IP" whoami deploy)"
 echo "$OUT" | sed 's/^/   b| /'
@@ -182,8 +182,8 @@ echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
   || fail "root should be denied when only 'deploy' is allowed: $OUT"
 
 # ---------------------------------------------------------------------------
-step "6. ray firewall ssh deny srv-b — access revoked"
-on "$A" "ray firewall ssh deny $NET srv-b" | strip | sed 's/^/   a| /'
+step "6. torpedo firewall ssh deny srv-b — access revoked"
+on "$A" "torpedo firewall ssh deny $NET srv-b" | strip | sed 's/^/   a| /'
 OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
@@ -192,16 +192,16 @@ echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
 
 # ---------------------------------------------------------------------------
 step "7. wildcard peer allow (* with --user '*') admits any peer as any user"
-on "$A" "ray firewall ssh allow $NET '*' --user '*'" | strip | sed 's/^/   a| /'
+on "$A" "torpedo firewall ssh allow $NET '*' --user '*'" | strip | sed 's/^/   a| /'
 OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -qi '^root' && pass "wildcard allow admits srv-b as root" \
   || fail "wildcard allow did not admit srv-b: $OUT"
 
 # ---------------------------------------------------------------------------
-step "8. ray firewall ssh off — port closes again"
-on "$A" 'ray firewall ssh off' | strip | sed 's/^/   a| /'
-on "$A" 'ray firewall show' | strip | grep -Ei '22.*ssh|ssh.*22' \
+step "8. torpedo firewall ssh off — port closes again"
+on "$A" 'torpedo firewall ssh off' | strip | sed 's/^/   a| /'
+on "$A" 'torpedo firewall show' | strip | grep -Ei '22.*ssh|ssh.*22' \
   && fail "tcp:22 passthrough still present after ssh off" \
   || pass "tcp:22 passthrough removed after ssh off"
 OUT="$(ssh_try "$B" "$A_IP" whoami)"

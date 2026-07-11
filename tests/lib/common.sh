@@ -1,4 +1,4 @@
-# Shared helpers for the rayfish e2e / benchmark test orchestrators.
+# Shared helpers for the torpedo e2e / benchmark test orchestrators.
 # Sourced (not executed) by each scenario's run.sh after it sets DIR/ROOT/SERVERS.
 # Provides SSH plumbing, PASS/FAIL accounting, and host-lifecycle helpers
 # (wait-for-ssh, state reset, deploy, daemon-up) so the run.sh scripts contain
@@ -28,7 +28,7 @@ summary(){
 # -n: never read stdin, so calling `on` inside a `while read` loop can't eat it.
 on(){ local ip="$1"; shift; ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"; }
 
-# strip : remove ANSI colour codes from rayfish CLI output (stdin -> stdout).
+# strip : remove ANSI colour codes from torpedo CLI output (stdin -> stdout).
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
 # own_ip <status-text> : extract a node's own VPN IPv4 (100.64.0.0/10 CGNAT range).
@@ -75,21 +75,21 @@ seed_known_hosts(){
 
 # reset_state <ip...> : clean-slate the daemon (stop + wipe the config tree) so
 # runs are reproducible on already-used servers. Set KEEP_STATE=1 to skip.
-# Linux config lives in /etc/rayfish; /root/.config/rayfish is the pre-migration
+# Linux config lives in /etc/torpedo; /root/.config/torpedo is the pre-migration
 # location (wiped too so an upgraded VM doesn't migrate stale state back in).
 reset_state(){
   [[ "${KEEP_STATE:-0}" == "1" ]] && return 0
-  step "reset rayfish state on all hosts (KEEP_STATE=1 to skip)"
+  step "reset torpedo state on all hosts (KEEP_STATE=1 to skip)"
   local h
   for h in "$@"; do
-    on "$h" 'systemctl stop rayfish 2>/dev/null; rm -rf /etc/rayfish /root/.config/rayfish' && echo "   reset $h"
+    on "$h" 'systemctl stop torpedo 2>/dev/null; rm -rf /etc/torpedo /root/.config/torpedo' && echo "   reset $h"
   done
 }
 
-# deploy_all <root> <ip...> : cross-build + rsync + ray up on each host; abort on failure.
+# deploy_all <root> <ip...> : cross-build + rsync + torpedo up on each host; abort on failure.
 deploy_all(){
   local root="$1"; shift
-  step "deploy ray to all hosts (cross build + rsync + ray up)"
+  step "deploy torpedo to all hosts (cross build + rsync + torpedo up)"
   local ip
   for ip in "$@"; do
     echo ">> just deploy $ip"
@@ -97,12 +97,12 @@ deploy_all(){
   done
 }
 
-# wait_daemons <ip...> : give daemons a moment to settle, then confirm `ray status` responds.
+# wait_daemons <ip...> : give daemons a moment to settle, then confirm `torpedo status` responds.
 wait_daemons(){
   sleep 5
   local ip
   for ip in "$@"; do
-    if on "$ip" 'ray status' >/dev/null 2>&1; then pass "daemon up on $ip"; else fail "daemon not responding on $ip"; fi
+    if on "$ip" 'torpedo status' >/dev/null 2>&1; then pass "daemon up on $ip"; else fail "daemon not responding on $ip"; fi
   done
 }
 
@@ -113,8 +113,8 @@ wait_daemons(){
 # jq is already a provisioning prerequisite (see tests/e2e/README.md).
 # ---------------------------------------------------------------------------
 
-# status_json <ip> : echo `ray status --json` from a host (raw JSON).
-status_json(){ on "$1" 'ray status --json' 2>/dev/null; }
+# status_json <ip> : echo `torpedo status --json` from a host (raw JSON).
+status_json(){ on "$1" 'torpedo status --json' 2>/dev/null; }
 
 # my_ip4 <ip> [net] : this node's own VPN IPv4 — for the named network, or the
 # first network if omitted. Empty if none.
@@ -248,15 +248,15 @@ fw_denies(){
 }
 
 # fw_pending_count <ip> <net> : number of suggested rules queued for review on a
-# node (from `ray firewall pending <net> --json`).
+# node (from `torpedo firewall pending <net> --json`).
 fw_pending_count(){
-  on "$1" "ray firewall pending $2 --json" 2>/dev/null | jq -r '(.rules // []) | length'
+  on "$1" "torpedo firewall pending $2 --json" 2>/dev/null | jq -r '(.rules // []) | length'
 }
 
 # fw_suggested_count <ip> [net] : number of *installed* rules tagged as suggested
-# (optionally by a specific network), from `ray firewall show --json`.
+# (optionally by a specific network), from `torpedo firewall show --json`.
 fw_suggested_count(){
-  on "$1" 'ray firewall show --json' 2>/dev/null | jq -r --arg n "${2:-}" \
+  on "$1" 'torpedo firewall show --json' 2>/dev/null | jq -r --arg n "${2:-}" \
     '[ (.rules // [])[] | select(.suggested_by != null) | select($n == "" or .suggested_by == $n) ] | length'
 }
 
@@ -267,25 +267,25 @@ fw_suggested_count(){
 # mint_invite <coord-ip> <net> <hostname> : mint a single-use, hostname-bound
 # invite and echo its join code.
 mint_invite(){
-  on "$1" "ray invite $2 create --hostname $3" | strip \
-    | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1
+  on "$1" "torpedo invite $2 create --hostname $3" | strip \
+    | sed -n 's/.*torpedo join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1
 }
 
 # mint_reusable <coord-ip> <net> : mint a reusable (multi-use) key, echo the code.
 mint_reusable(){
-  on "$1" "ray invite $2 create --reusable" | strip \
-    | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1
+  on "$1" "torpedo invite $2 create --reusable" | strip \
+    | sed -n 's/.*torpedo join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1
 }
 
 # request_id <coord-ip> <net> <hostname> : the short id of a queued join request
-# matching <hostname> (from `ray requests <net> --json`). Empty if none.
+# matching <hostname> (from `torpedo requests <net> --json`). Empty if none.
 request_id(){
-  on "$1" "ray requests $2 --json" 2>/dev/null \
+  on "$1" "torpedo requests $2 --json" 2>/dev/null \
     | jq -r --arg h "$3" 'map(select((.hostname // "") == $h)) | .[0].id // empty'
 }
 
 # peer_endpoint <ip> <peer-hostname> [net] : a peer's full endpoint id as seen by
-# <ip> (for `ray admin add`, which prefix-matches). Empty if absent.
+# <ip> (for `torpedo admin add`, which prefix-matches). Empty if absent.
 peer_endpoint(){
   status_json "$1" | jq -r --arg h "$2" --arg n "${3:-}" '
     (.networks // [])
@@ -293,25 +293,25 @@ peer_endpoint(){
     | [ .[].peers[] | select((.hostname // "") == $h) ] | .[0].endpoint_id // empty'
 }
 
-# send_recv <from-ip> <to-ip> <to-peer-hostname> <label> : ray send a 1MiB random
-# file and verify the sha256 round-trips after `ray files accept`. SR_PREFIX sets
+# send_recv <from-ip> <to-ip> <to-peer-hostname> <label> : torpedo send a 1MiB random
+# file and verify the sha256 round-trips after `torpedo files accept`. SR_PREFIX sets
 # the temp-file path prefix (default /tmp/ray_e2e).
 send_recv(){
   local from="$1" to="$2" peer="$3" label="$4"
   local pfx="${SR_PREFIX:-/tmp/ray_e2e}"
   on "$from" "head -c 1048576 /dev/urandom > ${pfx}_src.bin; sha256sum ${pfx}_src.bin | cut -d' ' -f1 > ${pfx}_src.sha"
   local src_sha; src_sha="$(on "$from" "cat ${pfx}_src.sha")"
-  on "$from" "ray send ${pfx}_src.bin $peer" 2>&1 | strip | sed 's/^/      send| /'
-  # `ray files` rows are `<id> <from> <size> <file> …` with a numeric id; the
+  on "$from" "torpedo send ${pfx}_src.bin $peer" 2>&1 | strip | sed 's/^/      send| /'
+  # `torpedo files` rows are `<id> <from> <size> <file> …` with a numeric id; the
   # header row's first column is the literal "id", so match a numeric id.
   local fid=""
   for _ in $(seq 1 12); do
-    fid="$(on "$to" 'ray files' 2>/dev/null | strip | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')"
+    fid="$(on "$to" 'torpedo files' 2>/dev/null | strip | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')"
     [[ -n "$fid" ]] && break
     sleep 3
   done
   if [[ -z "$fid" ]]; then fail "$label: no incoming file offer on receiver"; return; fi
-  on "$to" "rm -rf ${pfx}_recv && mkdir -p ${pfx}_recv && ray files accept $fid --output ${pfx}_recv" 2>&1 | strip | sed 's/^/      recv| /'
+  on "$to" "rm -rf ${pfx}_recv && mkdir -p ${pfx}_recv && torpedo files accept $fid --output ${pfx}_recv" 2>&1 | strip | sed 's/^/      recv| /'
   local dst_sha=""
   for _ in $(seq 1 10); do
     dst_sha="$(on "$to" "f=\$(find ${pfx}_recv -type f | head -1); [ -n \"\$f\" ] && sha256sum \"\$f\" | cut -d' ' -f1")"

@@ -7,7 +7,7 @@
 #
 # Proves the parts of the TUN-intercepted Magic DNS resolver that unit tests
 # can't reach end to end, on real Linux hosts:
-#   - after `ray up` + join, a peer's `<host>.<net>.ray` resolves through the
+#   - after `torpedo up` + join, a peer's `<host>.<net>.ray` resolves through the
 #     *system* resolver (getent/libc) to its VPN IPv4 — i.e. the OS was pointed
 #     at the magic resolver IP and the in-daemon resolver answered it;
 #   - resolution drives real reachability (ping by name);
@@ -16,13 +16,13 @@
 #     AdGuard/Pi-hole/umbrelOS case) by construction;
 #   - non-`.ray` names still resolve while the VPN is up (split-DNS passthrough,
 #     or the resolver forwarding to the captured upstream);
-#   - `ray down` reverts system DNS: `.ray` names stop resolving;
+#   - `torpedo down` reverts system DNS: `.ray` names stop resolving;
 #   - (conditional) on a host that fell to the direct `/etc/resolv.conf` takeover,
-#     resolv.conf carries the magic IP under the rayfish marker while up, and the
+#     resolv.conf carries the magic IP under the torpedo marker while up, and the
 #     original is restored on down.
 #
 # Reads tests/e2e/dns/.servers (written by provision.sh). Does NOT modify infra.
-# Re-runnable (resets rayfish state each run unless KEEP_STATE=1).
+# Re-runnable (resets torpedo state each run unless KEEP_STATE=1).
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -50,18 +50,18 @@ wait_all_ssh "$A" "$B"
 seed_known_hosts "$A" "$B"
 reset_state "$A" "$B"
 deploy_all "$ROOT" "$A" "$B"
-for h in "$A" "$B"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
+for h in "$A" "$B"; do on "$h" 'torpedo up' >/dev/null 2>&1 || true; done
 wait_daemons "$A" "$B"
 
 # ---------------------------------------------------------------------------
 step "1. srv-a creates the closed network; srv-b joins via invite"
-CREATE="$(on "$A" "ray create --name $NET --hostname srv-a" | strip)"
+CREATE="$(on "$A" "torpedo create --name $NET --hostname srv-a" | strip)"
 echo "$CREATE" | sed 's/^/   a| /'
 has_net "$A" "$NET" && pass "network '$NET' present on coordinator" || fail "create failed"
 
 INV_B="$(mint_invite "$A" "$NET" srv-b)"
 [[ -n "$INV_B" ]] && pass "minted invite for srv-b" || fail "invite mint failed"
-on "$B" "ray join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
+on "$B" "torpedo join $INV_B --hostname srv-b" 2>&1 | strip | sed 's/^/   b| /'
 wait_roster "$A" srv-b
 
 A_IP="$(my_ip4 "$A" "$NET")"; B_IP="$(my_ip4 "$B" "$NET")"
@@ -94,18 +94,18 @@ png "$B" "srv-a.$NET.ray" "srv-b pings srv-a by .ray name"
 step "4. the resolver does NOT bind host port 53 (coexists with any :53 server)"
 # The new architecture answers DNS via a magic IP routed through the TUN, never
 # a host socket — so it never competes for :53 with AdGuard/Pi-hole/dnsmasq.
-# Assert the ray daemon owns no :53 listener (UDP or TCP) on either host.
+# Assert the torpedo daemon owns no :53 listener (UDP or TCP) on either host.
 for h in "$A" "$B"; do
   RAY53="$(on "$h" "ss -lntup 2>/dev/null | grep ':53 ' | grep -c ray || true")"
   [[ "${RAY53:-0}" == "0" ]] \
-    && pass "ray daemon holds no :53 socket on $h (coexists by design)" \
-    || fail "ray daemon is bound to :53 on $h — should answer via the TUN magic IP"
+    && pass "torpedo daemon holds no :53 socket on $h (coexists by design)" \
+    || fail "torpedo daemon is bound to :53 on $h — should answer via the TUN magic IP"
 done
 
 # ---------------------------------------------------------------------------
 step "5. non-.ray names still resolve while the VPN is up"
 # Split-DNS hosts pass these straight to the system resolvers; direct-mode hosts
-# forward them through rayfish to the captured upstream. Either way, a public
+# forward them through torpedo to the captured upstream. Either way, a public
 # name must still resolve — the feature must not black-hole non-.ray DNS.
 for h in "$A" "$B"; do
   if retry_until 30 "[[ -n \"\$(a4 '$h' one.one.one.1)\" || -n \"\$(a4 '$h' dns.google)\" ]]"; then
@@ -118,10 +118,10 @@ done
 # ---------------------------------------------------------------------------
 step "6. (conditional) direct-mode /etc/resolv.conf takeover + restore"
 # Only meaningful on a host that fell to the direct manager (no split-DNS
-# backend). Detect by the rayfish marker; skip cleanly on split-DNS hosts.
+# backend). Detect by the torpedo marker; skip cleanly on split-DNS hosts.
 DIRECT_HOST=""
 for h in "$A" "$B"; do
-  if on "$h" 'grep -q "Added by rayfish" /etc/resolv.conf 2>/dev/null'; then DIRECT_HOST="$h"; break; fi
+  if on "$h" 'grep -q "Added by torpedo" /etc/resolv.conf 2>/dev/null'; then DIRECT_HOST="$h"; break; fi
 done
 if [[ -z "$DIRECT_HOST" ]]; then
   echo "   (no host used the direct resolv.conf takeover — split-DNS path; skipping)"
@@ -132,20 +132,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "7. ray down reverts system DNS — .ray stops resolving"
-on "$B" 'ray down' 2>&1 | strip | sed 's/^/   b| /'
+step "7. torpedo down reverts system DNS — .ray stops resolving"
+on "$B" 'torpedo down' 2>&1 | strip | sed 's/^/   b| /'
 if retry_until 30 "[[ -z \"\$(a4 '$B' srv-a.$NET.ray)\" ]]"; then
-  pass "after 'ray down', srv-b no longer resolves srv-a.$NET.ray"
+  pass "after 'torpedo down', srv-b no longer resolves srv-a.$NET.ray"
 else
-  fail "srv-b still resolves .ray after 'ray down' (DNS not reverted)"
+  fail "srv-b still resolves .ray after 'torpedo down' (DNS not reverted)"
 fi
 if [[ -n "$DIRECT_HOST" && "$DIRECT_HOST" == "$B" ]]; then
-  on "$B" '! grep -q "Added by rayfish" /etc/resolv.conf' \
-    && pass "direct mode: /etc/resolv.conf restored (rayfish marker gone) after down" \
-    || fail "direct mode: rayfish marker still in /etc/resolv.conf after down"
+  on "$B" '! grep -q "Added by torpedo" /etc/resolv.conf' \
+    && pass "direct mode: /etc/resolv.conf restored (torpedo marker gone) after down" \
+    || fail "direct mode: torpedo marker still in /etc/resolv.conf after down"
 fi
 # Restore srv-b for re-runs / a clean end state.
-on "$B" 'ray up' >/dev/null 2>&1 || true
+on "$B" 'torpedo up' >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 summary

@@ -1,6 +1,6 @@
 # Unpair (device-cert revocation) 3-peer e2e test
 
-End-to-end test that `ray unpair` revokes a paired device mesh-wide, enforced
+End-to-end test that `torpedo unpair` revokes a paired device mesh-wide, enforced
 verifier-side via a **cert-generation floor**. Builds on the device-cert
 topology: a user identity backed by two physical devices, then the primary
 unpairs the second (bumps its generation, publishes the new floor, drops the
@@ -11,18 +11,18 @@ device).
 | Host  | Identity | Role |
 |-------|----------|------|
 | srv-a | U        | primary device, coordinator of the closed network |
-| srv-b | U (DeviceCert) | paired into A's identity via `ray pair` |
+| srv-b | U (DeviceCert) | paired into A's identity via `torpedo pair` |
 | srv-c | V        | independent third peer, also a member |
 
 ## What it proves
 
-1. `ray pair list` on the primary shows the paired secondary.
-2. `ray unpair srv-b` bumps srv-a's cert generation and publishes the new
-   `_rayfish_certgen` floor, removes srv-b from the roster, and severs it.
+1. `torpedo pair list` on the primary shows the paired secondary.
+2. `torpedo unpair srv-b` bumps srv-a's cert generation and publishes the new
+   `_torpedo_certgen` floor, removes srv-b from the roster, and severs it.
 3. The floor propagates: srv-c (a different user) can no longer reach srv-b after
    its poller/reconverge picks up the floor and prunes it.
 4. srv-b cannot re-join — its cert is below the floor at admission.
-5. A secondary is refused (`ray unpair` is primary-only).
+5. A secondary is refused (`torpedo unpair` is primary-only).
 6. Best-effort: srv-b's on-disk `device_cert` is wiped (informational, since the
    authoritative revocation is the signed floor, not the wipe).
 

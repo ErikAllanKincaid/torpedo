@@ -3,7 +3,7 @@
 #
 # Topology (see docs/superpowers/specs/2026-06-24-device-cert-e2e-design.md):
 #   srv-a  identity U   primary device + coordinator of a closed network
-#   srv-b  identity U   paired into A's identity via a DeviceCert (ray pair)
+#   srv-b  identity U   paired into A's identity via a DeviceCert (torpedo pair)
 #   srv-c  identity V   independent third peer
 #
 # Proves that C can ping + ray-send to the U identity regardless of which
@@ -36,20 +36,20 @@ wait_daemons "$A" "$B" "$C"
 
 # ---------------------------------------------------------------------------
 step "2. pair srv-b into srv-a's identity (device cert)"
-A_ENDPOINT="$(on "$A" 'ray status' | strip | awk '/endpoint/{print $2}')"
+A_ENDPOINT="$(on "$A" 'torpedo status' | strip | awk '/endpoint/{print $2}')"
 echo "   srv-a endpoint/identity: $A_ENDPOINT"
 
-# `ray pair` on A arms the daemon's pairing accept loop and prints a ticket.
-TICKET="$(on "$A" 'ray pair' | strip | awk -F': ' '/Pairing ticket/{print $2}' | tr -d ' ')"
+# `torpedo pair` on A arms the daemon's pairing accept loop and prints a ticket.
+TICKET="$(on "$A" 'torpedo pair' | strip | awk -F': ' '/Pairing ticket/{print $2}' | tr -d ' ')"
 if [[ -z "$TICKET" ]]; then fail "could not obtain pairing ticket from srv-a"; else
   echo "   ticket: ${TICKET:0:16}…"
   # B accepts; retry a few times in case it races the arm on A.
   B_PAIR=""
   for _ in 1 2 3 4 5; do
-    B_PAIR="$(on "$B" "ray pair $TICKET" | strip)"
+    B_PAIR="$(on "$B" "torpedo pair $TICKET" | strip)"
     echo "$B_PAIR" | grep -qi 'Paired successfully' && break
     sleep 3
-    TICKET="$(on "$A" 'ray pair' | strip | awk -F': ' '/Pairing ticket/{print $2}' | tr -d ' ')"
+    TICKET="$(on "$A" 'torpedo pair' | strip | awk -F': ' '/Pairing ticket/{print $2}' | tr -d ' ')"
   done
   echo "$B_PAIR" | sed 's/^/   | /'
   B_USER="$(echo "$B_PAIR" | awk -F': ' '/User identity/{print $2}' | tr -d ' ')"
@@ -65,27 +65,27 @@ if [[ -z "$TICKET" ]]; then fail "could not obtain pairing ticket from srv-a"; e
   fi
 fi
 
-# `ray pair` stores the device cert to disk but does NOT refresh the running
+# `torpedo pair` stores the device cert to disk but does NOT refresh the running
 # daemon's in-memory copy (self.device_cert). A join in the same session would
 # therefore omit the cert and the coordinator would record srv-b as an
 # independent identity instead of user U. Restart srv-b so it loads the cert
 # from disk before joining. (See run notes — this restart works around a real
 # product bug.)
 echo ">> restarting srv-b daemon so it loads the new device cert before joining"
-on "$B" 'systemctl restart rayfish' >/dev/null 2>&1
-for _ in $(seq 1 20); do on "$B" 'ray status' >/dev/null 2>&1 && break; sleep 3; done
+on "$B" 'systemctl restart torpedo' >/dev/null 2>&1
+for _ in $(seq 1 20); do on "$B" 'torpedo status' >/dev/null 2>&1 && break; sleep 3; done
 pass "srv-b daemon restarted (device cert loaded)"
 
 # ---------------------------------------------------------------------------
 step "3. create closed network on srv-a + mint hostname-bound invites"
 NET=e2e
 # Closed is the default (no flag); invites gate admission.
-CREATE="$(on "$A" "ray create --name $NET --hostname srv-a" | strip)"
+CREATE="$(on "$A" "torpedo create --name $NET --hostname srv-a" | strip)"
 echo "$CREATE" | sed 's/^/   | /'
-ROOM="$(echo "$CREATE" | sed -n 's/.*ray join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1)"
+ROOM="$(echo "$CREATE" | sed -n 's/.*torpedo join \([A-Za-z0-9]\{20,\}\).*/\1/p' | head -1)"
 if [[ -n "$ROOM" ]]; then pass "network '$NET' created (room ${ROOM:0:12}…)"; else
   # maybe it already exists from a previous run
-  on "$A" "ray status" | strip | grep -q "$NET" && { pass "network '$NET' already exists"; } || fail "network create failed"
+  on "$A" "torpedo status" | strip | grep -q "$NET" && { pass "network '$NET' already exists"; } || fail "network create failed"
 fi
 
 # mint_invite (coord-ip, net, hostname) comes from common.sh.
@@ -97,23 +97,23 @@ INV_C="$(mint_invite "$A" "$NET" srv-c)"
 # ---------------------------------------------------------------------------
 step "4. srv-b and srv-c join the closed network"
 if [[ -n "$INV_B" ]]; then
-  on "$B" "ray join $INV_B" 2>&1 | strip | sed 's/^/   b| /'
+  on "$B" "torpedo join $INV_B" 2>&1 | strip | sed 's/^/   b| /'
 fi
 if [[ -n "$INV_C" ]]; then
-  on "$C" "ray join $INV_C" 2>&1 | strip | sed 's/^/   c| /'
+  on "$C" "torpedo join $INV_C" 2>&1 | strip | sed 's/^/   c| /'
 fi
 # Backstop: admit anything queued (a valid invite should auto-admit).
 sleep 3
-REQ="$(on "$A" "ray requests $NET" 2>/dev/null | strip || true)"
+REQ="$(on "$A" "torpedo requests $NET" 2>/dev/null | strip || true)"
 echo "$REQ" | grep -qiE '[0-9a-f]{6,}' && { echo "   pending requests found, accepting:"; echo "$REQ" | sed 's/^/   r| /'; \
-  echo "$REQ" | awk '/^ /{print $1}' | while read -r rid; do [[ -n "$rid" ]] && on "$A" "ray accept $NET $rid" | strip | sed 's/^/   a| /'; done; }
+  echo "$REQ" | awk '/^ /{print $1}' | while read -r rid; do [[ -n "$rid" ]] && on "$A" "torpedo accept $NET $rid" | strip | sed 's/^/   a| /'; done; }
 
 # ---------------------------------------------------------------------------
 step "5. wait for roster convergence (A, B, C all visible)"
 # wait_roster (common.sh) blocks until the coordinator sees both members online
-# (parsed from `ray status --json`, not table-grep) and PASS/FAILs.
+# (parsed from `torpedo status --json`, not table-grep) and PASS/FAILs.
 wait_roster "$A" srv-b srv-c
-SA="$(on "$A" 'ray status' | strip)"; SB="$(on "$B" 'ray status' | strip)"; SC="$(on "$C" 'ray status' | strip)"
+SA="$(on "$A" 'torpedo status' | strip)"; SB="$(on "$B" 'torpedo status' | strip)"; SC="$(on "$C" 'torpedo status' | strip)"
 echo "---- srv-a status ----"; echo "$SA" | sed 's/^/   a| /'
 echo "---- srv-b status ----"; echo "$SB" | sed 's/^/   b| /'
 echo "---- srv-c status ----"; echo "$SC" | sed 's/^/   c| /'
@@ -153,13 +153,13 @@ step "7. reachability — ping over the TUN (both directions)"
 [[ -n "$B_IP" && -n "$C_IP" ]] && png "$B" "$C_IP" "srv-b -> srv-c ($C_IP)"
 
 # ---------------------------------------------------------------------------
-step "8. data transfer — ray send / ray files accept"
+step "8. data transfer — torpedo send / torpedo files accept"
 # send_recv (1MiB random file, sha256 round-trip) comes from common.sh.
 # C reaches BOTH physical devices backing identity U, addressed by hostname:
-send_recv "$C" "$A" srv-a "ray send srv-c -> srv-a (device A of identity U)"
-send_recv "$C" "$B" srv-b "ray send srv-c -> srv-b (device B of identity U)"
+send_recv "$C" "$A" srv-a "torpedo send srv-c -> srv-a (device A of identity U)"
+send_recv "$C" "$B" srv-b "torpedo send srv-c -> srv-b (device B of identity U)"
 # reverse direction: a U device -> C
-send_recv "$A" "$C" srv-c "ray send srv-a -> srv-c (reverse)"
+send_recv "$A" "$C" srv-c "torpedo send srv-a -> srv-c (reverse)"
 
 # ---------------------------------------------------------------------------
 summary

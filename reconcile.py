@@ -2,7 +2,7 @@
 # reconcile.py -- run from ~/code/torpedo
 # Usage: python3 reconcile.py
 #
-# Checks the automatable constraints (CON-001..CON-010) from spec/design_spec.py.
+# Checks the automatable constraints (CON-001..CON-011) from spec/design_spec.py.
 # It does NOT check the Requirement classes (SUBNET-*/RENAME-*); those are
 # structural/design requirements verified by reading the diff and code directly.
 import json
@@ -165,9 +165,40 @@ def check_cli_reference_identity() -> dict:
     names), `stingray`/`array` (substrings), or `rayfish`. Every match is a
     stale CLI/binary reference that should read `torpedo`."""
     pat = re.compile(r"(?<![.\w-])ray (?=[a-z])")
+    targets = list(Path("src").rglob("*.rs"))
+    if Path("tests").is_dir():
+        targets += [p for p in Path("tests").rglob("*") if p.is_file()]
     n = 0
-    for p in Path("src").rglob("*.rs"):
+    for p in targets:
         n += len(pat.findall(p.read_text()))
+    return {"unexpected_count": n}
+
+
+def check_test_harness_identity() -> dict:
+    """CON-011/RENAME-017: the e2e/bench harness under `tests/` must not carry the
+    pre-fork `rayfish` service/config/marker/record identity — those references
+    are FUNCTIONAL (the scripts run against a `torpedo` binary/service), so a
+    stale token silently breaks the test rather than being cosmetic. Curated set,
+    so it never trips on the KEEP `NAMES=(rayfish-*)` Scaleway instance labels
+    (bare `rayfish`, deliberately retained) or the `.ray` TLD."""
+    tokens = [
+        "systemctl stop rayfish",
+        "systemctl start rayfish",
+        "systemctl restart rayfish",
+        "/etc/rayfish",
+        "/root/.config/rayfish",
+        "Added by rayfish",  # /etc/resolv.conf takeover marker (RENAME-006)
+        "_rayfish_certgen",  # pkarr cert-generation record name
+        "rayfish/files/1",  # FILES_ALPN
+    ]
+    n = 0
+    if Path("tests").is_dir():
+        for p in Path("tests").rglob("*"):
+            if not p.is_file():
+                continue
+            text = p.read_text()
+            for t in tokens:
+                n += text.count(t)
     return {"unexpected_count": n}
 
 
@@ -183,6 +214,7 @@ if __name__ == "__main__":
         "build_tooling_identity": check_build_tooling_identity(),
         "report_identity": check_report_identity(),
         "cli_reference_identity": check_cli_reference_identity(),
+        "test_harness_identity": check_test_harness_identity(),
     }
     print(json.dumps(ctx, indent=2))
     ok = (
@@ -196,5 +228,6 @@ if __name__ == "__main__":
         and ctx["build_tooling_identity"]["unexpected_count"] == 0
         and ctx["report_identity"]["unexpected_count"] == 0
         and ctx["cli_reference_identity"]["unexpected_count"] == 0
+        and ctx["test_harness_identity"]["unexpected_count"] == 0
     )
     sys.exit(0 if ok else 1)

@@ -31,8 +31,8 @@ on(){ local ip="$1"; shift; ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"; }
 # strip : remove ANSI colour codes from torpedo CLI output (stdin -> stdout).
 strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
-# own_ip <status-text> : extract a node's own VPN IPv4 (100.64.0.0/10 CGNAT range).
-own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+# own_ip <status-text> : extract a node's own VPN IPv4 (10.88.0.0/16 CGNAT range).
+own_ip(){ echo "$1" | grep -oE '10\.88\.[0-9]+\.[0-9]+' | head -1; }
 
 # peer_host <status-text> : first peer row's `<host>.<net>.ray` hostname label.
 peer_host(){ echo "$1" | grep -E '●|○' | grep -oE '[a-z0-9-]+\.[a-z0-9-]+\.ray' | head -1 | cut -d. -f1; }

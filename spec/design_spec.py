@@ -1447,3 +1447,44 @@ class NoResidualTestHarnessIdentityLeak(Constraint):
     """
     constraint_id = "CON-011"
     enforcement_logic = "{{ test_harness_identity.unexpected_count == 0 }}"
+
+
+class TestHarnessSubnetUpdated(Requirement):
+    """REQUIREMENT-ID: SUBNET-015
+
+    Found while doing RENAME-017 (2026-07-10): the `tests/` harness still assumed
+    upstream's `100.64.0.0/10` CGNAT range and the pre-fork fixed magic-DNS IP
+    `100.100.100.53`, both changed by the fork's core purpose — the default
+    overlay is now `10.88.0.0/16` (SUBNET-011) and the resolver is subnet-derived
+    to `10.88.100.53` (SUBNET-007/008). Two FUNCTIONAL breaks, not doc drift:
+
+    - `tests/lib/common.sh` `own_ip()` grepped status output for
+      `100\\.[0-9]+\\.[0-9]+\\.[0-9]+` — matches nothing in a real `10.88.x.x`
+      address, so it returned an empty string and the five tests that derive a
+      node's VPN IP from it (device-cert, ssh, unpair, bench, connect) fed empty
+      IPs into pings/asserts. Regex → `10\\.88\\.[0-9]+\\.[0-9]+`.
+    - `tests/e2e/dns/run.sh` set `MAGIC=100.100.100.53` and queried it; the
+      resolver answers at `10.88.100.53`. → `MAGIC=10.88.100.53`.
+
+    Plus 6 comment/README references to `100.64.x.x` / `100.64.0.0/10` /
+    `100.100.100.53` reworded to the `10.88` reality. No test sets a custom
+    `--subnet`, so the exact `10.88` literals are correct for the whole suite.
+
+    ENFORCEMENT: CON-012 (below). Distinct from CON-002 (`grep_hardcoded_cgnat`),
+    which polices the same drift in `src/` (membership/tun/dns).
+    """
+    req_id = "SUBNET-015"
+
+
+class NoResidualTestCgnatLeak(Constraint):
+    """CONSTRAINT-ID: CON-012
+
+    Anti-regression gate for SUBNET-015: the `tests/` harness must not carry the
+    pre-fork `100.64` CGNAT range or the `100.100.100` magic-DNS IP — literals
+    that make `own_ip` extract nothing and the DNS test hit the wrong address.
+    Counts both; must be 0. tests/-scoped counterpart to CON-002's src scan.
+
+    ENFORCEMENT (reconcile.py): test_subnet_identity.unexpected_count equals 0.
+    """
+    constraint_id = "CON-012"
+    enforcement_logic = "{{ test_subnet_identity.unexpected_count == 0 }}"

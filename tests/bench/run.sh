@@ -6,7 +6,7 @@
 #   srv-b  joins it with the room id (open net = no invite needed)
 #
 # For both directions we measure, over the public IP (DIRECT) and over the
-# torpedo 100.64.x.x TUN address (TORPEDO):
+# torpedo 10.88.x.x TUN address (TORPEDO):
 #   - ping RTT (latency)
 #   - iperf3 TCP throughput
 # so the delta isolates the cost torpedo (iroh QUIC datagrams, MTU 1200,

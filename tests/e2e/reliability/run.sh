@@ -9,7 +9,7 @@
 # direct QUIC connection. We then probe every unordered pair in BOTH directions,
 # over two paths:
 #   - direct   : the host's PUBLIC IP (raw Scaleway link, the baseline)
-#   - torpedo  : the peer's 100.64.x.x TUN IP (iroh QUIC datagrams over the VPN)
+#   - torpedo  : the peer's 10.88.x.x TUN IP (iroh QUIC datagrams over the VPN)
 #
 # Three probes per direction, each run over both paths:
 #   - ICMP burst : ping -c $PING_COUNT  -i 0.01      (100 pps)

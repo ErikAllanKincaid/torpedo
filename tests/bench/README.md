@@ -3,7 +3,7 @@
 Spins up **2 Scaleway instances in the same zone** and measures, for both
 directions, the cost torpedo adds on top of the raw link:
 
-- **latency** — `ping` mean RTT, direct (public IP) vs torpedo (`100.64.x.x` TUN)
+- **latency** — `ping` mean RTT, direct (public IP) vs torpedo (`10.88.x.x` TUN)
 - **throughput** — `iperf3` TCP, direct vs torpedo, forward (`tx`) and reverse (`rx`)
 
 The two peers join an **open** network (`torpedo create --open` / `torpedo join <room>`),

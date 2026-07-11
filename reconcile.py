@@ -2,7 +2,7 @@
 # reconcile.py -- run from ~/code/torpedo
 # Usage: python3 reconcile.py
 #
-# Checks the automatable constraints (CON-001..CON-011) from spec/design_spec.py.
+# Checks the automatable constraints (CON-001..CON-012) from spec/design_spec.py.
 # It does NOT check the Requirement classes (SUBNET-*/RENAME-*); those are
 # structural/design requirements verified by reading the diff and code directly.
 import json
@@ -202,6 +202,24 @@ def check_test_harness_identity() -> dict:
     return {"unexpected_count": n}
 
 
+def check_test_subnet_identity() -> dict:
+    """CON-012/SUBNET-015: the tests/ harness must not assume the pre-fork
+    100.64.0.0/10 CGNAT range or the fixed 100.100.100.53 magic-DNS IP. The fork
+    defaults to 10.88.0.0/16 and derives the resolver at 10.88.100.53, so a stale
+    literal is FUNCTIONAL breakage: `own_ip`'s `grep` extracts nothing from a real
+    10.88.x.x address, and the DNS test queries the wrong magic IP. Counts the two
+    upstream literals; must be 0. (`grep_hardcoded_cgnat`/CON-002 covers src.)"""
+    tokens = ["100.64", "100.100.100"]
+    n = 0
+    if Path("tests").is_dir():
+        for p in Path("tests").rglob("*"):
+            if p.is_file():
+                text = p.read_text()
+                for t in tokens:
+                    n += text.count(t)
+    return {"unexpected_count": n}
+
+
 if __name__ == "__main__":
     ctx = {
         "build": check_build(),
@@ -215,6 +233,7 @@ if __name__ == "__main__":
         "report_identity": check_report_identity(),
         "cli_reference_identity": check_cli_reference_identity(),
         "test_harness_identity": check_test_harness_identity(),
+        "test_subnet_identity": check_test_subnet_identity(),
     }
     print(json.dumps(ctx, indent=2))
     ok = (
@@ -229,5 +248,6 @@ if __name__ == "__main__":
         and ctx["report_identity"]["unexpected_count"] == 0
         and ctx["cli_reference_identity"]["unexpected_count"] == 0
         and ctx["test_harness_identity"]["unexpected_count"] == 0
+        and ctx["test_subnet_identity"]["unexpected_count"] == 0
     )
     sys.exit(0 if ok else 1)

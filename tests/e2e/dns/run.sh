@@ -38,7 +38,7 @@ B="$(server_ip "$SERVERS" srv-b || true)"
 [[ -n "$A" && -n "$B" ]] || { echo "missing srv-a/srv-b in $SERVERS"; exit 1; }
 
 NET=dns
-MAGIC=100.100.100.53
+MAGIC=10.88.100.53
 
 # A4 <host-ip> <name> : the IPv4 the host's *system* resolver returns for <name>
 # (libc/nsswitch path, the same one `ping` uses), or empty.
